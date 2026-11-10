@@ -14,7 +14,7 @@ x11rb = { version = "0.13.2", features = ["shape"] }
 slint-build = "1"
 
 [workspace]
-members = ["crates/ryme-proto"]
+members = ["crates/ryme-proto", "crates/ryme-server"]
 resolver = "2"
 
 [profile.release]

@@ -3862,6 +3862,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ryme-server"
+version = "0.1.0"
+dependencies = [
+ "ryme-proto",
+]
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

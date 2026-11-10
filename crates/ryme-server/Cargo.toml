@@ -1,0 +1,8 @@
+[package]
+name = "ryme-server"
+version = "0.1.0"
+edition = "2021"
+description = "Ryme voice relay"
+
+[dependencies]
+ryme-proto = { path = "../ryme-proto" }

@@ -1,0 +1,623 @@
+import "../fonts/SpaceGrotesk-Regular.ttf";
+import "../fonts/SpaceGrotesk-Medium.ttf";
+import "../fonts/SpaceGrotesk-Bold.ttf";
+
+export struct Member { name: string, initial: string, tint: color, muted: bool }
+export struct Channel { name: string, members: [Member] }
+
+global Theme {
+    // Charcoal shell. Lime is the only sharp color, and it is reserved for controls.
+    out property <color> bg: #0b0c0e;
+    out property <color> surface: #17191d;
+    out property <color> elevated: #23262c;
+    out property <color> ink: #e7e8eb;
+    out property <color> muted: #8d9199;
+    out property <color> signal: #D9F078;
+    out property <color> danger: #e08b92;
+    out property <color> frame: #4a4e57;
+    out property <string> sans: "Space Grotesk";
+}
+
+component Avatar inherits Rectangle {
+    in property <string> label;
+    in property <color> tint;
+    in property <bool> speaking;
+    in property <bool> muted;
+    width: 46px;
+    height: 46px;
+    background: transparent;
+
+    // A second ring, in this person's own color, with a gap. Lime stays on controls.
+    ring := Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: 23px;
+        border-width: root.speaking ? 1.5px : 0px;
+        border-color: root.tint;
+        animate border-width { duration: 160ms; easing: ease-out; }
+    }
+
+    disc := Rectangle {
+        width: 36px;
+        height: 36px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: 18px;
+        background: root.speaking ? root.tint.with-alpha(0.18) : Theme.surface;
+        border-width: 1px;
+        // Muted stays fully drawn, in the quiet ink. Fading the disc made the person vanish.
+        border-color: root.muted ? Theme.frame : root.tint;
+        animate background, border-color { duration: 160ms; easing: ease-out; }
+        Text {
+            width: 100%;
+            height: 100%;
+            text: root.label;
+            color: root.muted ? Theme.muted : root.tint;
+            font-family: Theme.sans;
+            font-size: 15px;
+            font-weight: 700;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// Same stroke as the card rim, held in from the edges so the tear stays the outline.
+component Hairline inherits Rectangle {
+    height: 1px;
+    background: transparent;
+    Rectangle {
+        x: 18px;
+        y: 0px;
+        width: parent.width - 36px;
+        height: 1px;
+        background: Theme.frame.with-alpha(0.85);
+    }
+}
+
+component Pill inherits Rectangle {
+    in property <string> label: "";
+    in property <string> glyph: ""; // "mic", "speaker", or a word via label
+    in property <bool> active;
+    in property <color> hue: Theme.signal;
+    callback clicked;
+    // Icon controls are circles. A word ("Leave") stays a short capsule.
+    // Neither stretches, so the torn corner keeps its empty ground.
+    height: 38px;
+    min-width: root.glyph == "" ? 88px : 38px;
+    max-width: root.glyph == "" ? 88px : 38px;
+    horizontal-stretch: 0;
+    border-radius: 19px;
+    background: active ? hue : (ta.has-hover ? hue.with-alpha(0.14) : transparent);
+    border-width: 1px;
+    border-color: active ? hue : hue.with-alpha(ta.has-hover ? 1.0 : 0.5);
+    animate background, border-color { duration: 160ms; easing: ease-out; }
+    property <color> mark: root.active ? Theme.bg : (root.hue == Theme.danger ? Theme.danger : Theme.ink);
+    animate mark { duration: 160ms; }
+
+    if root.glyph == "" : Text {
+        width: 100%;
+        height: 100%;
+        text: root.label;
+        color: root.mark;
+        font-family: Theme.sans;
+        font-size: 14px;
+        font-weight: 500;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    if root.glyph != "" : icons := Rectangle {
+        width: 100%;
+        height: 100%;
+        property <float> off: root.active ? 1 : 0;
+        animate off { duration: 180ms; easing: ease-in-out; }
+
+        if root.glyph == "mic" : Path {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 20px;
+            height: 20px;
+            viewbox-width: 24;
+            viewbox-height: 24;
+            commands: "M 9.4 7.1 C 9.4 5.1 10.4 3.5 12 3.5 C 13.6 3.5 14.6 5.1 14.6 7.1 L 14.6 11.4 C 14.6 13.5 13.5 14.9 12 14.9 C 10.5 14.9 9.4 13.5 9.4 11.4 Z M 7 11.3 C 7 15.5 9.1 17.8 12 17.8 C 14.9 17.8 17 15.5 17 11.3 M 12 17.8 L 12 20.6 M 9.3 20.6 L 14.7 20.6";
+            stroke: root.mark;
+            stroke-width: 1.6px;
+            stroke-line-cap: round;
+            stroke-line-join: round;
+        }
+        if root.glyph == "mic" : Path {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 20px;
+            height: 20px;
+            viewbox-width: 24;
+            viewbox-height: 24;
+            commands: "M 4.8 4.8 L 19.2 19.2";
+            stroke: root.mark;
+            stroke-width: 1.6px;
+            stroke-line-cap: round;
+            opacity: icons.off;
+        }
+        if root.glyph == "speaker" : Path {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 20px;
+            height: 20px;
+            viewbox-width: 24;
+            viewbox-height: 24;
+            commands: "M 4.8 9.4 L 4.8 14.6 L 8.2 14.6 L 12.5 18.4 L 12.5 5.6 L 8.2 9.4 Z";
+            stroke: root.mark;
+            stroke-width: 1.6px;
+            stroke-line-cap: round;
+            stroke-line-join: round;
+        }
+        if root.glyph == "speaker" : Path {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 20px;
+            height: 20px;
+            viewbox-width: 24;
+            viewbox-height: 24;
+            commands: "M 15.3 9.5 C 16.5 10.4 17.1 11.2 17.1 12 C 17.1 12.8 16.5 13.6 15.3 14.5 M 17.3 7.3 C 19.3 8.8 20.3 10.4 20.3 12 C 20.3 13.6 19.3 15.2 17.3 16.7";
+            stroke: root.mark;
+            stroke-width: 1.6px;
+            stroke-line-cap: round;
+            opacity: 1 - icons.off;
+        }
+        if root.glyph == "speaker" : Path {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 20px;
+            height: 20px;
+            viewbox-width: 24;
+            viewbox-height: 24;
+            commands: "M 15.6 9.3 L 20.2 14.7 M 20.2 9.3 L 15.6 14.7";
+            stroke: root.mark;
+            stroke-width: 1.6px;
+            stroke-line-cap: round;
+            opacity: icons.off;
+        }
+    }
+
+    ta := TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component MainWindow inherits Window {
+    no-frame: true;
+    background: transparent;
+    title: "ryme";
+    // A little taller than the wide bar, and a few pixels smaller overall.
+    // src/x11_frame.rs floats this on i3 and clips the corners.
+    // Keep the size in sync with CARD_W / CARD_H there.
+    preferred-width: 384px;
+    preferred-height: 290px;
+    min-width: 384px;
+    max-width: 384px;
+    min-height: 290px;
+    max-height: 290px;
+
+    callback request-close();
+    callback minimize();
+    callback drag(length, length);
+
+    in-out property <int> joined: 0;
+    in-out property <int> panel: 0; // 0 none, 1 channels
+    in-out property <bool> muted: false;
+    in-out property <bool> deafened: false;
+    in-out property <[Channel]> channels: [
+        { name: "Lobby", members: [
+            { name: "Mara", initial: "M", tint: #c9c6bf, muted: false },
+            { name: "Jonas", initial: "J", tint: #a7a3b3, muted: false },
+            { name: "Kit", initial: "K", tint: #8d938c, muted: true },
+            { name: "Ravi", initial: "R", tint: #b09a93, muted: false },
+        ] },
+        { name: "Ranked", members: [
+            { name: "Sol", initial: "S", tint: #96a0ad, muted: false },
+            { name: "Ivy", initial: "I", tint: #c9c6bf, muted: false },
+        ] },
+        { name: "Quiet corner", members: [] },
+    ];
+
+    property <int> tick: 0; // fake speaking for the prototype
+    Timer { interval: 1000ms; running: true; triggered => { root.tick += 1; } }
+
+    // Round top-left, torn bottom-right. Keep this path in sync with src/x11_frame.rs.
+    // Fill only. The rim is a separate path, drawn last, so nothing covers it.
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 384;
+        viewbox-height: 290;
+        commands: "M 2 34 C 2 14 16 2 38 2 L 382 2 L 382 266 L 374 272 L 380 278 L 372 284 L 376 288 L 2 288 L 2 34 Z";
+        fill: Theme.bg;
+    }
+
+    // Stars only — charcoal-white night, minimal, no moon.
+    // Fits the clean dark design of a lightweight Teamspeak/Mumble alternative.
+    Rectangle { x: 104px; y: 20px; width: 2px; height: 2px; border-radius: 1px; background: #e0e0e0; opacity: 0.45; }
+    Rectangle { x: 168px; y: 30px; width: 2px; height: 2px; border-radius: 1px; background: #e0e0e0; opacity: 0.55; }
+    Rectangle { x: 214px; y: 16px; width: 2px; height: 2px; border-radius: 1px; background: #e0e0e0; opacity: 0.75; }
+    Rectangle { x: 246px; y: 38px; width: 2px; height: 2px; border-radius: 1px; background: #e0e0e0; opacity: 0.35; }
+    Rectangle { x: 188px; y: 52px; width: 2px; height: 2px; border-radius: 1px; background: #e0e0e0; opacity: 0.28; }
+    Rectangle { x: 272px; y: 58px; width: 2px; height: 2px; border-radius: 1px; background: #e0e0e0; opacity: 0.50; }
+    Rectangle { x: 358px; y: 54px; width: 2px; height: 2px; border-radius: 1px; background: #e0e0e0; opacity: 0.42; }
+    Rectangle { x: 352px; y: 156px; width: 2px; height: 2px; border-radius: 1px; background: #e0e0e0; opacity: 0.32; }
+
+    VerticalLayout {
+        Rectangle {
+            height: 52px;
+            TouchArea {
+                width: 100%;
+                height: 100%;
+                property <length> sx;
+                property <length> sy;
+                pointer-event(e) => {
+                    if (e.button == PointerEventButton.left && e.kind == PointerEventKind.down) {
+                        sx = self.mouse-x;
+                        sy = self.mouse-y;
+                    }
+                }
+                moved => { if (self.pressed) { root.drag(self.mouse-x - sx, self.mouse-y - sy); } }
+            }
+            HorizontalLayout {
+                padding-left: 22px;
+                padding-right: 12px;
+                padding-top: 8px;
+                alignment: space-between;
+                VerticalLayout {
+                    alignment: center;
+                    Text {
+                        text: "ryme";
+                        color: Theme.ink;
+                        font-family: Theme.sans;
+                        font-size: 16px;
+                        font-weight: 700;
+                        letter-spacing: 0.4px;
+                        vertical-alignment: center;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    HorizontalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    Rectangle {
+                        width: 28px;
+                        height: 28px;
+                        border-radius: 14px;
+                        background: min-ta.has-hover ? Theme.elevated : transparent;
+                        animate background { duration: 120ms; }
+                        Path {
+                            x: 7px;
+                            y: 13px;
+                            width: 14px;
+                            height: 4px;
+                            viewbox-width: 14;
+                            viewbox-height: 4;
+                            commands: "M 1 2 L 13 2";
+                            stroke: min-ta.has-hover ? Theme.signal : Theme.muted;
+                            stroke-width: 1.5px;
+                            stroke-line-cap: round;
+                        }
+                        min-ta := TouchArea { clicked => { root.minimize(); } }
+                    }
+                    Rectangle {
+                        width: 28px;
+                        height: 28px;
+                        border-radius: 14px;
+                        background: cl-ta.has-hover ? Theme.elevated : transparent;
+                        animate background { duration: 120ms; }
+                        Path {
+                            x: 8px;
+                            y: 8px;
+                            width: 12px;
+                            height: 12px;
+                            viewbox-width: 12;
+                            viewbox-height: 12;
+                            commands: "M 1 1 L 11 11 M 11 1 L 1 11";
+                            stroke: cl-ta.has-hover ? Theme.signal : Theme.muted;
+                            stroke-width: 1.5px;
+                            stroke-line-cap: round;
+                        }
+                        cl-ta := TouchArea { clicked => { root.request-close(); } }
+                    }
+                    }
+                }
+            }
+        }
+
+        Hairline { }
+
+        Rectangle {
+            height: 32px;
+            HorizontalLayout {
+                padding-left: 22px;
+                spacing: 8px;
+                alignment: start;
+                Text {
+                    text: root.joined >= 0 ? root.channels[root.joined].name : "Pick a channel";
+                    color: Theme.ink;
+                    font-family: Theme.sans;
+                    font-size: 21px;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Path {
+                        width: 10px;
+                        height: 6px;
+                        viewbox-width: 10;
+                        viewbox-height: 6;
+                        commands: "M 1 1 L 5 5 L 9 1";
+                        stroke: Theme.signal;
+                        stroke-width: 1.5px;
+                        stroke-line-cap: round;
+                        stroke-line-join: round;
+                    }
+                }
+            }
+            TouchArea { clicked => { root.panel = 1; } }
+        }
+
+        HorizontalLayout {
+            padding-left: 22px;
+            height: 18px;
+            Text {
+                text: root.joined < 0 ? "Not in a channel"
+                    : root.channels[root.joined].members.length == 0 ? "Empty"
+                    : ("" + root.channels[root.joined].members.length + " in channel");
+                color: Theme.muted;
+                font-family: Theme.sans;
+                font-size: 13px;
+                vertical-alignment: center;
+            }
+        }
+
+        // Stage stays put when the channel is empty, so the dock does not jump.
+        Rectangle {
+            min-height: 74px;
+            if root.joined >= 0 : HorizontalLayout {
+                padding-left: 22px;
+                padding-top: 12px;
+                spacing: 14px;
+                alignment: start;
+                for member[mi] in root.channels[root.joined].members : VerticalLayout {
+                    spacing: 5px;
+                    width: 48px;
+                    alignment: center;
+                    Avatar {
+                        label: member.initial;
+                        tint: member.tint;
+                        muted: member.muted;
+                        speaking: !member.muted && Math.mod(root.tick + mi, 4) == 0;
+                    }
+                    Text {
+                        width: 48px;
+                        overflow: elide;
+                        text: member.name;
+                        color: member.muted ? Theme.muted : Theme.ink;
+                        font-family: Theme.sans;
+                        font-size: 12px;
+                        font-weight: 500;
+                        horizontal-alignment: center;
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            vertical-stretch: 1;
+        }
+
+        Hairline { }
+
+        HorizontalLayout {
+            padding-left: 18px;
+            padding-right: 20px;
+            padding-top: 12px;
+            padding-bottom: 16px;
+            spacing: 8px;
+            alignment: start;
+            Pill { glyph: "mic"; active: root.muted; clicked => { root.muted = !root.muted; } }
+            Pill { glyph: "speaker"; active: root.deafened; clicked => { root.deafened = !root.deafened; } }
+            Pill { label: "Leave"; hue: Theme.danger; clicked => { root.joined = -1; } }
+        }
+    }
+
+    // Full-canvas page. Slides up over the main view. The window shape still
+    // clips it, so later pages get the whole card instead of a small sheet.
+    // The rim is painted after this, so the slide cannot narrow the line.
+    Rectangle {
+        y: root.panel == 1 ? 0px : 316px;
+        width: 100%;
+        height: 100%;
+        background: Theme.bg;
+        animate y { duration: 240ms; easing: ease-out; }
+        // Eat clicks on the empty canvas so they don't reach the page underneath.
+        TouchArea {
+            width: 100%;
+            height: 100%;
+        }
+
+        VerticalLayout {
+            Rectangle {
+                height: 56px;
+                TouchArea {
+                    width: 100%;
+                    height: 100%;
+                    property <length> sx;
+                    property <length> sy;
+                    pointer-event(e) => {
+                        if (e.button == PointerEventButton.left && e.kind == PointerEventKind.down) {
+                            sx = self.mouse-x;
+                            sy = self.mouse-y;
+                        }
+                    }
+                    moved => { if (self.pressed) { root.drag(self.mouse-x - sx, self.mouse-y - sy); } }
+                }
+                HorizontalLayout {
+                    padding-left: 16px;
+                    padding-right: 12px;
+                    padding-top: 8px;
+                    alignment: space-between;
+                    HorizontalLayout {
+                        spacing: 2px;
+                        VerticalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: 28px;
+                                height: 28px;
+                                border-radius: 14px;
+                                background: back-ta.has-hover ? Theme.elevated : transparent;
+                                animate background { duration: 120ms; }
+                                Path {
+                                    x: 8px;
+                                    y: 8px;
+                                    width: 12px;
+                                    height: 12px;
+                                    viewbox-width: 12;
+                                    viewbox-height: 12;
+                                    commands: "M 9 1 L 3 6 L 9 11";
+                                    stroke: back-ta.has-hover ? Theme.signal : Theme.ink;
+                                    stroke-width: 1.6px;
+                                    stroke-line-cap: round;
+                                    stroke-line-join: round;
+                                }
+                                back-ta := TouchArea { clicked => { root.panel = 0; } }
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Text {
+                                text: "Channels";
+                                color: Theme.ink;
+                                font-family: Theme.sans;
+                                font-size: 17px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                    HorizontalLayout {
+                        alignment: center;
+                        spacing: 2px;
+                        Rectangle {
+                            width: 28px;
+                            height: 28px;
+                            border-radius: 14px;
+                            background: page-min.has-hover ? Theme.elevated : transparent;
+                            animate background { duration: 120ms; }
+                            Path {
+                                x: 7px;
+                                y: 13px;
+                                width: 14px;
+                                height: 4px;
+                                viewbox-width: 14;
+                                viewbox-height: 4;
+                                commands: "M 1 2 L 13 2";
+                                stroke: page-min.has-hover ? Theme.signal : Theme.muted;
+                                stroke-width: 1.5px;
+                                stroke-line-cap: round;
+                            }
+                            page-min := TouchArea { clicked => { root.minimize(); } }
+                        }
+                        Rectangle {
+                            width: 28px;
+                            height: 28px;
+                            border-radius: 14px;
+                            background: page-close.has-hover ? Theme.elevated : transparent;
+                            animate background { duration: 120ms; }
+                            Path {
+                                x: 8px;
+                                y: 8px;
+                                width: 12px;
+                                height: 12px;
+                                viewbox-width: 12;
+                                viewbox-height: 12;
+                                commands: "M 1 1 L 11 11 M 11 1 L 1 11";
+                                stroke: page-close.has-hover ? Theme.signal : Theme.muted;
+                                stroke-width: 1.5px;
+                                stroke-line-cap: round;
+                            }
+                            page-close := TouchArea { clicked => { root.request-close(); } }
+                        }
+                    }
+                    }
+                }
+            }
+
+            Hairline { }
+
+            VerticalLayout {
+                padding-left: 18px;
+                padding-right: 18px;
+                padding-top: 8px;
+                spacing: 2px;
+                for channel[ci] in root.channels : Rectangle {
+                    height: 44px;
+                    border-radius: 10px;
+                    background: root.joined == ci ? Theme.elevated : (row.has-hover ? Theme.surface : transparent);
+                    row := TouchArea { clicked => { root.joined = ci; root.panel = 0; } }
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 14px;
+                        spacing: 10px;
+                        alignment: space-between;
+                        HorizontalLayout {
+                            spacing: 10px;
+                            alignment: start;
+                            VerticalLayout {
+                                width: 2px;
+                                alignment: center;
+                                Rectangle {
+                                    width: 2px;
+                                    height: root.joined == ci ? 14px : 0px;
+                                    border-radius: 1px;
+                                    background: Theme.signal;
+                                }
+                            }
+                            Text {
+                                text: channel.name;
+                                color: Theme.ink;
+                                font-family: Theme.sans;
+                                font-size: 16px;
+                                font-weight: 500;
+                                vertical-alignment: center;
+                            }
+                        }
+                        Text {
+                            text: channel.members.length > 0 ? "" + channel.members.length : "";
+                            color: Theme.muted;
+                            font-family: Theme.sans;
+                            font-size: 14px;
+                            font-weight: 500;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 1px line on whole pixels, just inside the fill, drawn last so the
+    // shape clip and the sliding page cannot shave it.
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 384;
+        viewbox-height: 290;
+        commands: "M 3 34 C 3 15 18 4 28 4 L 381 4 L 381 265.5 L 372.48 271.89 L 378.48 277.89 L 370.48 283.89 L 373.59 287 L 3 287 Z";
+        stroke: Theme.frame;
+        stroke-width: 0.75px;
+        stroke-line-cap: round;
+        stroke-line-join: round;
+    }
+}

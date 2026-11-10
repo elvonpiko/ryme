@@ -78,6 +78,7 @@ component Hairline inherits Rectangle {
 component Field inherits Rectangle {
     in property <string> placeholder;
     in-out property <string> value;
+    callback submitted();
     height: 36px;
     border-radius: 10px;
     background: Theme.surface;
@@ -107,6 +108,13 @@ component Field inherits Rectangle {
         font-size: 14px;
         selection-background-color: Theme.signal;
         selection-foreground-color: Theme.bg;
+        key-pressed(event) => {
+            if (event.text == "\n") {
+                root.submitted();
+                return accept;
+            }
+            reject
+        }
     }
 }
 
@@ -213,6 +221,19 @@ component Pill inherits Rectangle {
             stroke-line-cap: round;
             opacity: icons.off;
         }
+        if root.glyph == "chat" : Path {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 20px;
+            height: 20px;
+            viewbox-width: 24;
+            viewbox-height: 24;
+            commands: "M 5 6.5 H 16.5 C 17.8 6.5 18.5 7.4 18.5 8.6 V 13.2 C 18.5 14.4 17.8 15.3 16.5 15.3 H 10.2 L 6.4 18.2 V 15.3 H 5 C 3.8 15.3 3 14.4 3 13.2 V 8.6 C 3 7.4 3.8 6.5 5 6.5 Z";
+            stroke: root.mark;
+            stroke-width: 1.6px;
+            stroke-line-cap: round;
+            stroke-line-join: round;
+        }
     }
 
     ta := TouchArea {
@@ -241,12 +262,14 @@ export component MainWindow inherits Window {
     callback drag(length, length);
 
     in-out property <int> joined: 0;
-    in-out property <int> panel: 0; // 0 none, 1 channels
+    in-out property <int> panel: 0; // 0 home, 1 channels, 2 chat
     in-out property <bool> muted: false;
     in-out property <bool> deafened: false;
     in-out property <bool> inside: false;
     in-out property <string> display-name: "";
     in-out property <string> invite: "";
+    in-out property <string> draft: "";
+    in-out property <string> sent: "";
     in-out property <[Channel]> channels: [
         { name: "Lobby", members: [
             { name: "Mara", initial: "M", tint: #c9c6bf, muted: false },
@@ -464,6 +487,7 @@ export component MainWindow inherits Window {
             alignment: start;
             Pill { glyph: "mic"; active: root.muted; clicked => { root.muted = !root.muted; } }
             Pill { glyph: "speaker"; active: root.deafened; clicked => { root.deafened = !root.deafened; } }
+            Pill { glyph: "chat"; clicked => { root.panel = 2; } }
             Pill { label: "Leave"; hue: Theme.danger; clicked => { root.joined = -1; } }
         }
     }
@@ -472,7 +496,7 @@ export component MainWindow inherits Window {
     // clips it, so later pages get the whole card instead of a small sheet.
     // The rim is painted after this, so the slide cannot narrow the line.
     Rectangle {
-        y: root.panel == 1 ? 0px : 316px;
+        y: root.panel == 0 ? 316px : 0px;
         width: 100%;
         height: 100%;
         background: Theme.bg;
@@ -533,7 +557,7 @@ export component MainWindow inherits Window {
                         VerticalLayout {
                             alignment: center;
                             Text {
-                                text: "Channels";
+                                text: root.panel == 2 ? "Chat" : "Channels";
                                 color: Theme.ink;
                                 font-family: Theme.sans;
                                 font-size: 17px;
@@ -594,7 +618,7 @@ export component MainWindow inherits Window {
 
             Hairline { }
 
-            VerticalLayout {
+            if root.panel == 1 : VerticalLayout {
                 padding-left: 18px;
                 padding-right: 18px;
                 padding-top: 8px;
@@ -641,6 +665,46 @@ export component MainWindow inherits Window {
                         }
                     }
                 }
+            }
+
+            if root.panel == 2 : VerticalLayout {
+                vertical-stretch: 1;
+                padding-left: 22px;
+                padding-right: 22px;
+                padding-top: 10px;
+                spacing: 8px;
+                HorizontalLayout {
+                    spacing: 10px;
+                    Text { text: "Mara"; width: 48px; color: Theme.muted; font-family: Theme.sans; font-size: 13px; font-weight: 500; }
+                    Text { text: "pushing mid"; color: Theme.ink; font-family: Theme.sans; font-size: 14px; }
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    Text { text: "You"; width: 48px; color: Theme.ink; font-family: Theme.sans; font-size: 13px; font-weight: 500; }
+                    Text { text: "on it"; color: Theme.ink; font-family: Theme.sans; font-size: 14px; }
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    Text { text: "Jonas"; width: 48px; color: Theme.muted; font-family: Theme.sans; font-size: 13px; font-weight: 500; }
+                    Text { text: "wait for smoke"; color: Theme.ink; font-family: Theme.sans; font-size: 14px; }
+                }
+                if root.sent != "" : HorizontalLayout {
+                    spacing: 10px;
+                    Text { text: "You"; width: 48px; color: Theme.ink; font-family: Theme.sans; font-size: 13px; font-weight: 500; }
+                    Text { text: root.sent; color: Theme.ink; font-family: Theme.sans; font-size: 14px; }
+                }
+                Rectangle { vertical-stretch: 1; }
+                Field {
+                    placeholder: "Say something";
+                    value <=> root.draft;
+                    submitted => {
+                        if (root.draft != "") {
+                            root.sent = root.draft;
+                            root.draft = "";
+                        }
+                    }
+                }
+                Rectangle { height: 8px; }
             }
         }
     }

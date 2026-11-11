@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Ryme
+GenericName=Voice chat
+Comment=A quiet room for voices
+Exec=ryme
+Icon=ryme
+Terminal=false
+Categories=Network;AudioVideo;Audio;
+StartupNotify=true

@@ -1,4 +1,6 @@
 /target
+/packaging/windows/stage/
+/packaging/windows/out/
 /ryme-data
 /end-to-end
 /.cursor

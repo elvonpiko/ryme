@@ -102,6 +102,59 @@ jobs:
         with:
           name: ${{ matrix.asset }}
           path: ${{ matrix.asset }}
+      - name: Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) { exit $LASTEXITCODE }
+          $global:LASTEXITCODE = 0
+          $ver = "${{ github.ref_name }}".TrimStart("v")
+          New-Item -ItemType Directory -Force -Path packaging\windows\stage | Out-Null
+          Copy-Item target\${{ matrix.target }}\release\ryme.exe packaging\windows\stage\ryme.exe
+          curl.exe -fsSL -o packaging\windows\stage\vc_redist.x64.exe https://aka.ms/vs/17/release/vc_redist.x64.exe
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            $found = Get-ChildItem "C:\Program Files*" -Recurse -Filter ISCC.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $found) { throw "Inno Setup compiler was not installed" }
+            $iscc = $found.FullName
+          }
+          & $iscc "/DMyAppVersion=$ver" packaging\windows\ryme.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: Ryme-Setup-x64.exe
+          path: packaging/windows/out/Ryme-Setup-x64.exe
+      - name: Linux package
+        if: runner.os == 'Linux'
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          packaging/linux/build-deb.sh "$ver" "target/${{ matrix.target }}/release/ryme" packaging/icon/ryme-256.png ryme-amd64.deb
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: ryme-amd64.deb
+          path: ryme-amd64.deb
+      - name: macOS disk image
+        if: runner.os == 'macOS'
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          case "${{ matrix.target }}" in
+            aarch64-apple-darwin) label=arm64 ;;
+            x86_64-apple-darwin) label=intel ;;
+          esac
+          packaging/macos/build-dmg.sh "$ver" "target/${{ matrix.target }}/release/ryme" "$label" . packaging/icon/ryme-1024.png
+      - uses: actions/upload-artifact@v4
+        if: matrix.target == 'aarch64-apple-darwin'
+        with:
+          name: Ryme-mac-arm64.dmg
+          path: Ryme-mac-arm64.dmg
+      - uses: actions/upload-artifact@v4
+        if: matrix.target == 'x86_64-apple-darwin'
+        with:
+          name: Ryme-mac-intel.dmg
+          path: Ryme-mac-intel.dmg
 
   publish:
     needs: [server, client]
@@ -122,4 +175,4 @@ jobs:
           gh release create "${{ github.ref_name }}" dist/* \
             --repo "${{ github.repository }}" \
             --title "${{ github.ref_name }}" \
-            --notes "Server builds for Linux and the Raspberry Pi. The same card for Windows, Mac, and Linux."
+            --notes "Windows setup, Mac disk images, and a Linux package. Server builds for Linux and the Raspberry Pi."

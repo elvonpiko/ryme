@@ -24,7 +24,7 @@ Set `RYME_PUBLIC` to the address friends can reach, then run `ryme-server`. Room
 
 ## Clients
 
-Downloads for Windows, Mac, and Linux are on the [latest release](https://github.com/elvonpiko/ryme/releases/latest).
+The [latest release](https://github.com/elvonpiko/ryme/releases/latest) has a Windows setup, a Mac disk image, and a Linux package. ryme.chat offers the one for this computer.
 
 ## Contributing
 

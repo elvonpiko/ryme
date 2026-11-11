@@ -1,0 +1,23 @@
+# RYME_PUBLIC is the address friends can reach. Put it in a .env file
+# beside this file, for example: RYME_PUBLIC=voice.example:1542
+services:
+  ryme:
+    build: .
+    image: ryme-server
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    environment:
+      RYME_DATA: /var/lib/ryme
+      RYME_BIND: 0.0.0.0:1542
+      RYME_PUBLIC: ${RYME_PUBLIC:-}
+    ports:
+      - "1542:1542/udp"
+    volumes:
+      - ryme-data:/var/lib/ryme
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=8m
+volumes:
+  ryme-data:

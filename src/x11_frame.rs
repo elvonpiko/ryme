@@ -15,6 +15,7 @@ use x11rb::protocol::xproto::Rectangle;
 use crate::card_shape::{outline_px, CARD_H, CARD_W};
 
 pub fn install(ui: &crate::MainWindow) {
+    polish(ui);
     for delay in [80_u64, 250, 700, 1400] {
         let weak = ui.as_weak();
         slint::Timer::single_shot(std::time::Duration::from_millis(delay), move || {
@@ -63,12 +64,25 @@ fn x11_window_id(window: &slint::Window) -> Option<u32> {
 }
 
 fn float_card_on_i3(xid: u32, width: u32, height: u32) {
-    // No i3, no socket: the command fails and the window stays as the WM left it.
-    let message =
-        format!("[id=\"{xid}\"] floating enable, border none, resize set {width} px {height} px");
-    let _ = std::process::Command::new("i3-msg")
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static MOVED: AtomicBool = AtomicBool::new(false);
+    // The first time the card floats, put it in the middle of the output.
+    // Later ticks only keep the size, so a drag is not pulled back.
+    let center = if MOVED.swap(true, Ordering::Relaxed) {
+        ""
+    } else {
+        ", move position center"
+    };
+    let message = format!(
+        "[id=\"{xid}\"] floating enable, border none, resize set {width} px {height} px{center}"
+    );
+    let ok = std::process::Command::new("i3-msg")
         .args(["-q", &message])
-        .status();
+        .status()
+        .is_ok_and(|status| status.success());
+    if !ok {
+        MOVED.store(false, Ordering::Relaxed);
+    }
 }
 
 fn clip_to_card(xid: u32, px_w: u32, px_h: u32) -> Result<(), String> {

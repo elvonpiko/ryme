@@ -9,6 +9,7 @@ mod local;
 mod update;
 
 mod card_shape;
+mod place;
 
 #[cfg(target_os = "linux")]
 mod x11_frame;
@@ -46,11 +47,17 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
+    // Show before the first paint is pumped, so the card can be centered
+    // and the system caption can be turned off while it is still unseen.
+    let _ = ui.show();
+
     #[cfg(target_os = "linux")]
     x11_frame::install(&ui);
 
     #[cfg(windows)]
     win_frame::install(&ui);
+
+    place::install(&ui);
 
     let tray = RymeTray::new()?;
     let weak = ui.as_weak();

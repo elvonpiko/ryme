@@ -1,0 +1,2 @@
+# libopus is upstream C. Ryme is the Rust and Slint around it.
+crates/opusic-sys/opus/** linguist-vendored

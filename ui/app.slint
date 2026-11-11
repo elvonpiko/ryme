@@ -2,8 +2,9 @@ import "../fonts/SpaceGrotesk-Regular.ttf";
 import "../fonts/SpaceGrotesk-Medium.ttf";
 import "../fonts/SpaceGrotesk-Bold.ttf";
 
-export struct Member { name: string, initial: string, tint: color, muted: bool }
+export struct Member { name: string, initial: string, tint: color, muted: bool, speaking: bool }
 export struct Channel { name: string, members: [Member] }
+export struct Line { author: string, body: string, mine: bool }
 
 global Theme {
     // Charcoal shell. Lime is the only sharp color, and it is reserved for controls.
@@ -16,6 +17,97 @@ global Theme {
     out property <color> danger: #e08b92;
     out property <color> frame: #4a4e57;
     out property <string> sans: "Space Grotesk";
+}
+
+// The app icon: a lowercase r on the torn tile. The word beside it stays the full name.
+component Mark inherits Rectangle {
+    width: 24px;
+    height: 24px;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    background: transparent;
+
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 300;
+        viewbox-height: 300;
+        commands: "M 6 48 C 6 18 24 6 54 6 L 294 6 L 294 246 L 274 262 L 290 278 L 266 294 L 6 294 L 6 48 Z";
+        fill: Theme.bg;
+        stroke: Theme.frame;
+        stroke-width: 1px;
+    }
+
+    Path {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
+        viewbox-width: 300;
+        viewbox-height: 300;
+        commands: "M 100 228 L 100 86 L 128 86 C 170 86 188 98 188 116 L 188 144 L 128 144 L 128 228 Z";
+        fill: Theme.ink;
+    }
+}
+
+component Wordmark inherits HorizontalLayout {
+    spacing: 8px;
+    alignment: center;
+    horizontal-stretch: 0;
+    Mark {}
+    Text {
+        text: "ryme";
+        color: Theme.ink;
+        font-family: Theme.sans;
+        font-size: 16px;
+        font-weight: 700;
+        letter-spacing: 0.4px;
+        vertical-alignment: center;
+    }
+}
+
+// A small four-point sparkle. Used while Ryme is connecting.
+component Spark inherits Rectangle {
+    in property <color> hue: Theme.ink;
+    in property <bool> live: false;
+    in property <bool> invert: false;
+    in property <float> strength: 1;
+    width: 10px;
+    height: 10px;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    background: transparent;
+
+    property <bool> bright: true;
+    Timer {
+        interval: 760ms;
+        running: root.live;
+        triggered => { root.bright = !root.bright; }
+    }
+
+    property <bool> hot: root.invert ? !root.bright : root.bright;
+    property <float> shown: root.live ? (root.hot ? root.strength : root.strength * 0.4) : root.strength;
+    animate shown { duration: 700ms; easing: ease-in-out; }
+
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: "M 12 0.1 L 14.8 9.2 L 23.9 12 L 14.8 14.8 L 12 23.9 L 9.2 14.8 L 0.1 12 L 9.2 9.2 Z";
+        fill: root.hue;
+        opacity: 0.22 * root.shown;
+    }
+
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: "M 12 3.5 L 14 10 L 20.5 12 L 14 14 L 12 20.5 L 10 14 L 3.5 12 L 10 10 Z";
+        fill: root.hue;
+        opacity: root.shown;
+    }
 }
 
 component Avatar inherits Rectangle {
@@ -148,6 +240,7 @@ component Pill inherits Rectangle {
     in property <string> glyph: ""; // "mic", "speaker", or a word via label
     in property <bool> active;
     in property <color> hue: Theme.signal;
+    in property <bool> busy: false;
     callback clicked;
     // Icon controls are circles. A word ("Leave") stays a short capsule.
     // Neither stretches, so the torn corner keeps its empty ground.
@@ -163,7 +256,7 @@ component Pill inherits Rectangle {
     property <color> mark: root.active ? Theme.bg : (root.hue == Theme.danger ? Theme.danger : Theme.ink);
     animate mark { duration: 160ms; }
 
-    if root.glyph == "" : Text {
+    if root.glyph == "" && !root.busy : Text {
         width: 100%;
         height: 100%;
         text: root.label;
@@ -173,6 +266,15 @@ component Pill inherits Rectangle {
         font-weight: 500;
         horizontal-alignment: center;
         vertical-alignment: center;
+    }
+
+    if root.busy : Spark {
+        width: 9px;
+        height: 9px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        hue: Theme.signal;
+        live: true;
     }
 
     if root.glyph != "" : icons := Rectangle {
@@ -272,6 +374,7 @@ export component MainWindow inherits Window {
     no-frame: true;
     background: transparent;
     title: "ryme";
+    icon: @image-url("icon.svg");
     // A little taller than the wide bar, and a few pixels smaller overall.
     // src/x11_frame.rs floats this on i3 and clips the corners.
     // Keep the size in sync with CARD_W / CARD_H there.
@@ -285,8 +388,17 @@ export component MainWindow inherits Window {
     callback request-close();
     callback minimize();
     callback drag(length, length);
+    callback submit-join();
+    callback send-chat(string);
+    callback set-mute(bool);
+    callback set-deafen(bool);
+    callback leave-channel();
+    callback pick-channel(string);
+    callback logout();
+    callback confirm-yes();
+    callback confirm-no();
 
-    in-out property <int> joined: 0;
+    in-out property <int> joined: -1;
     in-out property <int> panel: 0; // 0 home, 1 channels, 2 chat, 3 settings
     in-out property <bool> muted: false;
     in-out property <bool> deafened: false;
@@ -294,25 +406,17 @@ export component MainWindow inherits Window {
     in-out property <string> display-name: "";
     in-out property <string> invite: "";
     in-out property <string> draft: "";
-    in-out property <string> sent: "";
+    in-out property <bool> joining: false;
+    in-out property <string> toast: "";
+    in-out property <bool> toast-danger: true;
+    in-out property <bool> confirming: false;
+    in-out property <string> confirm-title: "";
+    in-out property <string> confirm-body: "";
+    in-out property <string> confirm-accept: "";
     in-out property <bool> ptt: true;
     in-out property <bool> denoise: true;
-    in-out property <[Channel]> channels: [
-        { name: "Lobby", members: [
-            { name: "Mara", initial: "M", tint: #c9c6bf, muted: false },
-            { name: "Jonas", initial: "J", tint: #a7a3b3, muted: false },
-            { name: "Kit", initial: "K", tint: #8d938c, muted: true },
-            { name: "Ravi", initial: "R", tint: #b09a93, muted: false },
-        ] },
-        { name: "Ranked", members: [
-            { name: "Sol", initial: "S", tint: #96a0ad, muted: false },
-            { name: "Ivy", initial: "I", tint: #c9c6bf, muted: false },
-        ] },
-        { name: "Quiet corner", members: [] },
-    ];
-
-    property <int> tick: 0; // fake speaking for the prototype
-    Timer { interval: 1000ms; running: true; triggered => { root.tick += 1; } }
+    in-out property <[Channel]> channels: [];
+    in-out property <[Line]> lines: [];
 
     // Round top-left, torn bottom-right. Keep this path in sync with src/x11_frame.rs.
     // Fill only. The rim is a separate path, drawn last, so nothing covers it.
@@ -359,15 +463,7 @@ export component MainWindow inherits Window {
                 alignment: space-between;
                 VerticalLayout {
                     alignment: center;
-                    Text {
-                        text: "ryme";
-                        color: Theme.ink;
-                        font-family: Theme.sans;
-                        font-size: 16px;
-                        font-weight: 700;
-                        letter-spacing: 0.4px;
-                        vertical-alignment: center;
-                    }
+                    Wordmark {}
                 }
                 VerticalLayout {
                     alignment: center;
@@ -498,7 +594,7 @@ export component MainWindow inherits Window {
                 padding-top: 12px;
                 spacing: 14px;
                 alignment: start;
-                for member[mi] in root.channels[root.joined].members : VerticalLayout {
+                for member in root.channels[root.joined].members : VerticalLayout {
                     spacing: 5px;
                     width: 48px;
                     alignment: center;
@@ -506,7 +602,7 @@ export component MainWindow inherits Window {
                         label: member.initial;
                         tint: member.tint;
                         muted: member.muted;
-                        speaking: !member.muted && Math.mod(root.tick + mi, 4) == 0;
+                        speaking: member.speaking;
                     }
                     Text {
                         width: 48px;
@@ -535,10 +631,10 @@ export component MainWindow inherits Window {
             padding-bottom: 16px;
             spacing: 8px;
             alignment: start;
-            Pill { glyph: "mic"; active: root.muted; clicked => { root.muted = !root.muted; } }
-            Pill { glyph: "speaker"; active: root.deafened; clicked => { root.deafened = !root.deafened; } }
+            Pill { glyph: "mic"; active: root.muted; clicked => { root.muted = !root.muted; root.set-mute(root.muted); } }
+            Pill { glyph: "speaker"; active: root.deafened; clicked => { root.deafened = !root.deafened; root.set-deafen(root.deafened); } }
             Pill { glyph: "chat"; clicked => { root.panel = 2; } }
-            Pill { label: "Leave"; hue: Theme.danger; clicked => { root.joined = -1; } }
+            Pill { label: "Leave"; hue: Theme.danger; clicked => { root.leave-channel(); } }
         }
     }
 
@@ -677,7 +773,7 @@ export component MainWindow inherits Window {
                     height: 44px;
                     border-radius: 10px;
                     background: root.joined == ci ? Theme.elevated : (row.has-hover ? Theme.surface : transparent);
-                    row := TouchArea { clicked => { root.joined = ci; root.panel = 0; } }
+                    row := TouchArea { clicked => { root.pick-channel(channel.name); root.panel = 0; } }
                     HorizontalLayout {
                         padding-left: 12px;
                         padding-right: 14px;
@@ -723,25 +819,25 @@ export component MainWindow inherits Window {
                 padding-right: 22px;
                 padding-top: 10px;
                 spacing: 8px;
-                HorizontalLayout {
+                for line in root.lines : HorizontalLayout {
                     spacing: 10px;
-                    Text { text: "Mara"; width: 48px; color: Theme.muted; font-family: Theme.sans; font-size: 13px; font-weight: 500; }
-                    Text { text: "pushing mid"; color: Theme.ink; font-family: Theme.sans; font-size: 14px; }
-                }
-                HorizontalLayout {
-                    spacing: 10px;
-                    Text { text: "You"; width: 48px; color: Theme.ink; font-family: Theme.sans; font-size: 13px; font-weight: 500; }
-                    Text { text: "on it"; color: Theme.ink; font-family: Theme.sans; font-size: 14px; }
-                }
-                HorizontalLayout {
-                    spacing: 10px;
-                    Text { text: "Jonas"; width: 48px; color: Theme.muted; font-family: Theme.sans; font-size: 13px; font-weight: 500; }
-                    Text { text: "wait for smoke"; color: Theme.ink; font-family: Theme.sans; font-size: 14px; }
-                }
-                if root.sent != "" : HorizontalLayout {
-                    spacing: 10px;
-                    Text { text: "You"; width: 48px; color: Theme.ink; font-family: Theme.sans; font-size: 13px; font-weight: 500; }
-                    Text { text: root.sent; color: Theme.ink; font-family: Theme.sans; font-size: 14px; }
+                    Text {
+                        text: line.author;
+                        width: 72px;
+                        overflow: elide;
+                        color: line.mine ? Theme.ink : Theme.muted;
+                        font-family: Theme.sans;
+                        font-size: 13px;
+                        font-weight: 500;
+                    }
+                    Text {
+                        text: line.body;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                        color: Theme.ink;
+                        font-family: Theme.sans;
+                        font-size: 14px;
+                    }
                 }
                 Rectangle { vertical-stretch: 1; }
                 Field {
@@ -749,7 +845,7 @@ export component MainWindow inherits Window {
                     value <=> root.draft;
                     submitted => {
                         if (root.draft != "") {
-                            root.sent = root.draft;
+                            root.send-chat(root.draft);
                             root.draft = "";
                         }
                     }
@@ -761,8 +857,8 @@ export component MainWindow inherits Window {
                 vertical-stretch: 1;
                 padding-left: 22px;
                 padding-right: 22px;
-                padding-top: 8px;
-                spacing: 2px;
+                padding-top: 2px;
+                spacing: 0px;
                 Rectangle {
                     height: 34px;
                     HorizontalLayout {
@@ -809,6 +905,11 @@ export component MainWindow inherits Window {
                         }
                     }
                 }
+                HorizontalLayout {
+                    padding-top: 4px;
+                    alignment: start;
+                    Pill { label: "Log out"; hue: Theme.danger; clicked => { root.logout(); } }
+                }
             }
         }
     }
@@ -845,15 +946,7 @@ export component MainWindow inherits Window {
                     alignment: space-between;
                     VerticalLayout {
                         alignment: center;
-                        Text {
-                            text: "ryme";
-                            color: Theme.ink;
-                            font-family: Theme.sans;
-                            font-size: 16px;
-                            font-weight: 700;
-                            letter-spacing: 0.4px;
-                            vertical-alignment: center;
-                        }
+                        Wordmark {}
                     }
                     VerticalLayout {
                         alignment: center;
@@ -931,12 +1024,86 @@ export component MainWindow inherits Window {
                 alignment: start;
                 Pill {
                     label: "Join";
-                    active: root.display-name != "" && root.invite != "";
+                    busy: root.joining;
+                    active: !root.joining && root.display-name != "" && root.invite != "";
                     clicked => {
-                        if (root.display-name != "" && root.invite != "") {
-                            root.inside = true;
+                        if (!root.joining && root.display-name != "" && root.invite != "") {
+                            root.submit-join();
                         }
                     }
+                }
+            }
+        }
+    }
+
+    // A note grows from a dot in the middle of the card, in the gap between
+    // the two fields. Longer copy wraps and the bubble gets taller.
+    // It is not a page, so it does not slide.
+    toast-bubble := Rectangle {
+        property <bool> open: root.toast != "";
+        width: open ? body.preferred-width : 8px;
+        height: open ? body.preferred-height : 8px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: open ? 14px : 4px;
+        clip: true;
+        opacity: open ? 1 : 0;
+        background: Theme.elevated;
+        border-width: 1px;
+        border-color: root.toast-danger ? Theme.danger : Theme.frame;
+        animate width, height, border-radius, opacity { duration: 280ms; easing: ease-out; }
+
+        body := VerticalLayout {
+            padding: 14px;
+            Text {
+                text: root.toast;
+                width: 236px;
+                wrap: word-wrap;
+                horizontal-alignment: center;
+                color: root.toast-danger ? Theme.danger : Theme.ink;
+                font-family: Theme.sans;
+                font-size: 13px;
+            }
+        }
+    }
+
+    if root.confirming : Rectangle {
+        width: 100%;
+        height: 100%;
+        background: Theme.bg.with-alpha(0.72);
+        TouchArea { width: 100%; height: 100%; }
+        Rectangle {
+            x: 28px;
+            y: 74px;
+            width: parent.width - 56px;
+            height: 156px;
+            border-radius: 14px;
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.frame;
+            VerticalLayout {
+                padding: 16px;
+                spacing: 8px;
+                Text {
+                    text: root.confirm-title;
+                    color: Theme.ink;
+                    font-family: Theme.sans;
+                    font-size: 16px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: root.confirm-body;
+                    wrap: word-wrap;
+                    color: Theme.muted;
+                    font-family: Theme.sans;
+                    font-size: 13px;
+                }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    Pill { label: "Cancel"; hue: Theme.muted; clicked => { root.confirm-no(); } }
+                    Pill { label: root.confirm-accept; hue: Theme.danger; clicked => { root.confirm-yes(); } }
                 }
             }
         }

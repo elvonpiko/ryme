@@ -1,14 +1,20 @@
 slint::include_modules!();
 
+mod ear;
+mod jitter;
+mod live;
+mod local;
+
 #[cfg(target_os = "linux")]
 mod x11_frame;
 
 fn main() -> Result<(), slint::PlatformError> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio");
     let ui = MainWindow::new()?;
-
-    ui.on_request_close(|| {
-        let _ = slint::quit_event_loop();
-    });
+    live::attach(&ui, rt.handle());
 
     let weak = ui.as_weak();
     ui.on_minimize(move || {

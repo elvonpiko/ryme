@@ -10,7 +10,7 @@ permissions:
 jobs:
   server:
     name: server ${{ matrix.target }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -29,6 +29,9 @@ jobs:
       - name: cross linker
         if: matrix.packages != ''
         run: |
+          link=$(ip -o route get 1.1.1.1 | awk '{print $5; exit}')
+          sudo resolvectl dns "$link" 1.1.1.1 8.8.8.8 || true
+          printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee /etc/resolv.conf >/dev/null
           for attempt in 1 2 3 4 5; do
             sudo apt-get update && sudo apt-get install -y ${{ matrix.packages }} && exit 0
             sleep 20
@@ -53,7 +56,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             bin: ryme
             asset: ryme-x86_64-unknown-linux-gnu
@@ -81,6 +84,9 @@ jobs:
       - name: desktop libraries
         if: matrix.packages != ''
         run: |
+          link=$(ip -o route get 1.1.1.1 | awk '{print $5; exit}')
+          sudo resolvectl dns "$link" 1.1.1.1 8.8.8.8 || true
+          printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee /etc/resolv.conf >/dev/null
           for attempt in 1 2 3 4 5; do
             sudo apt-get update && sudo apt-get install -y ${{ matrix.packages }} && exit 0
             sleep 20
@@ -99,7 +105,7 @@ jobs:
 
   publish:
     needs: [server, client]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
         with:

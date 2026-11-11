@@ -604,7 +604,7 @@ fn capture_thread(
         return;
     };
     let channels = supported.channels() as usize;
-    let rate = supported.sample_rate().0;
+    let rate = supported.sample_rate();
     let config = cpal::StreamConfig {
         channels: supported.channels(),
         sample_rate: supported.sample_rate(),
@@ -652,7 +652,7 @@ fn playback_thread(
         return;
     };
     let channels = supported.channels() as usize;
-    let rate = supported.sample_rate().0;
+    let rate = supported.sample_rate();
     let config = cpal::StreamConfig {
         channels: supported.channels(),
         sample_rate: supported.sample_rate(),

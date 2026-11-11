@@ -376,7 +376,7 @@ export component MainWindow inherits Window {
     title: "ryme";
     icon: @image-url("icon.svg");
     // A little taller than the wide bar, and a few pixels smaller overall.
-    // src/x11_frame.rs floats this on i3 and clips the corners.
+    // src/x11_frame.rs and src/win_frame.rs clip the corners.
     // Keep the size in sync with CARD_W / CARD_H there.
     preferred-width: 384px;
     preferred-height: 290px;

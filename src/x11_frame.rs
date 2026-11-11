@@ -2,8 +2,8 @@
 //!
 //! This session is i3 without a compositor. A transparent window is still a
 //! rectangle, and the pixels outside the card are painted black. i3 also
-//! tiles that rectangle and draws its own frame. The outline below is the
-//! same path drawn in `ui/app.slint`.
+//! tiles that rectangle and draws its own frame. The outline is `card_shape`,
+//! the same path drawn in `ui/app.slint`.
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use slint::ComponentHandle;
@@ -12,9 +12,7 @@ use x11rb::protocol::shape::{self, SK, SO};
 use x11rb::protocol::xproto::ClipOrdering;
 use x11rb::protocol::xproto::Rectangle;
 
-/// Logical size of the card. Matches the window and the path viewBox in `ui/app.slint`.
-const CARD_W: f32 = 384.0;
-const CARD_H: f32 = 290.0;
+use crate::card_shape::{outline_px, CARD_H, CARD_W};
 
 pub fn install(ui: &crate::MainWindow) {
     for delay in [80_u64, 250, 700, 1400] {
@@ -107,63 +105,9 @@ fn warn_once(err: &str) {
     }
 }
 
-/// The card outline in `ui/app.slint`, flattened and scan-converted.
-/// Coordinates are in the 384×290 viewBox, then scaled to the window.
+/// The card outline, scan-converted for the X shape extension.
 fn card_rects(px_w: u32, px_h: u32) -> Vec<Rectangle> {
-    let sx = px_w as f32 / CARD_W;
-    let sy = px_h as f32 / CARD_H;
-    let poly: Vec<(f32, f32)> = outline()
-        .into_iter()
-        .map(|(x, y)| (x * sx, y * sy))
-        .collect();
-    scan_polygon(&poly, px_w as i32, px_h as i32)
-}
-
-fn outline() -> Vec<(f32, f32)> {
-    // M 2 34
-    // C 2 14 16 2 38 2
-    // L 382 2 L 382 266 L 374 272 L 380 278 L 372 284 L 376 288 L 2 288 L 2 34
-    let mut pts = vec![(2.0_f32, 34.0)];
-    cubic(&mut pts, (2.0, 14.0), (16.0, 2.0), (38.0, 2.0));
-    for p in [
-        (382.0, 2.0),
-        (382.0, 266.0),
-        (374.0, 272.0),
-        (380.0, 278.0),
-        (372.0, 284.0),
-        (376.0, 288.0),
-        (2.0, 288.0),
-        (2.0, 34.0),
-    ] {
-        line(&mut pts, p);
-    }
-    if pts.len() > 1 {
-        let first = pts[0];
-        if let Some(last) = pts.last().copied() {
-            if (last.0 - first.0).abs() < 0.05 && (last.1 - first.1).abs() < 0.05 {
-                pts.pop();
-            }
-        }
-    }
-    pts
-}
-
-fn line(pts: &mut Vec<(f32, f32)>, to: (f32, f32)) {
-    pts.push(to);
-}
-
-fn cubic(pts: &mut Vec<(f32, f32)>, c1: (f32, f32), c2: (f32, f32), to: (f32, f32)) {
-    let p0 = *pts.last().unwrap();
-    const N: i32 = 24;
-    for i in 1..=N {
-        let t = i as f32 / N as f32;
-        let u = 1.0 - t;
-        let x =
-            u * u * u * p0.0 + 3.0 * u * u * t * c1.0 + 3.0 * u * t * t * c2.0 + t * t * t * to.0;
-        let y =
-            u * u * u * p0.1 + 3.0 * u * u * t * c1.1 + 3.0 * u * t * t * c2.1 + t * t * t * to.1;
-        pts.push((x, y));
-    }
+    scan_polygon(&outline_px(px_w, px_h), px_w as i32, px_h as i32)
 }
 
 fn scan_polygon(poly: &[(f32, f32)], width: i32, height: i32) -> Vec<Rectangle> {

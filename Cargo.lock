@@ -4483,6 +4483,7 @@ dependencies = [
  "slint",
  "slint-build",
  "tokio",
+ "windows-sys 0.59.0",
  "x11rb",
 ]
 

@@ -5,8 +5,13 @@ mod jitter;
 mod live;
 mod local;
 
+mod card_shape;
+
 #[cfg(target_os = "linux")]
 mod x11_frame;
+
+#[cfg(windows)]
+mod win_frame;
 
 fn main() -> Result<(), slint::PlatformError> {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -40,6 +45,9 @@ fn main() -> Result<(), slint::PlatformError> {
 
     #[cfg(target_os = "linux")]
     x11_frame::install(&ui);
+
+    #[cfg(windows)]
+    win_frame::install(&ui);
 
     ui.run()
 }

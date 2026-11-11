@@ -4,11 +4,21 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+bytes = "1.12.1"
+magnum-opus = "0.3.2"
+rtrb = "0.4.1"
+ryme-proto = { path = "crates/ryme-proto" }
+ryme-server = { path = "crates/ryme-server" }
 slint = { version = "1", features = ["raw-window-handle-06"] }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "time"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 raw-window-handle = "0.6"
 x11rb = { version = "0.13.2", features = ["shape"] }
+
+# Linux talks to the installed libasound directly. Other desktops use cpal.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+cpal = "0.18.2"
 
 [build-dependencies]
 slint-build = "1"

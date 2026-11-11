@@ -25,14 +25,33 @@ pub enum ClientMsg {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerMsg {
-    Welcome { user_id: u32 },
-    Reject { reason: String },
-    Joined { channel: String, members: Vec<Member> },
+    Welcome {
+        user_id: u32,
+    },
+    Reject {
+        reason: String,
+    },
+    Joined {
+        channel: String,
+        members: Vec<Member>,
+        rooms: Vec<String>,
+    },
     Left,
-    PeerJoined { user_id: u32, name: String },
-    PeerLeft { user_id: u32 },
-    Chat { user_id: u32, text: String },
-    Muted { user_id: u32, muted: bool },
+    PeerJoined {
+        user_id: u32,
+        name: String,
+    },
+    PeerLeft {
+        user_id: u32,
+    },
+    Chat {
+        user_id: u32,
+        text: String,
+    },
+    Muted {
+        user_id: u32,
+        muted: bool,
+    },
 }
 
 pub fn clean_label(value: &str, max: usize) -> Result<String, ProtoError> {
@@ -63,9 +82,17 @@ pub fn normalize_server(msg: ServerMsg) -> Result<ServerMsg, ProtoError> {
         ServerMsg::Reject { reason } => ServerMsg::Reject {
             reason: clean_label(&reason, MAX_CHAT)?,
         },
-        ServerMsg::Joined { channel, members } => ServerMsg::Joined {
+        ServerMsg::Joined {
+            channel,
+            members,
+            rooms,
+        } => ServerMsg::Joined {
             channel: clean_label(&channel, MAX_CHANNEL)?,
             members,
+            rooms: rooms
+                .into_iter()
+                .map(|room| clean_label(&room, MAX_CHANNEL))
+                .collect::<Result<Vec<_>, _>>()?,
         },
         ServerMsg::PeerJoined { user_id, name } => ServerMsg::PeerJoined {
             user_id,
@@ -90,11 +117,20 @@ mod tests {
 
     #[test]
     fn rejects_empty_control_and_long_labels() {
-        assert_eq!(clean_label("   ", MAX_NAME).unwrap_err(), ProtoError::Invalid);
+        assert_eq!(
+            clean_label("   ", MAX_NAME).unwrap_err(),
+            ProtoError::Invalid
+        );
         assert_eq!(clean_label("", MAX_NAME).unwrap_err(), ProtoError::Invalid);
-        assert_eq!(clean_label("a\nb", MAX_NAME).unwrap_err(), ProtoError::Invalid);
+        assert_eq!(
+            clean_label("a\nb", MAX_NAME).unwrap_err(),
+            ProtoError::Invalid
+        );
         let long = "a".repeat(MAX_NAME + 1);
-        assert_eq!(clean_label(&long, MAX_NAME).unwrap_err(), ProtoError::Invalid);
+        assert_eq!(
+            clean_label(&long, MAX_NAME).unwrap_err(),
+            ProtoError::Invalid
+        );
         assert!(clean_label(&"a".repeat(MAX_NAME), MAX_NAME).is_ok());
         assert!(clean_label(&"a".repeat(MAX_CHAT), MAX_CHAT).is_ok());
         assert_eq!(
@@ -109,11 +145,6 @@ mod tests {
             name: "  Kit ".into(),
         })
         .unwrap();
-        assert_eq!(
-            msg,
-            ClientMsg::Hello {
-                name: "Kit".into()
-            }
-        );
+        assert_eq!(msg, ClientMsg::Hello { name: "Kit".into() });
     }
 }

@@ -74,7 +74,10 @@ mod tests {
 
     #[test]
     fn two_frames_in_one_buffer() {
-        let hello = encode_client(&ClientMsg::Hello { name: "Mara".into() }).unwrap();
+        let hello = encode_client(&ClientMsg::Hello {
+            name: "Mara".into(),
+        })
+        .unwrap();
         let join = encode_client(&ClientMsg::Join {
             channel: "Lobby".into(),
         })
@@ -103,7 +106,9 @@ mod tests {
     fn partial_frame_waits() {
         let frame = encode_client(&ClientMsg::Leave).unwrap();
         assert!(decode_client_frame(&frame[..3]).unwrap().is_none());
-        assert!(decode_client_frame(&frame[..frame.len() - 1]).unwrap().is_none());
+        assert!(decode_client_frame(&frame[..frame.len() - 1])
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -117,10 +122,16 @@ mod tests {
     fn bad_version_and_garbage_are_rejected() {
         let mut frame = encode_client(&ClientMsg::Leave).unwrap();
         frame[4] = 9;
-        assert_eq!(decode_client_frame(&frame).unwrap_err(), ProtoError::Version);
+        assert_eq!(
+            decode_client_frame(&frame).unwrap_err(),
+            ProtoError::Version
+        );
 
         let garbage = [4, 0, 0, 0, CONTROL_VERSION, 0xff, 0xff, 0xff];
-        assert_eq!(decode_client_frame(&garbage).unwrap_err(), ProtoError::Codec);
+        assert_eq!(
+            decode_client_frame(&garbage).unwrap_err(),
+            ProtoError::Codec
+        );
     }
 
     #[test]
@@ -140,7 +151,13 @@ mod tests {
 
     #[test]
     fn invalid_name_fails_after_a_well_formed_frame() {
-        let frame = encode_client(&ClientMsg::Hello { name: " \n ".into() }).unwrap();
-        assert_eq!(decode_client_frame(&frame).unwrap_err(), ProtoError::Invalid);
+        let frame = encode_client(&ClientMsg::Hello {
+            name: " \n ".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            decode_client_frame(&frame).unwrap_err(),
+            ProtoError::Invalid
+        );
     }
 }

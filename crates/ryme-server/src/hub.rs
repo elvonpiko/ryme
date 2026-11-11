@@ -19,6 +19,7 @@ struct User {
 pub struct Hub {
     next_id: u32,
     users: HashMap<u32, User>,
+    channels: Vec<String>,
 }
 
 impl Hub {
@@ -26,7 +27,20 @@ impl Hub {
         Self {
             next_id: 1,
             users: HashMap::new(),
+            channels: vec!["Lobby".to_string()],
         }
+    }
+
+    /// The host decides which rooms exist. A join cannot invent one.
+    pub fn allow(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() || name.len() > ryme_proto::MAX_CHANNEL || name.contains(['\n', '\r']) {
+            return;
+        }
+        if self.channels.iter().any(|room| room == name) {
+            return;
+        }
+        self.channels.push(name.to_string());
     }
 
     pub fn handle(&mut self, user: Option<u32>, msg: ClientMsg) -> Step {
@@ -106,11 +120,19 @@ impl Hub {
         let Some(existing) = self.users.get(&id) else {
             return reject(Some(id), "unknown");
         };
+        if !self.channels.iter().any(|room| room == &channel) {
+            return reject(Some(id), "no such channel");
+        }
         if existing.channel.as_deref() == Some(channel.as_str()) {
             let members = self.members(&channel);
+            let rooms = self.channels.clone();
             return Step {
                 user_id: Some(id),
-                to_self: vec![ServerMsg::Joined { channel, members }],
+                to_self: vec![ServerMsg::Joined {
+                    channel,
+                    members,
+                    rooms,
+                }],
                 to_others: Vec::new(),
             };
         }
@@ -137,9 +159,15 @@ impl Hub {
             )
         }));
         let members = self.members(&channel);
+        let rooms = self.channels.clone();
+        tracing::info!(user_id = id, %channel, "joined");
         Step {
             user_id: Some(id),
-            to_self: vec![ServerMsg::Joined { channel, members }],
+            to_self: vec![ServerMsg::Joined {
+                channel,
+                members,
+                rooms,
+            }],
             to_others,
         }
     }
@@ -154,6 +182,7 @@ impl Hub {
         if let Some(user) = self.users.get_mut(&id) {
             user.channel = None;
         }
+        tracing::info!(user_id = id, "left");
         Step {
             user_id: Some(id),
             to_self: vec![ServerMsg::Left],
@@ -263,6 +292,7 @@ impl Default for Hub {
 }
 
 fn reject(user_id: Option<u32>, reason: &str) -> Step {
+    tracing::info!(user_id, %reason, "rejected");
     Step {
         user_id,
         to_self: vec![ServerMsg::Reject {
@@ -284,9 +314,10 @@ mod tests {
 
     fn voice(seq: u32) -> Vec<u8> {
         encode_voice(&VoicePacket {
-            flags: 1,
+            speaker: 0,
             seq,
             timestamp: seq * 960,
+            flags: 0,
             payload: vec![seq as u8],
         })
         .unwrap()
@@ -335,6 +366,7 @@ mod tests {
                     name: "Mara".into(),
                     muted: false,
                 }],
+                rooms: vec!["Lobby".into()],
             }]
         );
 
@@ -384,6 +416,39 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_channel_does_not_get_created() {
+        let mut hub = Hub::new();
+        let mara = hello(&mut hub, "Mara");
+        let _ = hub.handle(
+            Some(mara),
+            ClientMsg::Join {
+                channel: "Lobby".into(),
+            },
+        );
+        let refused = hub.handle(
+            Some(mara),
+            ClientMsg::Join {
+                channel: "Loby".into(),
+            },
+        );
+        assert_eq!(
+            refused.to_self,
+            vec![ServerMsg::Reject {
+                reason: "no such channel".into(),
+            }]
+        );
+        assert!(refused.to_others.is_empty());
+        let jonas = hello(&mut hub, "Jonas");
+        let _ = hub.handle(
+            Some(jonas),
+            ClientMsg::Join {
+                channel: "Lobby".into(),
+            },
+        );
+        assert_eq!(hub.voice_targets(mara, &voice(1)), vec![jonas]);
+    }
+
+    #[test]
     fn switching_channels_leaves_the_old_one() {
         let mut hub = Hub::new();
         let mara = hello(&mut hub, "Mara");
@@ -400,6 +465,7 @@ mod tests {
                 channel: "Lobby".into(),
             },
         );
+        hub.allow("Ranked");
         let moved = hub.handle(
             Some(jonas),
             ClientMsg::Join {
@@ -431,6 +497,7 @@ mod tests {
                 channel: "Lobby".into(),
             },
         );
+        hub.allow("Ranked");
         let _ = hub.handle(
             Some(kit),
             ClientMsg::Join {

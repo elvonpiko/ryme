@@ -14,6 +14,7 @@ pub fn parse_invite(raw: &str) -> Result<Invite, ProtoError> {
         .ok_or(ProtoError::Invalid)?;
     let (addr, hex_fp) = rest.split_once("/#").ok_or(ProtoError::Invalid)?;
     let (host, port) = addr.rsplit_once(':').ok_or(ProtoError::Invalid)?;
+    let host = host.trim_matches(|c| c == '[' || c == ']');
     if host.is_empty() || host.chars().any(|c| c.is_whitespace() || c == '/') {
         return Err(ProtoError::Invalid);
     }
@@ -74,6 +75,13 @@ mod tests {
         assert_eq!(invite.host, "voice.example");
         assert_eq!(invite.port, 443);
         assert_eq!(invite.fingerprint, [0xab; 32]);
+    }
+
+    #[test]
+    fn parses_a_bracketed_ipv6_host() {
+        let invite = parse_invite(&sample("[2001:db8::1]")).unwrap();
+        assert_eq!(invite.host, "2001:db8::1");
+        assert_eq!(invite.port, 7777);
     }
 
     #[test]

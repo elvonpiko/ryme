@@ -5,7 +5,8 @@ use crate::identity::client_config;
 use crate::Server;
 use bytes::Bytes;
 use ryme_proto::{
-    decode_server_frame, encode_client, encode_voice, ClientMsg, ServerMsg, VoicePacket,
+    decode_server_frame, decode_voice, encode_client, encode_voice, ClientMsg, ServerMsg,
+    VoicePacket,
 };
 
 async fn dial(
@@ -123,18 +124,21 @@ async fn two_clients_share_voice_until_one_mutes() {
     ));
 
     let packet = encode_voice(&VoicePacket {
-        flags: 1,
+        speaker: 99,
         seq: 1,
         timestamp: 960,
+        flags: 0,
         payload: vec![7, 7, 7],
     })
     .unwrap();
-    a_conn.send_datagram(Bytes::from(packet.clone())).unwrap();
+    a_conn.send_datagram(Bytes::from(packet)).unwrap();
     let heard = tokio::time::timeout(Duration::from_secs(2), b_conn.read_datagram())
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(heard.as_ref(), packet.as_slice());
+    let heard = decode_voice(&heard).unwrap();
+    assert_eq!(heard.speaker, 1);
+    assert_eq!(heard.payload, vec![7, 7, 7]);
 
     send_msg(&mut a_send, &ClientMsg::Mute { muted: true }).await;
     assert!(matches!(
@@ -142,9 +146,10 @@ async fn two_clients_share_voice_until_one_mutes() {
         ServerMsg::Muted { muted: true, .. }
     ));
     let dropped = encode_voice(&VoicePacket {
-        flags: 1,
+        speaker: 1,
         seq: 2,
         timestamp: 1920,
+        flags: 0,
         payload: vec![8],
     })
     .unwrap();

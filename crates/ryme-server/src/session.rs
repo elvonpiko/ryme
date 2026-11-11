@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use ryme_proto::{decode_client_frame, encode_server, ClientMsg, ProtoError, ServerMsg};
+use ryme_proto::{
+    decode_client_frame, encode_server, stamp_speaker, ClientMsg, ProtoError, ServerMsg,
+};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::hub::{Hub, Step};
@@ -36,12 +38,21 @@ impl World {
     }
 
     fn voice(&mut self, from: u32, packet: Bytes) {
+        let mut packet = packet.to_vec();
+        if stamp_speaker(&mut packet, from).is_err() {
+            return;
+        }
         let targets = self.hub.voice_targets(from, &packet);
+        let packet = Bytes::from(packet);
         for id in targets {
             if let Some(pipes) = self.pipes.get(&id) {
                 let _ = pipes.voice.send(packet.clone());
             }
         }
+    }
+
+    fn allow(&mut self, name: &str) {
+        self.hub.allow(name);
     }
 
     fn disconnect(&mut self, id: u32) {
@@ -67,7 +78,10 @@ impl World {
 }
 
 pub async fn run(conn: quinn::Connection, world: Arc<Mutex<World>>) {
+    let peer = conn.remote_address();
+    tracing::info!(%peer, "connected");
     let Ok((send, mut recv)) = conn.accept_bi().await else {
+        tracing::info!(%peer, "disconnected");
         return;
     };
 
@@ -114,6 +128,7 @@ pub async fn run(conn: quinn::Connection, world: Arc<Mutex<World>>) {
     }
     drop(pipes);
     let _ = writer.await;
+    tracing::info!(%peer, "disconnected");
 }
 
 fn drain_frames(
@@ -163,4 +178,8 @@ async fn write_out(
 
 pub(crate) fn world() -> Arc<Mutex<World>> {
     Arc::new(Mutex::new(World::new()))
+}
+
+pub(crate) fn allow(world: &Mutex<World>, name: &str) {
+    world.lock().expect("hub").allow(name);
 }

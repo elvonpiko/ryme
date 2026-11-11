@@ -15,7 +15,10 @@ pub struct Server {
 
 impl Server {
     pub fn bind(addr: SocketAddr) -> Result<Self, ServerError> {
-        let identity = Identity::generate()?;
+        Self::bind_identity(addr, Identity::generate()?)
+    }
+
+    pub fn bind_identity(addr: SocketAddr, identity: Identity) -> Result<Self, ServerError> {
         let endpoint = listen(addr, &identity)?;
         Ok(Self {
             endpoint,
@@ -36,19 +39,30 @@ impl Server {
     }
 
     pub fn invite(&self, host: &str) -> String {
-        identity::invite_url(host, self.port(), &self.fingerprint)
+        self.invite_on(host, self.port())
+    }
+
+    pub fn invite_on(&self, host: &str, port: u16) -> String {
+        identity::invite_url(host, port, &self.fingerprint)
     }
 
     pub async fn serve(&self) {
         while let Some(incoming) = self.endpoint.accept().await {
+            let peer = incoming.remote_address();
             let world = Arc::clone(&self.world);
             tokio::spawn(async move {
                 let Ok(conn) = incoming.await else {
+                    tracing::info!(%peer, "handshake rejected");
                     return;
                 };
                 session::run(conn, world).await;
             });
         }
+    }
+
+    /// Add a room the host is willing to run. Lobby already exists.
+    pub fn allow(&self, name: &str) {
+        session::allow(&self.world, name);
     }
 }
 

@@ -28,7 +28,12 @@ jobs:
           targets: ${{ matrix.target }}
       - name: cross linker
         if: matrix.packages != ''
-        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.packages }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            sudo apt-get update && sudo apt-get install -y ${{ matrix.packages }} && exit 0
+            sleep 20
+          done
+          exit 1
       - name: build
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
@@ -75,7 +80,12 @@ jobs:
           targets: ${{ matrix.target }}
       - name: desktop libraries
         if: matrix.packages != ''
-        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.packages }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            sudo apt-get update && sudo apt-get install -y ${{ matrix.packages }} && exit 0
+            sleep 20
+          done
+          exit 1
       - name: build
         shell: bash
         run: cargo build -p ryme --release --locked --target ${{ matrix.target }}

@@ -27,6 +27,9 @@ slint-build = "1"
 members = ["crates/ryme-proto", "crates/ryme-server"]
 resolver = "2"
 
+[patch.crates-io]
+opusic-sys = { path = "crates/opusic-sys" }
+
 [profile.release]
 opt-level = 3
 lto = true

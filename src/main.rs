@@ -60,13 +60,6 @@ fn main() -> Result<(), slint::PlatformError> {
             let _ = ui.window().show();
         }
     });
-    let weak = ui.as_weak();
-    tray.on_clicked(move || {
-        if let Some(ui) = weak.upgrade() {
-            ui.window().set_minimized(false);
-            let _ = ui.window().show();
-        }
-    });
     tray.on_quit(|| {
         let _ = slint::quit_event_loop();
     });

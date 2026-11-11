@@ -1142,6 +1142,8 @@ export component RymeTray inherits SystemTrayIcon {
     callback show-window();
     callback quit();
 
+    clicked => { root.show-window(); }
+
     Menu {
         MenuItem {
             title: "Show";

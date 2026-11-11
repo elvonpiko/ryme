@@ -397,6 +397,7 @@ export component MainWindow inherits Window {
     callback logout();
     callback confirm-yes();
     callback confirm-no();
+    callback apply-update();
 
     in-out property <int> joined: -1;
     in-out property <int> panel: 0; // 0 home, 1 channels, 2 chat, 3 settings
@@ -410,6 +411,9 @@ export component MainWindow inherits Window {
     in-out property <string> toast: "";
     in-out property <bool> toast-danger: true;
     in-out property <bool> confirming: false;
+    in-out property <bool> confirm-danger: true;
+    in-out property <string> update-label: "";
+    in-out property <bool> update-busy: false;
     in-out property <string> confirm-title: "";
     in-out property <string> confirm-body: "";
     in-out property <string> confirm-accept: "";
@@ -491,6 +495,7 @@ export component MainWindow inherits Window {
                         Rectangle { x: 9px; y: 7px; width: 4px; height: 4px; border-radius: 2px; background: gear-ta.has-hover ? Theme.signal : Theme.muted; }
                         Rectangle { x: 15px; y: 12px; width: 4px; height: 4px; border-radius: 2px; background: gear-ta.has-hover ? Theme.signal : Theme.muted; }
                         Rectangle { x: 11px; y: 17px; width: 4px; height: 4px; border-radius: 2px; background: gear-ta.has-hover ? Theme.signal : Theme.muted; }
+                        if root.update-label != "": Rectangle { x: 16px; y: 4px; width: 6px; height: 6px; border-radius: 3px; background: Theme.signal; }
                         gear-ta := TouchArea { clicked => { root.panel = 3; } }
                     }
                     Rectangle {
@@ -908,6 +913,13 @@ export component MainWindow inherits Window {
                 HorizontalLayout {
                     padding-top: 4px;
                     alignment: start;
+                    spacing: 8px;
+                    if root.update-label != "": Pill {
+                        label: "Update";
+                        hue: Theme.signal;
+                        busy: root.update-busy;
+                        clicked => { root.apply-update(); }
+                    }
                     Pill { label: "Log out"; hue: Theme.danger; clicked => { root.logout(); } }
                 }
             }
@@ -1103,7 +1115,7 @@ export component MainWindow inherits Window {
                     spacing: 8px;
                     alignment: start;
                     Pill { label: "Cancel"; hue: Theme.muted; clicked => { root.confirm-no(); } }
-                    Pill { label: root.confirm-accept; hue: Theme.danger; clicked => { root.confirm-yes(); } }
+                    Pill { label: root.confirm-accept; hue: root.confirm-danger ? Theme.danger : Theme.signal; clicked => { root.confirm-yes(); } }
                 }
             }
         }
@@ -1121,5 +1133,25 @@ export component MainWindow inherits Window {
         stroke-width: 0.75px;
         stroke-line-cap: round;
         stroke-line-join: round;
+    }
+}
+
+export component RymeTray inherits SystemTrayIcon {
+    icon: @image-url("icon.svg");
+    tooltip: "Ryme";
+    callback show-window();
+    callback quit();
+
+    clicked => { root.show-window(); }
+
+    Menu {
+        MenuItem {
+            title: "Show";
+            activated => { root.show-window(); }
+        }
+        MenuItem {
+            title: "Quit";
+            activated => { root.quit(); }
+        }
     }
 }

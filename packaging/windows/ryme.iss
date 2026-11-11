@@ -48,6 +48,7 @@ Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environmen
 [Run]
 Filename: "{tmp}\vc_redist.x64.exe"; Parameters: "/install /quiet /norestart"; StatusMsg: "Installing the Microsoft Visual C++ runtime..."; Flags: waituntilterminated; Check: not VCRedistInstalled
 Filename: "{app}\ryme.exe"; Description: "Open Ryme"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\ryme.exe"; Flags: nowait; Check: WizardSilent
 
 [Code]
 const

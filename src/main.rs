@@ -6,6 +6,7 @@ mod ear;
 mod jitter;
 mod live;
 mod local;
+mod update;
 
 mod card_shape;
 
@@ -50,6 +51,29 @@ fn main() -> Result<(), slint::PlatformError> {
 
     #[cfg(windows)]
     win_frame::install(&ui);
+
+    let tray = RymeTray::new()?;
+    let weak = ui.as_weak();
+    tray.on_show_window(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.window().set_minimized(false);
+            let _ = ui.window().show();
+        }
+    });
+    let weak = ui.as_weak();
+    tray.on_clicked(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.window().set_minimized(false);
+            let _ = ui.window().show();
+        }
+    });
+    tray.on_quit(|| {
+        let _ = slint::quit_event_loop();
+    });
+    tray.show()?;
+
+    // The tray keeps the process alive, so closing the card only hides it.
+    ui.window().on_close_requested(|| slint::CloseRequestResponse::HideWindow);
 
     ui.run()
 }

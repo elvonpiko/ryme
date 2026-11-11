@@ -114,8 +114,8 @@ struct Slot {
 
 enum Ask {
     None,
-    Close,
     Logout,
+    Update,
 }
 
 pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) {
@@ -195,6 +195,7 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) {
                 return;
             }
             *ask.lock().unwrap() = Ask::Logout;
+            ui.set_confirm_danger(true);
             pose(
                 &ui,
                 "Log out",
@@ -206,25 +207,33 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) {
 
     ui.on_request_close({
         let weak = ui.as_weak();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                let _ = ui.window().hide();
+            }
+        }
+    });
+
+    ui.on_apply_update({
+        let weak = ui.as_weak();
         let ask = ask.clone();
         move || {
             let Some(ui) = weak.upgrade() else {
                 return;
             };
-            if ui.get_confirming() {
+            if ui.get_confirming() || ui.get_update_label().is_empty() || ui.get_update_busy() {
                 return;
             }
-            if ui.get_inside() && ui.get_joined() >= 0 {
-                *ask.lock().unwrap() = Ask::Close;
-                pose(
-                    &ui,
-                    "Close",
-                    "The call drops. Next open joins this channel again.",
-                    "Close",
-                );
-                return;
-            }
-            let _ = slint::quit_event_loop();
+            let in_call = ui.get_inside() && ui.get_joined() >= 0;
+            let body = if in_call {
+                "Ryme restarts and this call drops."
+            } else {
+                "Ryme restarts."
+            };
+            let title = ui.get_update_label().to_string();
+            *ask.lock().unwrap() = Ask::Update;
+            ui.set_confirm_danger(false);
+            pose(&ui, &title, body, "Update");
         }
     });
 
@@ -243,6 +252,8 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) {
         let weak = ui.as_weak();
         let ask = ask.clone();
         let slot = slot.clone();
+        let rt = rt.clone();
+        let notices = notices.clone();
         move || {
             let Some(ui) = weak.upgrade() else {
                 return;
@@ -261,12 +272,38 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) {
                     bump(&slot);
                     clear(&ui);
                 }
-                Ask::Close => {
-                    let _ = slint::quit_event_loop();
+                Ask::Update => {
+                    ui.set_update_busy(true);
+                    let weak = weak.clone();
+                    let rt = rt.clone();
+                    let notices = notices.clone();
+                    crate::update::launch(rt.clone(), move |message| {
+                        let Some(ui) = weak.upgrade() else {
+                            return;
+                        };
+                        ui.set_update_busy(false);
+                        note(&ui, &rt, &notices, &message);
+                    });
                 }
                 Ask::None => {}
             }
         }
+    });
+
+    let weak = ui.as_weak();
+    let ask = ask.clone();
+    crate::update::watch(rt.clone(), move |version| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let title = format!("{version} is ready");
+        ui.set_update_label(title.as_str().into());
+        if ui.get_inside() || ui.get_confirming() {
+            return;
+        }
+        *ask.lock().unwrap() = Ask::Update;
+        ui.set_confirm_danger(false);
+        pose(&ui, &title, "Ryme restarts.", "Update");
     });
 }
 

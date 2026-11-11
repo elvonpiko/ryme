@@ -1,6 +1,6 @@
 [package]
 name = "ryme"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 
 [dependencies]
@@ -10,7 +10,10 @@ rtrb = "0.4.1"
 ryme-proto = { path = "crates/ryme-proto" }
 ryme-server = { path = "crates/ryme-server" }
 slint = { version = "1", features = ["raw-window-handle-06"] }
+serde_json = "1"
+sha2 = "0.10"
 tokio = { version = "1", features = ["net", "rt-multi-thread", "time"] }
+ureq = { version = "2.12", default-features = false, features = ["tls", "json"] }
 
 [target.'cfg(any(target_os = "linux", windows))'.dependencies]
 raw-window-handle = "0.6"

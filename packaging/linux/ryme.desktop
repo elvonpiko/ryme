@@ -9,3 +9,4 @@ Terminal=false
 Categories=Network;AudioVideo;Audio;
 StartupNotify=false
 StartupWMClass=ryme
+SingleMainWindow=true

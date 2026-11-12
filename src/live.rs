@@ -245,26 +245,52 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
         }
     });
 
-    ui.on_apply_update({
+    ui.on_check_update({
         let weak = ui.as_weak();
         let ask = ask.clone();
+        let rt = rt.clone();
+        let notices = notices.clone();
         move || {
             let Some(ui) = weak.upgrade() else {
                 return;
             };
-            if ui.get_confirming() || ui.get_update_label().is_empty() || ui.get_update_busy() {
+            if ui.get_confirming() || ui.get_update_busy() {
                 return;
             }
-            let in_call = ui.get_inside() && ui.get_joined() >= 0;
-            let body = if in_call {
-                "Ryme restarts and this call drops."
-            } else {
-                "Ryme restarts."
-            };
-            let title = ui.get_update_label().to_string();
-            *ask.lock().unwrap() = Ask::Update;
-            ui.set_confirm_danger(false);
-            pose(&ui, &title, body, "Update");
+            if !ui.get_update_label().is_empty() {
+                let title = ui.get_update_label().to_string();
+                offer(&ui, &ask, &title);
+                return;
+            }
+            ui.set_update_busy(true);
+            let weak = weak.clone();
+            let ask = ask.clone();
+            let rt = rt.clone();
+            let notices = notices.clone();
+            rt.spawn(async move {
+                let status = match tokio::task::spawn_blocking(crate::update::check).await {
+                    Ok(status) => status,
+                    Err(_) => crate::update::Found::Failed("Could not check for an update.".into()),
+                };
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    ui.set_update_busy(false);
+                    match status {
+                        crate::update::Found::Ready(version) => {
+                            let title = format!("{version} is ready");
+                            ui.set_update_label(title.as_str().into());
+                            if !ui.get_confirming() {
+                                offer(&ui, &ask, &title);
+                            }
+                        }
+                        crate::update::Found::Current => {
+                            mention(&ui, &rt, &notices, "Ryme is up to date.");
+                        }
+                        crate::update::Found::Failed(message) => {
+                            note(&ui, &rt, &notices, &message);
+                        }
+                    }
+                });
+            });
         }
     });
 
@@ -321,21 +347,6 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
         }
     });
 
-    let weak = ui.as_weak();
-    let ask = ask.clone();
-    crate::update::watch(rt.clone(), move |version| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        let title = format!("{version} is ready");
-        ui.set_update_label(title.as_str().into());
-        if ui.get_inside() || ui.get_confirming() {
-            return;
-        }
-        *ask.lock().unwrap() = Ask::Update;
-        ui.set_confirm_danger(false);
-        pose(&ui, &title, "Ryme restarts.", "Update");
-    });
     Shutdown { slot }
 }
 
@@ -498,6 +509,18 @@ fn begin(
     });
 }
 
+fn offer(ui: &MainWindow, ask: &Mutex<Ask>, title: &str) {
+    let in_call = ui.get_inside() && ui.get_joined() >= 0;
+    let body = if in_call {
+        "Ryme will restart to update, and this call drops."
+    } else {
+        "Ryme will restart to update."
+    };
+    *ask.lock().unwrap() = Ask::Update;
+    ui.set_confirm_danger(false);
+    pose(ui, title, body, "Update");
+}
+
 fn pose(ui: &MainWindow, title: &str, body: &str, accept: &str) {
     ui.set_confirm_title(title.into());
     ui.set_confirm_body(body.into());
@@ -505,9 +528,23 @@ fn pose(ui: &MainWindow, title: &str, body: &str, accept: &str) {
     ui.set_confirming(true);
 }
 
+fn mention(ui: &MainWindow, rt: &tokio::runtime::Handle, notices: &Arc<AtomicU64>, text: &str) {
+    toast(ui, rt, notices, text, false);
+}
+
 fn note(ui: &MainWindow, rt: &tokio::runtime::Handle, notices: &Arc<AtomicU64>, text: &str) {
+    toast(ui, rt, notices, text, true);
+}
+
+fn toast(
+    ui: &MainWindow,
+    rt: &tokio::runtime::Handle,
+    notices: &Arc<AtomicU64>,
+    text: &str,
+    danger: bool,
+) {
     let token = notices.fetch_add(1, Ordering::Relaxed) + 1;
-    ui.set_toast_danger(true);
+    ui.set_toast_danger(danger);
     ui.set_toast(text.into());
     let notices = notices.clone();
     let weak = ui.as_weak();

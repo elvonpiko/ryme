@@ -13,6 +13,8 @@ mod place;
 mod single;
 
 #[cfg(target_os = "linux")]
+mod linux_tray;
+#[cfg(target_os = "linux")]
 mod x11_frame;
 
 #[cfg(windows)]
@@ -52,6 +54,26 @@ fn main() -> Result<(), slint::PlatformError> {
 
     place::install(&ui);
 
+    // Closing the card hides it. The tray is what keeps the process, and the
+    // call, alive after that.
+    ui.window()
+        .on_close_requested(|| slint::CloseRequestResponse::HideWindow);
+
+    // Slint's own tray registers as "slint-tray". GNOME treats that as a
+    // second application, so the dock shows two windows. The Linux tray uses
+    // the desktop id instead. Other desktops keep Slint's tray.
+    #[cfg(target_os = "linux")]
+    {
+        return match linux_tray::install(shutdown) {
+            Ok(()) => slint::run_event_loop_until_quit(),
+            Err(shutdown) => keep_in_tray(&ui, shutdown),
+        };
+    }
+    #[cfg(not(target_os = "linux"))]
+    keep_in_tray(&ui, shutdown)
+}
+
+fn keep_in_tray(ui: &MainWindow, shutdown: live::Shutdown) -> Result<(), slint::PlatformError> {
     let tray = RymeTray::new()?;
     let weak = ui.as_weak();
     tray.on_show_window(move || {
@@ -67,10 +89,5 @@ fn main() -> Result<(), slint::PlatformError> {
         let _ = slint::quit_event_loop();
     });
     tray.show()?;
-
-    // The tray keeps the process alive, so closing the card only hides it.
-    ui.window()
-        .on_close_requested(|| slint::CloseRequestResponse::HideWindow);
-
     ui.run()
 }

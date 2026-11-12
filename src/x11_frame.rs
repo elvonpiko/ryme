@@ -32,6 +32,10 @@ fn polish(ui: &crate::MainWindow) {
         return;
     };
 
+    // Slint sets the class and leaves the instance empty. GNOME then fails to
+    // match the window to ryme.desktop and keeps a second dock entry.
+    name_the_window(xid);
+
     let scale = window.scale_factor().max(1.0);
     let target_w = (CARD_W * scale).round().max(1.0) as u32;
     let target_h = (CARD_H * scale).round().max(1.0) as u32;
@@ -83,6 +87,24 @@ fn float_card_on_i3(xid: u32, width: u32, height: u32) {
     if !ok {
         MOVED.store(false, Ordering::Relaxed);
     }
+}
+
+fn name_the_window(xid: u32) {
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt, PropMode};
+    let Ok((conn, _)) = x11rb::connect(None) else {
+        return;
+    };
+    let Ok(cookie) = conn.change_property8(
+        PropMode::REPLACE,
+        xid,
+        AtomEnum::WM_CLASS,
+        AtomEnum::STRING,
+        b"ryme\0ryme\0",
+    ) else {
+        return;
+    };
+    let _ = cookie.check();
+    let _ = conn.flush();
 }
 
 fn clip_to_card(xid: u32, px_w: u32, px_h: u32) -> Result<(), String> {

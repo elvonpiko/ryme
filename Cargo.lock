@@ -2780,6 +2780,7 @@ dependencies = [
  "pastey",
  "serde",
  "task-local",
+ "tokio",
  "zbus",
 ]
 
@@ -4526,10 +4527,11 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "ryme"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "bytes",
  "cpal",
+ "ksni",
  "magnum-opus",
  "raw-window-handle",
  "rtrb",
@@ -5389,8 +5391,10 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
+ "tracing",
  "windows-sys 0.61.2",
 ]
 
@@ -6732,6 +6736,7 @@ dependencies = [
  "rustix 1.1.6",
  "serde",
  "serde_repr",
+ "tokio",
  "tracing",
  "uds_windows",
  "uuid",

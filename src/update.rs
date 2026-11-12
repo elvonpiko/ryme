@@ -1,4 +1,4 @@
-//! Background check against the GitHub release. A newer build is downloaded,
+//! A settings check against the GitHub release. A newer build is downloaded,
 //! checked against SHA256SUMS, and applied when the user asks.
 //!
 //! Asset names match .github/workflows/release.yml.
@@ -6,7 +6,7 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -29,11 +29,77 @@ struct Ready {
 
 static READY: Mutex<Option<Ready>> = Mutex::new(None);
 
-pub fn watch(rt: tokio::runtime::Handle, on_ready: impl Fn(String) + Send + Sync + 'static) {
-    if asset().is_none() {
-        return;
+pub enum Found {
+    Current,
+    Ready(String),
+    Failed(String),
+}
+
+/// Look up the latest release. Downloads and checks it when a newer one exists.
+pub fn check() -> Found {
+    if let Some(version) = READY
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|ready| ready.version.clone()))
+    {
+        return Found::Ready(version);
     }
-    schedule(rt, Arc::new(on_ready), Duration::from_secs(4));
+    let Some((name, kind)) = asset() else {
+        return Found::Failed("No update is published for this system.".into());
+    };
+    let release = match fetch_latest() {
+        Ok(release) => release,
+        Err(_) => return Found::Failed("Could not check for an update.".into()),
+    };
+    if !is_newer(&release.tag, CURRENT) {
+        return Found::Current;
+    }
+    let Some(url) = release.assets.get(name).cloned() else {
+        return Found::Failed("No update is published for this system.".into());
+    };
+    if !allowed(&url) {
+        return Found::Failed("Could not check for an update.".into());
+    }
+    let dir = std::env::temp_dir().join("ryme-update");
+    if fs::create_dir_all(&dir).is_err() {
+        return Found::Failed("Could not save the update.".into());
+    }
+    let path = dir.join(name);
+    if download(&url, &path).is_err() {
+        return Found::Failed("Could not download the update.".into());
+    }
+    let sums_url = format!(
+        "https://github.com/elvonpiko/ryme/releases/download/{}/SHA256SUMS",
+        release.tag
+    );
+    let sums_path = dir.join("SHA256SUMS");
+    if download(&sums_url, &sums_path).is_err() {
+        return Found::Failed("Could not check the update.".into());
+    }
+    let Ok(sums) = fs::read_to_string(&sums_path) else {
+        return Found::Failed("Could not check the update.".into());
+    };
+    let Some(want) = sum_for(&sums, name) else {
+        let _ = fs::remove_file(&path);
+        return Found::Failed("Could not check the update.".into());
+    };
+    let Ok(got) = sha256_file(&path) else {
+        return Found::Failed("Could not check the update.".into());
+    };
+    if !want.eq_ignore_ascii_case(&got) {
+        let _ = fs::remove_file(&path);
+        return Found::Failed("The update did not match.".into());
+    }
+    let version = release.tag.trim().trim_start_matches('v').to_string();
+    let Ok(mut guard) = READY.lock() else {
+        return Found::Failed("Could not save the update.".into());
+    };
+    *guard = Some(Ready {
+        version: version.clone(),
+        path,
+        kind,
+    });
+    Found::Ready(version)
 }
 
 pub fn launch(rt: tokio::runtime::Handle, on_error: impl FnOnce(String) + Send + 'static) {
@@ -58,62 +124,6 @@ pub fn launch(rt: tokio::runtime::Handle, on_error: impl FnOnce(String) + Send +
             }
         });
     });
-}
-
-fn schedule(
-    rt: tokio::runtime::Handle,
-    on_ready: Arc<dyn Fn(String) + Send + Sync>,
-    delay: Duration,
-) {
-    let next = rt.clone();
-    rt.spawn(async move {
-        tokio::time::sleep(delay).await;
-        let found = tokio::task::spawn_blocking(check_once).await.ok().flatten();
-        if let Some(version) = found {
-            let _ = slint::invoke_from_event_loop(move || on_ready(version));
-            return;
-        }
-        schedule(next, on_ready, Duration::from_secs(6 * 60 * 60));
-    });
-}
-
-fn check_once() -> Option<String> {
-    if READY.lock().ok()?.is_some() {
-        return None;
-    }
-    let (name, kind) = asset()?;
-    let release = fetch_latest().ok()?;
-    if !is_newer(&release.tag, CURRENT) {
-        return None;
-    }
-    let url = release.assets.get(name)?;
-    if !allowed(url) {
-        return None;
-    }
-    let dir = std::env::temp_dir().join("ryme-update");
-    fs::create_dir_all(&dir).ok()?;
-    let path = dir.join(name);
-    download(url, &path).ok()?;
-    let sums_url = format!(
-        "https://github.com/elvonpiko/ryme/releases/download/{}/SHA256SUMS",
-        release.tag
-    );
-    let sums_path = dir.join("SHA256SUMS");
-    download(&sums_url, &sums_path).ok()?;
-    let sums = fs::read_to_string(&sums_path).ok()?;
-    let want = sum_for(&sums, name)?;
-    let got = sha256_file(&path).ok()?;
-    if !want.eq_ignore_ascii_case(&got) {
-        let _ = fs::remove_file(&path);
-        return None;
-    }
-    let version = release.tag.trim().trim_start_matches('v').to_string();
-    *READY.lock().ok()? = Some(Ready {
-        version: version.clone(),
-        path,
-        kind,
-    });
-    Some(version)
 }
 
 struct Release {

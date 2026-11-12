@@ -399,7 +399,7 @@ export component MainWindow inherits Window {
     callback set-ptt(bool);
     callback confirm-yes();
     callback confirm-no();
-    callback apply-update();
+    callback check-update();
 
     in-out property <int> joined: -1;
     in-out property <int> panel: 0; // 0 home, 1 channels, 2 chat, 3 settings
@@ -839,80 +839,103 @@ export component MainWindow inherits Window {
                 Rectangle { height: 8px; }
             }
 
-            if root.panel == 3 : VerticalLayout {
+            if root.panel == 3 : Flickable {
                 vertical-stretch: 1;
-                padding-left: 22px;
-                padding-right: 22px;
-                padding-top: 2px;
-                spacing: 0px;
-                Rectangle {
-                    height: 34px;
-                    HorizontalLayout {
-                        alignment: space-between;
-                        Text { text: "Name"; color: Theme.ink; font-family: Theme.sans; font-size: 14px; font-weight: 500; vertical-alignment: center; }
-                        Text { text: root.display-name; color: Theme.muted; font-family: Theme.sans; font-size: 14px; vertical-alignment: center; }
-                    }
-                }
-                Rectangle {
-                    height: 34px;
-                    HorizontalLayout {
-                        alignment: space-between;
-                        Text { text: "Microphone"; color: Theme.ink; font-family: Theme.sans; font-size: 14px; font-weight: 500; vertical-alignment: center; }
-                        Text { text: "Default"; color: Theme.muted; font-family: Theme.sans; font-size: 14px; vertical-alignment: center; }
-                    }
-                }
-                Rectangle {
-                    height: 34px;
-                    HorizontalLayout {
-                        alignment: space-between;
-                        Text { text: "Speakers"; color: Theme.ink; font-family: Theme.sans; font-size: 14px; font-weight: 500; vertical-alignment: center; }
-                        Text { text: "Default"; color: Theme.muted; font-family: Theme.sans; font-size: 14px; vertical-alignment: center; }
-                    }
-                }
-                Rectangle {
-                    height: 36px;
-                    HorizontalLayout {
-                        alignment: space-between;
-                        Text { text: "Push to talk"; color: Theme.ink; font-family: Theme.sans; font-size: 14px; font-weight: 500; vertical-alignment: center; }
+                content-width: self.width;
+                content-height: settings-rows.preferred-height;
+                settings-rows := VerticalLayout {
+                    width: parent.width;
+                    padding-left: 22px;
+                    padding-right: 22px;
+                    padding-top: 2px;
+                    padding-bottom: 16px;
+                    spacing: 0px;
+                    Rectangle {
+                        height: 34px;
                         HorizontalLayout {
-                            spacing: 10px;
-                            alignment: center;
-                            if root.ptt : Text {
-                                text: "Hold V";
-                                color: Theme.muted;
-                                font-family: Theme.sans;
-                                font-size: 12px;
-                                vertical-alignment: center;
+                            alignment: space-between;
+                            Text { text: "Name"; color: Theme.ink; font-family: Theme.sans; font-size: 14px; font-weight: 500; vertical-alignment: center; }
+                            Text { text: root.display-name; color: Theme.muted; font-family: Theme.sans; font-size: 14px; vertical-alignment: center; }
+                        }
+                    }
+                    Rectangle {
+                        height: 34px;
+                        HorizontalLayout {
+                            alignment: space-between;
+                            Text { text: "Microphone"; color: Theme.ink; font-family: Theme.sans; font-size: 14px; font-weight: 500; vertical-alignment: center; }
+                            Text { text: "Default"; color: Theme.muted; font-family: Theme.sans; font-size: 14px; vertical-alignment: center; }
+                        }
+                    }
+                    Rectangle {
+                        height: 34px;
+                        HorizontalLayout {
+                            alignment: space-between;
+                            Text { text: "Speakers"; color: Theme.ink; font-family: Theme.sans; font-size: 14px; font-weight: 500; vertical-alignment: center; }
+                            Text { text: "Default"; color: Theme.muted; font-family: Theme.sans; font-size: 14px; vertical-alignment: center; }
+                        }
+                    }
+                    Rectangle {
+                        height: 36px;
+                        HorizontalLayout {
+                            alignment: space-between;
+                            Text { text: "Push to talk"; color: Theme.ink; font-family: Theme.sans; font-size: 14px; font-weight: 500; vertical-alignment: center; }
+                            HorizontalLayout {
+                                spacing: 10px;
+                                alignment: center;
+                                if root.ptt : Text {
+                                    text: "Hold V";
+                                    color: Theme.muted;
+                                    font-family: Theme.sans;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    Switch { on <=> root.ptt; }
+                                }
                             }
+                        }
+                    }
+                    Rectangle {
+                        height: 36px;
+                        HorizontalLayout {
+                            alignment: space-between;
+                            Text { text: "Soften noise"; color: Theme.ink; font-family: Theme.sans; font-size: 14px; font-weight: 500; vertical-alignment: center; }
                             VerticalLayout {
                                 alignment: center;
-                                Switch { on <=> root.ptt; }
+                                Switch { on <=> root.denoise; }
                             }
                         }
                     }
-                }
-                Rectangle {
-                    height: 36px;
-                    HorizontalLayout {
-                        alignment: space-between;
-                        Text { text: "Soften noise"; color: Theme.ink; font-family: Theme.sans; font-size: 14px; font-weight: 500; vertical-alignment: center; }
-                        VerticalLayout {
-                            alignment: center;
-                            Switch { on <=> root.denoise; }
+                    Rectangle {
+                        height: 36px;
+                        HorizontalLayout {
+                            alignment: space-between;
+                            Text { text: "Check for update"; color: Theme.ink; font-family: Theme.sans; font-size: 14px; font-weight: 500; vertical-alignment: center; }
+                            if root.update-busy : VerticalLayout {
+                                alignment: center;
+                                Spark { width: 9px; height: 9px; hue: Theme.signal; live: true; }
+                            }
+                            if !root.update-busy && root.update-label != "" : Text {
+                                text: "Ready";
+                                color: Theme.signal;
+                                font-family: Theme.sans;
+                                font-size: 13px;
+                                vertical-alignment: center;
+                            }
+                        }
+                        TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            clicked => { root.check-update(); }
                         }
                     }
-                }
-                HorizontalLayout {
-                    padding-top: 4px;
-                    alignment: start;
-                    spacing: 8px;
-                    if root.update-label != "": Pill {
-                        label: "Update";
-                        hue: Theme.signal;
-                        busy: root.update-busy;
-                        clicked => { root.apply-update(); }
+                    HorizontalLayout {
+                        padding-top: 8px;
+                        alignment: start;
+                        spacing: 8px;
+                        Pill { label: "Log out"; hue: Theme.danger; clicked => { root.logout(); } }
                     }
-                    Pill { label: "Log out"; hue: Theme.danger; clicked => { root.logout(); } }
                 }
             }
         }

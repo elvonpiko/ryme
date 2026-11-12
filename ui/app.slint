@@ -413,6 +413,7 @@ export component MainWindow inherits Window {
     in-out property <string> invite: "";
     in-out property <string> draft: "";
     in-out property <bool> joining: false;
+    in-out property <bool> reconnecting: false;
     in-out property <string> toast: "";
     in-out property <bool> toast-danger: true;
     in-out property <bool> confirming: false;
@@ -603,7 +604,8 @@ export component MainWindow inherits Window {
             padding-left: 22px;
             height: 18px;
             Text {
-                text: root.joined < 0 ? "Not in a channel"
+                text: root.reconnecting ? "Reconnecting."
+                    : root.joined < 0 ? "Not in a channel"
                     : root.channels[root.joined].members.length == 0 ? "Empty"
                     : ("" + root.channels[root.joined].members.length + " in channel");
                 color: Theme.muted;

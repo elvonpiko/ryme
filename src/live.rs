@@ -153,7 +153,7 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
         ui.set_invite(saved.invite.clone().into());
         if saved.resume {
             slot.lock().unwrap().resume_channel = saved.channel;
-            begin(ui, &slot, rt, &notices);
+            begin(ui, &slot, rt, &notices, false, 0);
         }
     }
 
@@ -164,7 +164,7 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
         let notices = notices.clone();
         move || {
             if let Some(ui) = ui_weak.upgrade() {
-                begin(&ui, &slot, &rt, &notices);
+                begin(&ui, &slot, &rt, &notices, false, 0);
             }
         }
     });
@@ -361,10 +361,15 @@ fn begin(
     slot: &Arc<Mutex<Slot>>,
     rt: &tokio::runtime::Handle,
     notices: &Arc<AtomicU64>,
+    retry: bool,
+    attempt: u32,
 ) {
     let name = ui.get_display_name().to_string();
     let invite = ui.get_invite().to_string();
+    let muted = ui.get_muted();
+    let deafened = ui.get_deafened();
     let gen = bump(slot);
+    ui.set_reconnecting(retry);
     ui.set_joining(true);
     ui.set_toast("".into());
     let weak = ui.as_weak();
@@ -382,14 +387,30 @@ fn begin(
                         return;
                     }
                     guard.link = Some(live.link.clone());
-                    guard.channel = live.channel.clone();
-                    std::mem::take(&mut guard.resume_channel)
+                    let resume = std::mem::take(&mut guard.resume_channel);
+                    guard.channel = if resume.is_empty() {
+                        live.channel.clone()
+                    } else {
+                        resume.clone()
+                    };
+                    resume
                 };
                 if !resume_channel.is_empty() && resume_channel != live.channel {
                     live.link.join(resume_channel.clone());
                 }
+                if muted {
+                    live.link.mute(true);
+                }
+                if deafened {
+                    live.link.deafen(true);
+                }
                 remember(&name, &invite, &live.channel, true);
                 let mut room = Room::new(live.me, live.channel.clone(), live.members, live.rooms);
+                if muted {
+                    if let Some(me) = room.members.iter_mut().find(|peer| peer.user_id == room.me) {
+                        me.muted = true;
+                    }
+                }
                 show(&weak, &slot, gen, &room, true);
                 let (speak_tx, mut speak_rx) = tokio::sync::mpsc::unbounded_channel();
                 let ear = crate::ear::open(live.voice, live.me, speak_tx);
@@ -400,6 +421,8 @@ fn begin(
                         return;
                     }
                     ear.set_ptt(guard.ptt);
+                    ear.set_muted(muted);
+                    ear.set_deaf(deafened);
                     guard.ear = Some(ear);
                 }
                 if !mic || !speakers {
@@ -447,25 +470,32 @@ fn begin(
                                 break;
                             }
                             if matches!(event, Event::Disconnected) {
-                                let ours = {
+                                let held = {
                                     let mut guard = slot.lock().unwrap();
-                                    if guard.generation == gen {
-                                        guard.link = None;
-                                        guard.ear = None;
-                                        guard.generation += 1;
-                                        true
+                                    if guard.generation != gen {
+                                        None
                                     } else {
-                                        false
+                                        guard.link = None;
+                                        let ear = guard.ear.take();
+                                        guard.generation += 1;
+                                        guard.resume_channel = guard.channel.clone();
+                                        Some((ear, guard.generation))
                                     }
                                 };
-                                if ours {
-                                    let notices = notices.clone();
-                                    let rt = task_rt.clone();
-                                    let _ = weak.upgrade_in_event_loop(move |ui| {
-                                        clear(&ui);
-                                        note(&ui, &rt, &notices, "The server closed the connection.");
-                                    });
-                                }
+                                let Some((ear, retry_gen)) = held else {
+                                    break;
+                                };
+                                drop(ear);
+                                let weak = weak.clone();
+                                let slot = slot.clone();
+                                let notices = notices.clone();
+                                let _ = weak.upgrade_in_event_loop(move |ui| {
+                                    ui.set_panel(0);
+                                    ui.set_reconnecting(true);
+                                    ui.set_joining(false);
+                                    ui.set_toast("".into());
+                                });
+                                pursue(&task_rt, &weak, &slot, &notices, 0, retry_gen);
                                 break;
                             }
                             if let Event::Rejected { reason } = &event {
@@ -498,6 +528,18 @@ fn begin(
                 if slot.lock().unwrap().generation != gen {
                     return;
                 }
+                let next = attempt.saturating_add(1);
+                if retry && matches!(err, LinkError::Unreachable) && pace(next).is_some() {
+                    let weak = weak.clone();
+                    let slot = slot.clone();
+                    let notices = notices.clone();
+                    let _ = weak.upgrade_in_event_loop(move |ui| {
+                        ui.set_reconnecting(true);
+                        ui.set_joining(false);
+                    });
+                    pursue(&task_rt, &weak, &slot, &notices, next, gen);
+                    return;
+                }
                 let message = explain(err);
                 let notices = notices.clone();
                 let rt = task_rt.clone();
@@ -506,8 +548,7 @@ fn begin(
                     if slot.lock().unwrap().generation != gen {
                         return;
                     }
-                    ui.set_joining(false);
-                    ui.set_inside(false);
+                    clear(&ui);
                     note(&ui, &rt, &notices, &message);
                 });
             }
@@ -596,6 +637,7 @@ fn show(weak: &Weak<MainWindow>, slot: &Arc<Mutex<Slot>>, gen: u64, room: &Room,
             return;
         }
         ui.set_joining(false);
+        ui.set_reconnecting(false);
         if entered {
             ui.set_toast("".into());
         }
@@ -612,6 +654,7 @@ fn show(weak: &Weak<MainWindow>, slot: &Arc<Mutex<Slot>>, gen: u64, room: &Room,
 fn clear(ui: &MainWindow) {
     ui.set_inside(false);
     ui.set_joining(false);
+    ui.set_reconnecting(false);
     ui.set_joined(-1);
     ui.set_panel(0);
     ui.set_muted(false);
@@ -701,5 +744,57 @@ fn explain(err: LinkError) -> String {
         LinkError::Invite => "That invite is not a ryme link.".into(),
         LinkError::Unreachable => "Could not reach that server.".into(),
         LinkError::Rejected(reason) => reason,
+    }
+}
+
+// A dropped call gets three attempts back. The first wait is the server's
+// silent-member timeout, so the new session does not sit beside the old one.
+const ATTEMPTS: u32 = 3;
+const QUIET_WAIT: Duration = Duration::from_secs(16);
+const AGAIN_WAIT: Duration = Duration::from_secs(10);
+
+fn pace(attempt: u32) -> Option<Duration> {
+    if attempt >= ATTEMPTS {
+        return None;
+    }
+    Some(if attempt == 0 { QUIET_WAIT } else { AGAIN_WAIT })
+}
+
+fn pursue(
+    rt: &tokio::runtime::Handle,
+    weak: &Weak<MainWindow>,
+    slot: &Arc<Mutex<Slot>>,
+    notices: &Arc<AtomicU64>,
+    attempt: u32,
+    gen: u64,
+) {
+    let Some(wait) = pace(attempt) else {
+        return;
+    };
+    let weak = weak.clone();
+    let slot = slot.clone();
+    let rt = rt.clone();
+    let notices = notices.clone();
+    rt.spawn(async move {
+        tokio::time::sleep(wait).await;
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            if slot.lock().unwrap().generation != gen {
+                return;
+            }
+            begin(&ui, &slot, &rt, &notices, true, attempt);
+        });
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pace, AGAIN_WAIT, ATTEMPTS, QUIET_WAIT};
+
+    #[test]
+    fn a_drop_is_tried_three_times_and_then_stops() {
+        assert_eq!(pace(0), Some(QUIET_WAIT));
+        assert_eq!(pace(1), Some(AGAIN_WAIT));
+        assert_eq!(pace(ATTEMPTS - 1), Some(AGAIN_WAIT));
+        assert_eq!(pace(ATTEMPTS), None);
     }
 }

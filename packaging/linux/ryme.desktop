@@ -7,4 +7,5 @@ Exec=ryme
 Icon=ryme
 Terminal=false
 Categories=Network;AudioVideo;Audio;
-StartupNotify=true
+StartupNotify=false
+StartupWMClass=ryme

@@ -711,14 +711,26 @@ fn prefer_f32(
     input: bool,
 ) -> cpal::SupportedStreamConfig {
     use cpal::traits::DeviceTrait;
-    let ranges = if input {
-        device.supported_input_configs().ok()
+    if input {
+        device
+            .supported_input_configs()
+            .ok()
+            .map(|ranges| choose_f32(ranges, fallback.clone()))
+            .unwrap_or(fallback)
     } else {
-        device.supported_output_configs().ok()
-    };
-    let Some(ranges) = ranges else {
-        return fallback;
-    };
+        device
+            .supported_output_configs()
+            .ok()
+            .map(|ranges| choose_f32(ranges, fallback.clone()))
+            .unwrap_or(fallback)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn choose_f32(
+    ranges: impl Iterator<Item = cpal::SupportedStreamConfigRange>,
+    fallback: cpal::SupportedStreamConfig,
+) -> cpal::SupportedStreamConfig {
     let rate = fallback.sample_rate();
     let channels = fallback.channels();
     ranges

@@ -20,6 +20,7 @@ mkdir -p \
 
 install -m 0755 "$binary" "$root/usr/bin/ryme"
 install -m 0644 packaging/linux/ryme.desktop "$root/usr/share/applications/ryme.desktop"
+install -m 0755 packaging/linux/postinst "$root/DEBIAN/postinst"
 install -m 0644 packaging/icon/ryme-48.png "$root/usr/share/icons/hicolor/48x48/apps/ryme.png"
 install -m 0644 "$icon" "$root/usr/share/icons/hicolor/256x256/apps/ryme.png"
 

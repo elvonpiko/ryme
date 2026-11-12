@@ -27,6 +27,9 @@ fn main() -> Result<(), slint::PlatformError> {
         .build()
         .expect("tokio");
     let ui = MainWindow::new()?;
+    // The dock matches this id to ryme.desktop. It has to be set before the
+    // window is created, which is the first time the card is shown.
+    let _ = slint::set_xdg_app_id("ryme");
     let shutdown = live::attach(&ui, rt.handle());
     single::watch(ui.as_weak());
 
@@ -34,21 +37,6 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.on_minimize(move || {
         if let Some(ui) = weak.upgrade() {
             ui.window().set_minimized(true);
-        }
-    });
-
-    // Frameless window dragging (works on Windows and X11).
-    // Wayland forbids apps from positioning themselves; see notes.
-    let weak = ui.as_weak();
-    ui.on_drag(move |dx, dy| {
-        if let Some(ui) = weak.upgrade() {
-            let w = ui.window();
-            let s = w.scale_factor();
-            let p = w.position();
-            w.set_position(slint::PhysicalPosition::new(
-                p.x + (dx * s) as i32,
-                p.y + (dy * s) as i32,
-            ));
         }
     });
 

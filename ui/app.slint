@@ -432,6 +432,14 @@ export component MainWindow inherits Window {
     in-out property <[Channel]> channels: [];
     in-out property <[Line]> lines: [];
 
+    // "Up to date." is a confirmation, not a setting. It leaves so the page
+    // settles back to the rows and the two buttons.
+    Timer {
+        interval: 3s;
+        running: root.update-note == "Up to date.";
+        triggered => { root.update-note = ""; }
+    }
+
     // Round top-left, torn bottom-right. Keep this path in sync with src/x11_frame.rs.
     // Fill only. The rim is a separate path, drawn last, so nothing covers it.
     Path {
@@ -544,10 +552,11 @@ export component MainWindow inherits Window {
         Hairline { }
 
         Rectangle {
-            height: 32px;
+            height: 36px;
             HorizontalLayout {
                 padding-left: 22px;
-                spacing: 8px;
+                padding-right: 22px;
+                spacing: 2px;
                 alignment: start;
                 Text {
                     text: root.joined >= 0 ? root.channels[root.joined].name : "Pick a channel";
@@ -556,23 +565,38 @@ export component MainWindow inherits Window {
                     font-size: 21px;
                     font-weight: 700;
                     vertical-alignment: center;
+                    horizontal-stretch: 0;
                 }
                 VerticalLayout {
+                    width: 28px;
                     alignment: center;
-                    Path {
-                        width: 10px;
-                        height: 6px;
-                        viewbox-width: 10;
-                        viewbox-height: 6;
-                        commands: "M 1 1 L 5 5 L 9 1";
-                        stroke: Theme.signal;
-                        stroke-width: 1.5px;
-                        stroke-line-cap: round;
-                        stroke-line-join: round;
+                    Rectangle {
+                        width: 28px;
+                        height: 28px;
+                        border-radius: 14px;
+                        background: room-ta.has-hover ? Theme.elevated : transparent;
+                        animate background { duration: 120ms; }
+                        Path {
+                            x: 9px;
+                            y: 11px;
+                            width: 10px;
+                            height: 6px;
+                            viewbox-width: 10;
+                            viewbox-height: 6;
+                            commands: "M 1 1 L 5 5 L 9 1";
+                            stroke: room-ta.has-hover ? Theme.signal : Theme.muted;
+                            stroke-width: 1.5px;
+                            stroke-line-cap: round;
+                            stroke-line-join: round;
+                        }
+                        room-ta := TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            clicked => { root.panel = 1; }
+                        }
                     }
                 }
             }
-            TouchArea { clicked => { root.panel = 1; } }
         }
 
         HorizontalLayout {
@@ -811,12 +835,21 @@ export component MainWindow inherits Window {
                 }
             }
 
-            if root.panel == 2 : VerticalLayout {
-                vertical-stretch: 1;
-                Flickable {
-                    vertical-stretch: 1;
+            // The body is the card under the header. The field is anchored to
+            // that box, so an empty thread cannot pack the field up under the title.
+            if root.panel == 2 : Rectangle {
+                height: root.height - 57px;
+                chat-view := Flickable {
+                    width: parent.width;
+                    height: parent.height - max(composer.preferred-height, 64px);
                     content-width: self.width;
                     content-height: chat-lines.preferred-height;
+                    property <length> span: chat-lines.preferred-height;
+                    changed span => {
+                        if (self.height > 0px) {
+                            self.content-y = min(0px, self.height - self.span);
+                        }
+                    }
                     chat-lines := VerticalLayout {
                         width: parent.width;
                         padding-left: 22px;
@@ -846,10 +879,13 @@ export component MainWindow inherits Window {
                         }
                     }
                 }
-                VerticalLayout {
+                composer := VerticalLayout {
+                    y: parent.height - max(self.preferred-height, 64px);
+                    width: parent.width;
                     padding-left: 22px;
                     padding-right: 22px;
-                    padding-bottom: 8px;
+                    padding-top: 12px;
+                    padding-bottom: 16px;
                     Field {
                         placeholder: "Say something";
                         value <=> root.draft;
@@ -1075,37 +1111,23 @@ export component MainWindow inherits Window {
         }
     }
 
-    // The note sits in the empty corner beside Join. A short line stays
-    // narrow. A longer one wraps and the bubble grows upward.
-    // Off the card so the line can be measured. A height of 0 reports no width,
-    // and the bubble then opens empty.
-    measure := Text {
-        y: -40px;
-        text: root.toast;
-        wrap: no-wrap;
-        font-family: Theme.sans;
-        font-size: 13px;
-        opacity: 0;
-    }
+    // Beside Join. The line keeps a real width from the start, so the first
+    // error is text on the elevated chip instead of an empty dark one.
     toast-bubble := Rectangle {
-        property <bool> open: root.toast != "";
-        property <length> text-w: min(measure.preferred-width, 200px);
-        width: open ? text-w + 24px : 8px;
-        height: open ? copy.preferred-height + 20px : 8px;
+        visible: root.toast != "";
         x: parent.width - self.width - 18px;
         y: parent.height - self.height - 16px;
-        border-radius: open ? 14px : 4px;
-        clip: true;
-        opacity: open ? 1 : 0;
+        width: 224px;
+        height: max(40px, copy.preferred-height + 20px);
+        border-radius: 14px;
         background: Theme.elevated;
         border-width: 1px;
         border-color: root.toast-danger ? Theme.danger : Theme.frame;
-        animate x, y, width, height, border-radius, opacity { duration: 280ms; easing: ease-out; }
 
         copy := Text {
             x: 12px;
             y: 10px;
-            width: parent.text-w;
+            width: 200px;
             text: root.toast;
             wrap: word-wrap;
             color: root.toast-danger ? Theme.danger : Theme.ink;

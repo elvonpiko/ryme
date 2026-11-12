@@ -728,7 +728,7 @@ fn prefer_f32(
 
 #[cfg(not(target_os = "linux"))]
 fn choose_f32(
-    ranges: impl Iterator<Item = cpal::SupportedStreamConfigRange>,
+    mut ranges: impl Iterator<Item = cpal::SupportedStreamConfigRange>,
     fallback: cpal::SupportedStreamConfig,
 ) -> cpal::SupportedStreamConfig {
     let rate = fallback.sample_rate();

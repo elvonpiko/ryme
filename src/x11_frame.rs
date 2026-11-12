@@ -90,7 +90,8 @@ fn float_card_on_i3(xid: u32, width: u32, height: u32) {
 }
 
 fn name_the_window(xid: u32) {
-    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt, PropMode};
+    use x11rb::protocol::xproto::{AtomEnum, PropMode};
+    use x11rb::wrapper::ConnectionExt as _;
     let Ok((conn, _)) = x11rb::connect(None) else {
         return;
     };

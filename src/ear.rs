@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -27,12 +27,21 @@ const RING: usize = 16_384;
 const MIC_GAIN: f32 = 2.5;
 const SPEECH: f32 = 0.015;
 
+#[derive(Clone, Copy)]
+pub struct Mix {
+    pub gain: f32,
+    pub quiet: bool,
+}
+
 pub struct Ear {
     stop: Arc<AtomicBool>,
     muted: Arc<AtomicBool>,
     deaf: Arc<AtomicBool>,
     live: Arc<AtomicBool>,
     ptt: Arc<AtomicBool>,
+    denoise: Arc<AtomicBool>,
+    vkey: Arc<AtomicBool>,
+    levels: Arc<Mutex<HashMap<u32, Mix>>>,
     pub mic: bool,
     pub speakers: bool,
     thread: Option<JoinHandle<()>>,
@@ -55,6 +64,19 @@ impl Ear {
     pub fn set_ptt(&self, ptt: bool) {
         self.ptt.store(ptt, Ordering::Relaxed);
     }
+
+    pub fn set_denoise(&self, on: bool) {
+        self.denoise.store(on, Ordering::Relaxed);
+    }
+
+    /// V, as seen by the window. The audio thread also reads the keyboard.
+    pub fn set_vkey(&self, down: bool) {
+        self.vkey.store(down, Ordering::Relaxed);
+    }
+
+    pub fn set_levels(&self, levels: HashMap<u32, Mix>) {
+        *self.levels.lock().unwrap() = levels;
+    }
 }
 
 impl Drop for Ear {
@@ -72,6 +94,9 @@ pub fn open(pipe: VoicePipe, me: u32, speaking: UnboundedSender<(u32, bool)>) ->
     let deaf = Arc::new(AtomicBool::new(false));
     let live = Arc::new(AtomicBool::new(true));
     let ptt = Arc::new(AtomicBool::new(false));
+    let denoise = Arc::new(AtomicBool::new(true));
+    let vkey = Arc::new(AtomicBool::new(false));
+    let levels = Arc::new(Mutex::new(HashMap::new()));
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     let thread = thread::spawn({
         let stop = stop.clone();
@@ -79,7 +104,14 @@ pub fn open(pipe: VoicePipe, me: u32, speaking: UnboundedSender<(u32, bool)>) ->
         let deaf = deaf.clone();
         let live = live.clone();
         let ptt = ptt.clone();
-        move || run(pipe, me, speaking, stop, muted, deaf, live, ptt, ready_tx)
+        let denoise = denoise.clone();
+        let vkey = vkey.clone();
+        let levels = levels.clone();
+        move || {
+            run(
+                pipe, me, speaking, stop, muted, deaf, live, ptt, denoise, vkey, levels, ready_tx,
+            )
+        }
     });
     let opened = ready_rx
         .recv_timeout(Duration::from_secs(2))
@@ -93,6 +125,9 @@ pub fn open(pipe: VoicePipe, me: u32, speaking: UnboundedSender<(u32, bool)>) ->
         deaf,
         live,
         ptt,
+        denoise,
+        vkey,
+        levels,
         mic: opened.mic,
         speakers: opened.speakers,
         thread: Some(thread),
@@ -113,6 +148,9 @@ fn run(
     deaf: Arc<AtomicBool>,
     live: Arc<AtomicBool>,
     ptt: Arc<AtomicBool>,
+    denoise: Arc<AtomicBool>,
+    vkey: Arc<AtomicBool>,
+    levels: Arc<Mutex<HashMap<u32, Mix>>>,
     ready: std::sync::mpsc::SyncSender<Opened>,
 ) {
     let (cap_rate, mut cap_rx, mic, cap_thread) = start_capture(stop.clone());
@@ -125,7 +163,11 @@ fn run(
     let mut encoder = Encoder::new(RATE, Channels::Mono, Application::Voip).ok();
     if let Some(encoder) = encoder.as_mut() {
         let _ = encoder.set_bitrate(Bitrate::Bits(64_000));
+        let _ = encoder.set_vbr(true);
+        let _ = encoder.set_inband_fec(true);
+        let _ = encoder.set_packet_loss_perc(8);
     }
+    let mut tone = Tone::new();
     let mut speakers: HashMap<u32, Mouth> = HashMap::new();
     let mut shown: HashMap<u32, bool> = HashMap::new();
     let mut mine = Meter::default();
@@ -141,7 +183,7 @@ fn run(
             ingest(&mut speakers, packet);
         }
         let keyed = if ptt.load(Ordering::Relaxed) {
-            key_held()
+            vkey.load(Ordering::Relaxed) || key_held()
         } else {
             true
         };
@@ -154,7 +196,7 @@ fn run(
                 let mut frame = [0f32; FRAME];
                 frame.copy_from_slice(&cap_48[..FRAME]);
                 cap_48.drain(..FRAME);
-                lift(&mut frame);
+                shape_frame(&mut frame, denoise.load(Ordering::Relaxed), &mut tone);
                 let sending =
                     live.load(Ordering::Relaxed) && !muted.load(Ordering::Relaxed) && keyed;
                 let talking = sending && mine.tick(&frame);
@@ -171,7 +213,10 @@ fn run(
             let filled = RING - play_tx.as_ref().map(|tx| tx.slots()).unwrap_or(RING);
             if filled + pending_play.len() < frame_device * 2 {
                 let mut mix = [0f32; FRAME];
-                let heard = mix_frame(&mut speakers, &mut mix, &speaking, &mut shown);
+                let heard = {
+                    let levels = levels.lock().unwrap().clone();
+                    mix_frame(&mut speakers, &mut mix, &speaking, &mut shown, &levels)
+                };
                 if deaf.load(Ordering::Relaxed) {
                     mix.fill(0.0);
                 }
@@ -233,6 +278,7 @@ fn mix_frame(
     mix: &mut [f32; FRAME],
     speaking: &UnboundedSender<(u32, bool)>,
     shown: &mut HashMap<u32, bool>,
+    levels: &HashMap<u32, Mix>,
 ) -> bool {
     let ids: Vec<u32> = speakers.keys().copied().collect();
     let mut heard = false;
@@ -247,17 +293,24 @@ fn mix_frame(
             Play::Packet(packet) => {
                 mouth.losses = 0;
                 if mouth.decoder.decode_float(&packet, &mut pcm, false).is_ok() {
-                    add(mix, &pcm);
                     tell(speaking, shown, id, mouth.meter.tick(&pcm));
-                    heard = true;
+                    if blend(&mut pcm, levels.get(&id).copied()) {
+                        add(mix, &pcm);
+                        heard = true;
+                    }
                 }
             }
             Play::Loss => {
                 mouth.losses = mouth.losses.saturating_add(1);
-                let _ = mouth.decoder.decode_float(&[], &mut pcm, false);
+                let fec = mouth.jitter.upcoming().map(|packet| packet.to_vec());
+                if let Some(packet) = fec {
+                    let _ = mouth.decoder.decode_float(&packet, &mut pcm, true);
+                } else {
+                    let _ = mouth.decoder.decode_float(&[], &mut pcm, false);
+                }
                 if mouth.losses > 30 {
                     gone.push(id);
-                } else {
+                } else if blend(&mut pcm, levels.get(&id).copied()) {
                     add(mix, &pcm);
                     heard = true;
                 }
@@ -285,10 +338,84 @@ fn soft(sample: f32) -> f32 {
     sample / (1.0 + sample.abs())
 }
 
-fn lift(frame: &mut [f32]) {
-    for sample in frame {
-        *sample = (*sample * MIC_GAIN).clamp(-1.0, 1.0);
+struct Tone {
+    prev_x: f32,
+    prev_y: f32,
+    floor: f32,
+    gate: f32,
+}
+
+impl Tone {
+    fn new() -> Self {
+        Self {
+            prev_x: 0.0,
+            prev_y: 0.0,
+            floor: 0.008,
+            gate: 1.0,
+        }
     }
+}
+
+/// High-pass, then an optional downward expander, then a soft peak.
+/// The expander is what Soften noise does. It does not add a look-ahead.
+fn shape_frame(frame: &mut [f32], soften: bool, tone: &mut Tone) {
+    const POLE: f32 = 0.986;
+    for sample in frame.iter_mut() {
+        let x = *sample;
+        let y = POLE * (tone.prev_y + x - tone.prev_x);
+        tone.prev_x = x;
+        tone.prev_y = y;
+        *sample = y;
+    }
+    let mut energy = 0.0f32;
+    for sample in frame.iter() {
+        energy += sample * sample;
+    }
+    let rms = (energy / frame.len().max(1) as f32).sqrt();
+    if soften {
+        // Follow the quiet parts only. A held voice must not become the new floor
+        // and then duck itself.
+        if rms <= tone.floor {
+            tone.floor = tone.floor * 0.80 + rms * 0.20;
+        } else if rms < tone.floor * 2.0 {
+            tone.floor = tone.floor * 0.99 + rms * 0.01;
+        }
+        let thresh = (tone.floor * 2.8).max(0.0015);
+        let target = if rms < thresh {
+            let ratio = (rms / thresh).clamp(0.0, 1.0);
+            (ratio * ratio).max(0.015)
+        } else {
+            1.0
+        };
+        tone.gate += (target - tone.gate) * 0.45;
+    } else {
+        tone.gate += (1.0 - tone.gate) * 0.45;
+    }
+    if (tone.gate - 1.0).abs() > 0.001 {
+        for sample in frame.iter_mut() {
+            *sample *= tone.gate;
+        }
+    }
+    for sample in frame.iter_mut() {
+        let x = *sample * MIC_GAIN;
+        *sample = x / (1.0 + x.abs());
+    }
+}
+
+fn blend(pcm: &mut [f32], level: Option<Mix>) -> bool {
+    let level = level.unwrap_or(Mix {
+        gain: 1.0,
+        quiet: false,
+    });
+    if level.quiet || level.gain <= 0.001 {
+        return false;
+    }
+    if (level.gain - 1.0).abs() > 0.001 {
+        for sample in pcm.iter_mut() {
+            *sample *= level.gain;
+        }
+    }
+    true
 }
 
 fn send_frame(encoder: &mut Encoder, pipe: &VoicePipe, seq: u32, frame: &[f32]) {
@@ -968,7 +1095,7 @@ fn key_held() -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        return linux_key_held().unwrap_or(true);
+        return linux_key_held().unwrap_or(false) || evdev_key_held();
     }
     #[cfg(target_os = "macos")]
     {
@@ -998,6 +1125,87 @@ fn mac_key_held() -> bool {
     }
     // HID system state, kVK_ANSI_V.
     unsafe { CGEventSourceKeyState(1, 0x09) }
+}
+
+#[cfg(target_os = "linux")]
+fn evdev_key_held() -> bool {
+    use std::cell::RefCell;
+    thread_local! {
+        static BOARD: RefCell<Option<Evdev>> = const { RefCell::new(None) };
+    }
+    BOARD.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(Evdev::open());
+        }
+        slot.as_mut().map(|board| board.down()).unwrap_or(false)
+    })
+}
+
+#[cfg(target_os = "linux")]
+struct Evdev {
+    files: Vec<std::fs::File>,
+    held: i32,
+}
+
+#[cfg(target_os = "linux")]
+impl Evdev {
+    fn open() -> Self {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut files = Vec::new();
+        for index in 0..32 {
+            let path = format!("/dev/input/event{index}");
+            let Ok(file) = OpenOptions::new()
+                .read(true)
+                .custom_flags(0x800)
+                .open(&path)
+            else {
+                continue;
+            };
+            files.push(file);
+        }
+        Self { files, held: 0 }
+    }
+
+    fn down(&mut self) -> bool {
+        use std::io::Read;
+        let mut dead = Vec::new();
+        for (index, file) in self.files.iter_mut().enumerate() {
+            let mut buf = [0u8; 24];
+            loop {
+                match file.read(&mut buf) {
+                    Ok(24) => {
+                        let kind = u16::from_ne_bytes([buf[16], buf[17]]);
+                        let code = u16::from_ne_bytes([buf[18], buf[19]]);
+                        let value = i32::from_ne_bytes([buf[20], buf[21], buf[22], buf[23]]);
+                        // EV_KEY, KEY_V. Repeat (2) does not change the hold.
+                        if kind == 1 && code == 47 {
+                            if value == 1 {
+                                self.held = self.held.saturating_add(1);
+                            } else if value == 0 {
+                                self.held = self.held.saturating_sub(1);
+                            }
+                        }
+                    }
+                    Ok(0) => {
+                        dead.push(index);
+                        break;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => {
+                        dead.push(index);
+                        break;
+                    }
+                    Ok(_) => break,
+                }
+            }
+        }
+        for index in dead.into_iter().rev() {
+            self.files.swap_remove(index);
+        }
+        self.held > 0
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1073,7 +1281,6 @@ impl XKeys {
     }
 
     fn down(&mut self) -> Option<bool> {
-        use x11rb::connection::Connection;
         use x11rb::protocol::xproto::ConnectionExt;
         if self.at.elapsed() < Duration::from_millis(20) {
             return Some(self.down);
@@ -1095,6 +1302,74 @@ impl XKeys {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn soften_pulls_room_noise_down_and_leaves_a_voice() {
+        let mut tone = Tone::new();
+        let mut noise = [0f32; FRAME];
+        for (index, sample) in noise.iter_mut().enumerate() {
+            *sample = (index as f32 * 0.37).sin() * 0.0015;
+        }
+        shape_frame(&mut noise, true, &mut tone);
+        let noise_rms = rms(&noise);
+        let mut voice = [0f32; FRAME];
+        for (index, sample) in voice.iter_mut().enumerate() {
+            *sample = (index as f32 * 0.15).sin() * 0.2;
+        }
+        for _ in 0..8 {
+            shape_frame(&mut voice.clone(), true, &mut tone);
+        }
+        shape_frame(&mut voice, true, &mut tone);
+        let voice_rms = rms(&voice);
+        assert!(
+            noise_rms < 0.02,
+            "noise should be softened, rms {noise_rms}"
+        );
+        assert!(
+            voice_rms > noise_rms * 4.0,
+            "voice {voice_rms} should stay well above the noise {noise_rms}"
+        );
+    }
+
+    #[test]
+    fn a_held_voice_does_not_become_the_noise_floor() {
+        let mut tone = Tone::new();
+        let mut frame = [0f32; FRAME];
+        for (index, sample) in frame.iter_mut().enumerate() {
+            *sample = (index as f32 * 0.13).sin() * 0.12;
+        }
+        for _ in 0..400 {
+            let mut pass = frame;
+            shape_frame(&mut pass, true, &mut tone);
+        }
+        shape_frame(&mut frame, true, &mut tone);
+        let voice = rms(&frame);
+        assert!(
+            voice > 0.05,
+            "a held voice was ducked to {voice} (floor {})",
+            tone.floor
+        );
+    }
+
+    #[test]
+    fn a_hot_mic_is_rounded_instead_of_squared_off() {
+        let mut tone = Tone::new();
+        let mut frame = [0f32; FRAME];
+        for (index, sample) in frame.iter_mut().enumerate() {
+            *sample = (index as f32 * 0.2).sin() * 0.9;
+        }
+        shape_frame(&mut frame, false, &mut tone);
+        let peak = frame
+            .iter()
+            .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+        assert!(peak < 0.95, "peak {peak}");
+        assert!(peak > 0.4, "peak {peak}");
+    }
+
+    fn rms(frame: &[f32]) -> f32 {
+        let energy: f32 = frame.iter().map(|sample| sample * sample).sum();
+        (energy / frame.len() as f32).sqrt()
+    }
 
     #[test]
     fn quiet_room_stays_dark_and_speech_lights_the_ring() {

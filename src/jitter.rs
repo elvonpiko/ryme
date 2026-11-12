@@ -75,6 +75,12 @@ impl Jitter {
         }
     }
 
+    /// The packet that would play after the one `pull` just reported, still queued.
+    pub fn upcoming(&self) -> Option<&[u8]> {
+        self.next
+            .and_then(|seq| self.queued.get(&seq).map(Vec::as_slice))
+    }
+
     pub fn pull(&mut self) -> Play {
         if !self.started {
             return Play::Wait;
@@ -149,6 +155,7 @@ mod tests {
         jitter.push(1, vec![9]);
         assert_eq!(jitter.pull(), Play::Packet(vec![2]));
         assert_eq!(jitter.pull(), Play::Loss);
+        assert_eq!(jitter.upcoming(), Some(&[4][..]));
         assert_eq!(jitter.pull(), Play::Packet(vec![4]));
     }
 

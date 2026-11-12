@@ -3,13 +3,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use ryme_proto::parse_invite;
 use ryme_server::{connect, Event, Link, LinkError, Peer};
 
-use crate::ear::Ear;
+use crate::ear::{Ear, Mix};
+use crate::local::{self, Level, Saved};
 use slint::{ComponentHandle, ModelRc, VecModel, Weak};
 
-use crate::local::{self, Saved};
-use crate::{Channel, Line, MainWindow, Member};
+use crate::{Band, Channel, Line, MainWindow, Member, Seat};
 
 const TINTS: [[u8; 3]; 6] = [
     [0xc9, 0xc6, 0xbf],
@@ -63,12 +64,17 @@ impl Room {
                     self.rooms = rooms;
                 }
             }
-            Event::PeerJoined { user_id, name } => {
+            Event::PeerJoined {
+                user_id,
+                name,
+                card,
+            } => {
                 if !self.members.iter().any(|peer| peer.user_id == user_id) {
                     self.members.push(Peer {
                         user_id,
                         name,
                         muted: false,
+                        card,
                     });
                 }
             }
@@ -111,6 +117,10 @@ struct Slot {
     channel: String,
     resume_channel: String,
     ptt: bool,
+    denoise: bool,
+    server: [u8; 32],
+    roster: HashMap<u32, u64>,
+    levels: HashMap<u64, Level>,
 }
 
 enum Ask {
@@ -145,12 +155,18 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
         channel: String::new(),
         resume_channel: String::new(),
         ptt: ui.get_ptt(),
+        denoise: ui.get_denoise(),
+        server: [0; 32],
+        roster: HashMap::new(),
+        levels: HashMap::new(),
     }));
     let ask = Arc::new(Mutex::new(Ask::None));
     let notices = Arc::new(AtomicU64::new(0));
     if let Some(saved) = local::load() {
         ui.set_display_name(saved.name.clone().into());
         ui.set_invite(saved.invite.clone().into());
+        ui.set_denoise(saved.denoise);
+        slot.lock().unwrap().denoise = saved.denoise;
         if saved.resume {
             slot.lock().unwrap().resume_channel = saved.channel;
             begin(ui, &slot, rt, &notices, false, 0);
@@ -203,6 +219,43 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
                 ear.set_ptt(on);
             }
         }
+    });
+
+    ui.on_set_denoise({
+        let slot = slot.clone();
+        move |on| {
+            let mut guard = slot.lock().unwrap();
+            guard.denoise = on;
+            if let Some(ear) = guard.ear.as_ref() {
+                ear.set_denoise(on);
+            }
+            drop(guard);
+            if let Some(mut saved) = local::load() {
+                saved.denoise = on;
+                local::store(&saved);
+            }
+        }
+    });
+
+    ui.on_v_key({
+        let slot = slot.clone();
+        move |down| {
+            if let Some(ear) = slot.lock().unwrap().ear.as_ref() {
+                ear.set_vkey(down);
+            }
+        }
+    });
+
+    ui.on_tune({
+        let slot = slot.clone();
+        let weak = ui.as_weak();
+        move |gain| adjust(&slot, &weak, |level| level.gain = gain.clamp(0.0, 2.0))
+    });
+
+    ui.on_hush({
+        let slot = slot.clone();
+        let weak = ui.as_weak();
+        move |quiet| adjust(&slot, &weak, |level| level.quiet = quiet)
     });
 
     ui.on_leave_channel({
@@ -325,12 +378,16 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
             let pending = std::mem::replace(&mut *ask.lock().unwrap(), Ask::None);
             match pending {
                 Ask::Logout => {
-                    let channel = slot.lock().unwrap().channel.clone();
+                    let (channel, denoise) = {
+                        let guard = slot.lock().unwrap();
+                        (guard.channel.clone(), guard.denoise)
+                    };
                     local::store(&Saved {
                         name: ui.get_display_name().to_string(),
                         invite: ui.get_invite().to_string(),
                         channel,
                         resume: false,
+                        denoise,
                     });
                     bump(&slot);
                     clear(&ui);
@@ -378,7 +435,15 @@ fn begin(
     let task_rt = rt.clone();
     let notices = notices.clone();
     rt.spawn(async move {
-        match connect(&invite, &name).await {
+        let server = parse_invite(&invite)
+            .map(|parsed| parsed.fingerprint)
+            .unwrap_or([0; 32]);
+        {
+            let mut guard = slot.lock().unwrap();
+            guard.server = server;
+            guard.levels = local::load_levels(&server);
+        }
+        match connect(&invite, &name, local::card()).await {
             Ok(live) => {
                 let resume_channel = {
                     let mut guard = slot.lock().unwrap();
@@ -404,7 +469,8 @@ fn begin(
                 if deafened {
                     live.link.deafen(true);
                 }
-                remember(&name, &invite, &live.channel, true);
+                let denoise = slot.lock().unwrap().denoise;
+                remember(&name, &invite, &live.channel, true, denoise);
                 let mut room = Room::new(live.me, live.channel.clone(), live.members, live.rooms);
                 if muted {
                     if let Some(me) = room.members.iter_mut().find(|peer| peer.user_id == room.me) {
@@ -421,8 +487,10 @@ fn begin(
                         return;
                     }
                     ear.set_ptt(guard.ptt);
+                    ear.set_denoise(guard.denoise);
                     ear.set_muted(muted);
                     ear.set_deaf(deafened);
+                    ear.set_levels(hearing(&guard.roster, &guard.levels));
                     guard.ear = Some(ear);
                 }
                 if !mic || !speakers {
@@ -453,10 +521,15 @@ fn begin(
                                     let weak = weak.clone();
                                     let slot = slot.clone();
                                     let _ = weak.upgrade_in_event_loop(move |ui| {
-                                        if slot.lock().unwrap().generation != gen {
-                                            return;
-                                        }
+                                        let levels = {
+                                            let guard = slot.lock().unwrap();
+                                            if guard.generation != gen {
+                                                return;
+                                            }
+                                            guard.levels.clone()
+                                        };
                                         ui.set_channels(channels(&snapshot));
+                                        ui.set_bands(bands(&snapshot, &levels));
                                     });
                                 }
                                 None => speak_open = false,
@@ -511,7 +584,8 @@ fn begin(
                             room.apply(event);
                             if joined {
                                 slot.lock().unwrap().channel = room.channel.clone();
-                                remember(&name, &invite, &room.channel, true);
+                                let denoise = slot.lock().unwrap().denoise;
+                                remember(&name, &invite, &room.channel, true, denoise);
                             }
                             if let Some(ear) = slot.lock().unwrap().ear.as_ref() {
                                 ear.set_live(room.in_channel);
@@ -604,13 +678,38 @@ fn toast(
     });
 }
 
-fn remember(name: &str, invite: &str, channel: &str, resume: bool) {
+fn remember(name: &str, invite: &str, channel: &str, resume: bool, denoise: bool) {
     local::store(&Saved {
         name: name.to_string(),
         invite: invite.to_string(),
         channel: channel.to_string(),
         resume,
+        denoise,
     });
+}
+
+fn adjust(slot: &Arc<Mutex<Slot>>, weak: &Weak<MainWindow>, change: impl FnOnce(&mut Level)) {
+    let Some(ui) = weak.upgrade() else {
+        return;
+    };
+    let id = ui.get_picked();
+    if id < 0 {
+        return;
+    }
+    let mut guard = slot.lock().unwrap();
+    let Some(card) = guard.roster.get(&(id as u32)).copied() else {
+        return;
+    };
+    let level = guard.levels.entry(card).or_insert(Level {
+        gain: 1.0,
+        quiet: false,
+    });
+    change(level);
+    local::store_levels(&guard.server, &guard.levels);
+    let mixes = hearing(&guard.roster, &guard.levels);
+    if let Some(ear) = guard.ear.as_ref() {
+        ear.set_levels(mixes);
+    }
 }
 
 fn bump(slot: &Arc<Mutex<Slot>>) -> u64 {
@@ -633,9 +732,22 @@ fn show(weak: &Weak<MainWindow>, slot: &Arc<Mutex<Slot>>, gen: u64, room: &Room,
     let room = room.clone();
     let slot = slot.clone();
     let _ = weak.upgrade_in_event_loop(move |ui| {
-        if slot.lock().unwrap().generation != gen {
-            return;
-        }
+        let levels = {
+            let mut guard = slot.lock().unwrap();
+            if guard.generation != gen {
+                return;
+            }
+            guard.roster = room
+                .members
+                .iter()
+                .map(|peer| (peer.user_id, peer.card))
+                .collect();
+            let mixes = hearing(&guard.roster, &guard.levels);
+            if let Some(ear) = guard.ear.as_ref() {
+                ear.set_levels(mixes);
+            }
+            guard.levels.clone()
+        };
         ui.set_joining(false);
         ui.set_reconnecting(false);
         if entered {
@@ -644,11 +756,47 @@ fn show(weak: &Weak<MainWindow>, slot: &Arc<Mutex<Slot>>, gen: u64, room: &Room,
         ui.set_inside(true);
         ui.set_joined(place(&room));
         ui.set_channels(channels(&room));
+        ui.set_bands(bands(&room, &levels));
         ui.set_lines(lines(&room));
+        let picked = ui.get_picked();
+        if picked >= 0 {
+            if let Some(peer) = room
+                .members
+                .iter()
+                .find(|peer| peer.user_id == picked as u32)
+            {
+                let level = levels.get(&peer.card).copied().unwrap_or(Level {
+                    gain: 1.0,
+                    quiet: false,
+                });
+                ui.set_picked_name(peer.name.clone().into());
+                ui.set_picked_quiet(level.quiet);
+                ui.set_picked_gain(level.gain);
+            } else {
+                ui.set_picked(-1);
+            }
+        }
         if let Some(me) = room.members.iter().find(|peer| peer.user_id == room.me) {
             ui.set_muted(me.muted);
         }
     });
+}
+
+fn hearing(roster: &HashMap<u32, u64>, levels: &HashMap<u64, Level>) -> HashMap<u32, Mix> {
+    roster
+        .iter()
+        .filter_map(|(id, card)| {
+            levels.get(card).map(|level| {
+                (
+                    *id,
+                    Mix {
+                        gain: level.gain,
+                        quiet: level.quiet,
+                    },
+                )
+            })
+        })
+        .collect()
 }
 
 fn clear(ui: &MainWindow) {
@@ -661,6 +809,8 @@ fn clear(ui: &MainWindow) {
     ui.set_deafened(false);
     ui.set_channels(ModelRc::new(VecModel::from(Vec::<Channel>::new())));
     ui.set_lines(ModelRc::new(VecModel::from(Vec::<Line>::new())));
+    ui.set_bands(ModelRc::new(VecModel::from(Vec::<Band>::new())));
+    ui.set_picked(-1);
 }
 
 fn place(room: &Room) -> i32 {
@@ -704,6 +854,47 @@ fn channels(room: &Room) -> ModelRc<Channel> {
                 name: name.into(),
                 members: ModelRc::new(VecModel::from(members)),
             }
+        })
+        .collect::<Vec<_>>();
+    ModelRc::new(VecModel::from(rows))
+}
+
+fn bands(room: &Room, levels: &HashMap<u64, Level>) -> ModelRc<Band> {
+    if !room.in_channel {
+        return ModelRc::new(VecModel::from(Vec::new()));
+    }
+    let seats: Vec<Seat> = room
+        .members
+        .iter()
+        .map(|peer| {
+            let level = levels.get(&peer.card).copied().unwrap_or(Level {
+                gain: 1.0,
+                quiet: false,
+            });
+            let initial = peer
+                .name
+                .chars()
+                .next()
+                .map(|glyph| glyph.to_uppercase().collect::<String>())
+                .unwrap_or_else(|| "?".to_string());
+            let [red, green, blue] = TINTS[(peer.user_id as usize) % TINTS.len()];
+            Seat {
+                name: peer.name.clone().into(),
+                initial: initial.into(),
+                tint: slint::Color::from_rgb_u8(red, green, blue),
+                muted: peer.muted,
+                speaking: room.speaking.get(&peer.user_id).copied().unwrap_or(false),
+                id: peer.user_id as i32,
+                quiet: level.quiet,
+                mine: peer.user_id == room.me,
+                gain: level.gain,
+            }
+        })
+        .collect();
+    let rows = seats
+        .chunks(5)
+        .map(|row| Band {
+            seats: ModelRc::new(VecModel::from(row.to_vec())),
         })
         .collect::<Vec<_>>();
     ModelRc::new(VecModel::from(rows))

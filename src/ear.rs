@@ -22,12 +22,17 @@ use crate::jitter::{Jitter, Play};
 const RATE: u32 = 48_000;
 const FRAME: usize = 480;
 const RING: usize = 16_384;
+// Laptop mics often sit well below a full-scale voice. Lift before the meter
+// and the encoder, then light the ring a little under a quiet speaking level.
+const MIC_GAIN: f32 = 2.5;
+const SPEECH: f32 = 0.015;
 
 pub struct Ear {
     stop: Arc<AtomicBool>,
     muted: Arc<AtomicBool>,
     deaf: Arc<AtomicBool>,
     live: Arc<AtomicBool>,
+    ptt: Arc<AtomicBool>,
     pub mic: bool,
     pub speakers: bool,
     thread: Option<JoinHandle<()>>,
@@ -45,6 +50,11 @@ impl Ear {
     pub fn set_live(&self, live: bool) {
         self.live.store(live, Ordering::Relaxed);
     }
+
+    /// Push-to-talk holds the microphone until V is down. Off means open mic.
+    pub fn set_ptt(&self, ptt: bool) {
+        self.ptt.store(ptt, Ordering::Relaxed);
+    }
 }
 
 impl Drop for Ear {
@@ -61,13 +71,15 @@ pub fn open(pipe: VoicePipe, me: u32, speaking: UnboundedSender<(u32, bool)>) ->
     let muted = Arc::new(AtomicBool::new(false));
     let deaf = Arc::new(AtomicBool::new(false));
     let live = Arc::new(AtomicBool::new(true));
+    let ptt = Arc::new(AtomicBool::new(false));
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     let thread = thread::spawn({
         let stop = stop.clone();
         let muted = muted.clone();
         let deaf = deaf.clone();
         let live = live.clone();
-        move || run(pipe, me, speaking, stop, muted, deaf, live, ready_tx)
+        let ptt = ptt.clone();
+        move || run(pipe, me, speaking, stop, muted, deaf, live, ptt, ready_tx)
     });
     let opened = ready_rx
         .recv_timeout(Duration::from_secs(2))
@@ -80,6 +92,7 @@ pub fn open(pipe: VoicePipe, me: u32, speaking: UnboundedSender<(u32, bool)>) ->
         muted,
         deaf,
         live,
+        ptt,
         mic: opened.mic,
         speakers: opened.speakers,
         thread: Some(thread),
@@ -99,6 +112,7 @@ fn run(
     muted: Arc<AtomicBool>,
     deaf: Arc<AtomicBool>,
     live: Arc<AtomicBool>,
+    ptt: Arc<AtomicBool>,
     ready: std::sync::mpsc::SyncSender<Opened>,
 ) {
     let (cap_rate, mut cap_rx, mic, cap_thread) = start_capture(stop.clone());
@@ -126,7 +140,12 @@ fn run(
         while let Some(packet) = pipe.try_recv() {
             ingest(&mut speakers, packet);
         }
-        if muted.load(Ordering::Relaxed) || !live.load(Ordering::Relaxed) {
+        let keyed = if ptt.load(Ordering::Relaxed) {
+            key_held()
+        } else {
+            true
+        };
+        if muted.load(Ordering::Relaxed) || !live.load(Ordering::Relaxed) || !keyed {
             tell(&speaking, &mut shown, me, false);
         }
         if encoder.is_some() {
@@ -135,7 +154,9 @@ fn run(
                 let mut frame = [0f32; FRAME];
                 frame.copy_from_slice(&cap_48[..FRAME]);
                 cap_48.drain(..FRAME);
-                let sending = live.load(Ordering::Relaxed) && !muted.load(Ordering::Relaxed);
+                lift(&mut frame);
+                let sending =
+                    live.load(Ordering::Relaxed) && !muted.load(Ordering::Relaxed) && keyed;
                 let talking = sending && mine.tick(&frame);
                 tell(&speaking, &mut shown, me, talking);
                 if sending {
@@ -264,6 +285,12 @@ fn soft(sample: f32) -> f32 {
     sample / (1.0 + sample.abs())
 }
 
+fn lift(frame: &mut [f32]) {
+    for sample in frame {
+        *sample = (*sample * MIC_GAIN).clamp(-1.0, 1.0);
+    }
+}
+
 fn send_frame(encoder: &mut Encoder, pipe: &VoicePipe, seq: u32, frame: &[f32]) {
     let mut packet = [0u8; 400];
     let Ok(n) = encoder.encode_float(frame, &mut packet) else {
@@ -307,8 +334,8 @@ impl Meter {
             energy += sample * sample;
         }
         let rms = (energy / frame.len().max(1) as f32).sqrt();
-        if rms > 0.02 {
-            self.hang = 12;
+        if rms > SPEECH {
+            self.hang = 30;
             self.on = true;
         } else if self.hang > 0 {
             self.hang -= 1;
@@ -603,23 +630,14 @@ fn capture_thread(
         let _ = ready.send((false, RATE));
         return;
     };
-    let channels = supported.channels() as usize;
-    let rate = supported.sample_rate();
-    let config = cpal::StreamConfig {
-        channels: supported.channels(),
-        sample_rate: supported.sample_rate(),
-        buffer_size: cpal::BufferSize::Default,
-    };
+    let chosen = prefer_f32(&device, supported, true);
+    let channels = chosen.channels() as usize;
+    let rate = chosen.sample_rate();
+    let config = stream_config(&chosen);
     let Ok(stream) = device.build_input_stream_raw(
         config,
-        supported.sample_format(),
-        move |data, _| {
-            if let Some(samples) = data.as_slice::<f32>() {
-                push_f32(&mut producer, samples, channels);
-            } else if let Some(samples) = data.as_slice::<i16>() {
-                push_i16(&mut producer, samples, channels);
-            }
-        },
+        chosen.sample_format(),
+        move |data, _| push_captured(&mut producer, data, channels),
         |_| {},
         None,
     ) else {
@@ -651,23 +669,14 @@ fn playback_thread(
         let _ = ready.send((false, RATE));
         return;
     };
-    let channels = supported.channels() as usize;
-    let rate = supported.sample_rate();
-    let config = cpal::StreamConfig {
-        channels: supported.channels(),
-        sample_rate: supported.sample_rate(),
-        buffer_size: cpal::BufferSize::Default,
-    };
+    let chosen = prefer_f32(&device, supported, false);
+    let channels = chosen.channels() as usize;
+    let rate = chosen.sample_rate();
+    let config = stream_config(&chosen);
     let Ok(stream) = device.build_output_stream_raw(
         config,
-        supported.sample_format(),
-        move |data, _| {
-            if let Some(samples) = data.as_slice_mut::<f32>() {
-                fill_f32(samples, channels, &mut consumer);
-            } else if let Some(samples) = data.as_slice_mut::<i16>() {
-                fill_i16(samples, channels, &mut consumer);
-            }
-        },
+        chosen.sample_format(),
+        move |data, _| fill_captured(data, channels, &mut consumer),
         |_| {},
         None,
     ) else {
@@ -681,6 +690,184 @@ fn playback_thread(
     let _ = ready.send((true, rate));
     while !stop.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stream_config(supported: &cpal::SupportedStreamConfig) -> cpal::StreamConfig {
+    cpal::StreamConfig {
+        channels: supported.channels(),
+        sample_rate: supported.sample_rate(),
+        buffer_size: cpal::BufferSize::Default,
+    }
+}
+
+/// Shared-mode Windows and macOS devices are often 24-bit. Asking for float
+/// lets the host convert; the callback still accepts the formats it might get.
+#[cfg(not(target_os = "linux"))]
+fn prefer_f32(
+    device: &cpal::Device,
+    fallback: cpal::SupportedStreamConfig,
+    input: bool,
+) -> cpal::SupportedStreamConfig {
+    use cpal::traits::DeviceTrait;
+    let ranges = if input {
+        device.supported_input_configs().ok()
+    } else {
+        device.supported_output_configs().ok()
+    };
+    let Some(ranges) = ranges else {
+        return fallback;
+    };
+    let rate = fallback.sample_rate();
+    let channels = fallback.channels();
+    ranges
+        .find(|range| {
+            range.channels() == channels
+                && range.sample_format() == cpal::SampleFormat::F32
+                && range.min_sample_rate() <= rate
+                && range.max_sample_rate() >= rate
+        })
+        .map(|range| range.with_sample_rate(rate))
+        .unwrap_or(fallback)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn push_captured(producer: &mut Producer<f32>, data: &cpal::Data, channels: usize) {
+    use cpal::SampleFormat::*;
+    match data.sample_format() {
+        F32 => {
+            if let Some(samples) = data.as_slice::<f32>() {
+                push_f32(producer, samples, channels);
+            }
+        }
+        F64 => {
+            if let Some(samples) = data.as_slice::<f64>() {
+                push_mapped(producer, samples, channels, |sample| sample as f32);
+            }
+        }
+        I8 => {
+            if let Some(samples) = data.as_slice::<i8>() {
+                push_mapped(producer, samples, channels, |sample| {
+                    sample as f32 / i8::MAX as f32
+                });
+            }
+        }
+        I16 => {
+            if let Some(samples) = data.as_slice::<i16>() {
+                push_i16(producer, samples, channels);
+            }
+        }
+        I24 => {
+            if let Some(samples) = data.as_slice::<cpal::I24>() {
+                push_mapped(producer, samples, channels, |sample| {
+                    sample.inner() as f32 / 8_388_608.0
+                });
+            }
+        }
+        I32 => {
+            if let Some(samples) = data.as_slice::<i32>() {
+                push_mapped(producer, samples, channels, |sample| {
+                    sample as f32 / i32::MAX as f32
+                });
+            }
+        }
+        U8 => {
+            if let Some(samples) = data.as_slice::<u8>() {
+                push_mapped(producer, samples, channels, |sample| {
+                    (sample as f32 - 128.0) / 128.0
+                });
+            }
+        }
+        U16 => {
+            if let Some(samples) = data.as_slice::<u16>() {
+                push_mapped(producer, samples, channels, |sample| {
+                    (sample as f32 - 32_768.0) / 32_768.0
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fill_captured(data: &mut cpal::Data, channels: usize, consumer: &mut Consumer<f32>) {
+    use cpal::SampleFormat::*;
+    match data.sample_format() {
+        F32 => {
+            if let Some(samples) = data.as_slice_mut::<f32>() {
+                fill_f32(samples, channels, consumer);
+            }
+        }
+        F64 => {
+            if let Some(samples) = data.as_slice_mut::<f64>() {
+                fill_mapped(samples, channels, consumer, |sample| sample as f64);
+            }
+        }
+        I16 => {
+            if let Some(samples) = data.as_slice_mut::<i16>() {
+                fill_i16(samples, channels, consumer);
+            }
+        }
+        I24 => {
+            if let Some(samples) = data.as_slice_mut::<cpal::I24>() {
+                fill_mapped(samples, channels, consumer, |sample| {
+                    cpal::I24::new_unchecked((sample.clamp(-1.0, 1.0) * 8_388_607.0) as i32)
+                });
+            }
+        }
+        I32 => {
+            if let Some(samples) = data.as_slice_mut::<i32>() {
+                fill_mapped(samples, channels, consumer, |sample| {
+                    (sample.clamp(-1.0, 1.0) * i32::MAX as f32) as i32
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn push_mapped<T: Copy>(
+    producer: &mut Producer<f32>,
+    samples: &[T],
+    channels: usize,
+    map: impl Fn(T) -> f32,
+) {
+    if channels <= 1 {
+        for sample in samples {
+            if producer.push(map(*sample)).is_err() {
+                break;
+            }
+        }
+        return;
+    }
+    for frame in samples.chunks(channels) {
+        let sample = frame.iter().map(|sample| map(*sample)).sum::<f32>() / channels as f32;
+        if producer.push(sample).is_err() {
+            break;
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fill_mapped<T: Copy>(
+    samples: &mut [T],
+    channels: usize,
+    consumer: &mut Consumer<f32>,
+    map: impl Fn(f32) -> T,
+) {
+    if channels <= 1 {
+        for sample in samples {
+            *sample = map(consumer.pop().unwrap_or(0.0));
+        }
+        return;
+    }
+    for frame in samples.chunks_mut(channels) {
+        let mapped = map(consumer.pop().unwrap_or(0.0));
+        for channel in frame {
+            *channel = mapped;
+        }
     }
 }
 
@@ -760,9 +947,150 @@ fn push_i16(producer: &mut Producer<f32>, samples: &[i16], channels: usize) {
     }
 }
 
+/// V, wherever the card is. A desktop we cannot read does not mute an open mic
+/// that the switch has put into push-to-talk.
+fn key_held() -> bool {
+    #[cfg(windows)]
+    {
+        return win_key_held();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return linux_key_held().unwrap_or(true);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return mac_key_held();
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        true
+    }
+}
+
+#[cfg(windows)]
+fn win_key_held() -> bool {
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetAsyncKeyState(key: i32) -> i16;
+    }
+    // VK_V. The high bit is set while it is down.
+    unsafe { GetAsyncKeyState(0x56) < 0 }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_key_held() -> bool {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGEventSourceKeyState(state: i32, key: u16) -> bool;
+    }
+    // HID system state, kVK_ANSI_V.
+    unsafe { CGEventSourceKeyState(1, 0x09) }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_key_held() -> Option<bool> {
+    use std::cell::{Cell, RefCell};
+    thread_local! {
+        static KEYS: RefCell<Option<XKeys>> = const { RefCell::new(None) };
+        static FAILED: Cell<bool> = const { Cell::new(false) };
+    }
+    if FAILED.with(|failed| failed.get()) {
+        return None;
+    }
+    KEYS.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            match XKeys::open() {
+                Some(keys) => *slot = Some(keys),
+                None => {
+                    FAILED.with(|failed| failed.set(true));
+                    return None;
+                }
+            }
+        }
+        slot.as_mut().and_then(|keys| keys.down())
+    })
+}
+
+#[cfg(target_os = "linux")]
+struct XKeys {
+    conn: x11rb::rust_connection::RustConnection,
+    codes: Vec<u8>,
+    at: std::time::Instant,
+    down: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl XKeys {
+    fn open() -> Option<Self> {
+        use x11rb::connection::Connection;
+        use x11rb::protocol::xproto::ConnectionExt;
+        let (conn, _) = x11rb::connect(None).ok()?;
+        let (first, count) = {
+            let setup = conn.setup();
+            (
+                setup.min_keycode,
+                setup
+                    .max_keycode
+                    .saturating_sub(setup.min_keycode)
+                    .saturating_add(1),
+            )
+        };
+        let reply = conn.get_keyboard_mapping(first, count).ok()?.reply().ok()?;
+        let per = reply.keysyms_per_keycode as usize;
+        if per == 0 {
+            return None;
+        }
+        let mut codes = Vec::new();
+        for (index, group) in reply.keysyms.chunks(per).enumerate() {
+            // XK_v and XK_V.
+            if group.iter().any(|sym| *sym == 0x76 || *sym == 0x56) {
+                codes.push(first.saturating_add(index as u8));
+            }
+        }
+        if codes.is_empty() {
+            return None;
+        }
+        Some(Self {
+            conn,
+            codes,
+            at: std::time::Instant::now() - Duration::from_secs(1),
+            down: false,
+        })
+    }
+
+    fn down(&mut self) -> Option<bool> {
+        use x11rb::connection::Connection;
+        use x11rb::protocol::xproto::ConnectionExt;
+        if self.at.elapsed() < Duration::from_millis(20) {
+            return Some(self.down);
+        }
+        let reply = self.conn.query_keymap().ok()?.reply().ok()?;
+        self.at = std::time::Instant::now();
+        self.down = self.codes.iter().any(|code| {
+            let code = *code as usize;
+            reply
+                .keys
+                .get(code / 8)
+                .map(|byte| byte & (1 << (code % 8)) != 0)
+                .unwrap_or(false)
+        });
+        Some(self.down)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quiet_room_stays_dark_and_speech_lights_the_ring() {
+        let mut meter = Meter::default();
+        assert!(!meter.tick(&[0.004; FRAME]));
+        assert!(meter.tick(&[0.05; FRAME]));
+        assert!(meter.tick(&[0.0; FRAME]));
+    }
 
     #[test]
     fn a_ten_ms_frame_roundtrips_through_opus() {

@@ -126,7 +126,7 @@ component Avatar inherits Rectangle {
         width: 100%;
         height: 100%;
         border-radius: 23px;
-        border-width: root.speaking ? 1.5px : 0px;
+        border-width: root.speaking ? 2.5px : 0px;
         border-color: root.tint;
         animate border-width { duration: 160ms; easing: ease-out; }
     }
@@ -137,7 +137,7 @@ component Avatar inherits Rectangle {
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         border-radius: 18px;
-        background: root.speaking ? root.tint.with-alpha(0.18) : Theme.surface;
+        background: root.speaking ? root.tint.with-alpha(0.4) : Theme.surface;
         border-width: 1px;
         // Muted stays fully drawn, in the quiet ink. Fading the disc made the person vanish.
         border-color: root.muted ? Theme.frame : root.tint;
@@ -397,6 +397,7 @@ export component MainWindow inherits Window {
     callback leave-channel();
     callback pick-channel(string);
     callback logout();
+    callback set-ptt(bool);
     callback confirm-yes();
     callback confirm-no();
     callback apply-update();
@@ -419,7 +420,10 @@ export component MainWindow inherits Window {
     in-out property <string> confirm-title: "";
     in-out property <string> confirm-body: "";
     in-out property <string> confirm-accept: "";
-    in-out property <bool> ptt: true;
+    in-out property <bool> ptt: false;
+    changed ptt => {
+        root.set-ptt(root.ptt);
+    }
     in-out property <bool> denoise: true;
     in-out property <[Channel]> channels: [];
     in-out property <[Line]> lines: [];
@@ -895,9 +899,20 @@ export component MainWindow inherits Window {
                     HorizontalLayout {
                         alignment: space-between;
                         Text { text: "Push to talk"; color: Theme.ink; font-family: Theme.sans; font-size: 14px; font-weight: 500; vertical-alignment: center; }
-                        VerticalLayout {
+                        HorizontalLayout {
+                            spacing: 10px;
                             alignment: center;
-                            Switch { on <=> root.ptt; }
+                            if root.ptt : Text {
+                                text: "Hold V";
+                                color: Theme.muted;
+                                font-family: Theme.sans;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                Switch { on <=> root.ptt; }
+                            }
                         }
                     }
                 }

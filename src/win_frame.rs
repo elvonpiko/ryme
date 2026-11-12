@@ -19,6 +19,7 @@ use windows_sys::Win32::Graphics::Gdi::{CreatePolygonRgn, DeleteObject, SetWindo
 use crate::card_shape::outline_px;
 
 pub fn install(ui: &crate::MainWindow) {
+    crate::single::arm();
     polish(ui);
     for delay in [80_u64, 250, 700, 1400] {
         let weak = ui.as_weak();
@@ -144,6 +145,10 @@ unsafe extern "system" fn wnd_proc(
 ) -> LRESULT {
     let prev = PREV_WNDPROC.load(Ordering::Acquire);
     if prev == 0 {
+        return 0;
+    }
+    if msg != 0 && msg == crate::single::show_message() {
+        crate::single::show_now();
         return 0;
     }
     match msg {

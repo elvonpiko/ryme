@@ -239,9 +239,10 @@ pub fn datagram_transport() -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.datagram_receive_buffer_size(Some(1024 * 1024));
     // Mute, a left channel, and a missing microphone send no voice. A keepalive
-    // inside the idle window is what keeps that session connected.
-    transport.keep_alive_interval(Some(std::time::Duration::from_secs(20)));
-    transport.max_idle_timeout(Some(std::time::Duration::from_secs(60).try_into().unwrap()));
+    // inside the idle window is what keeps that session connected. A process
+    // that died without a close still leaves the lobby, but only for this long.
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(4)));
+    transport.max_idle_timeout(Some(std::time::Duration::from_secs(15).try_into().unwrap()));
     transport
 }
 

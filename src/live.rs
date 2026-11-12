@@ -110,6 +110,7 @@ struct Slot {
     generation: u64,
     channel: String,
     resume_channel: String,
+    ptt: bool,
 }
 
 enum Ask {
@@ -118,13 +119,32 @@ enum Ask {
     Update,
 }
 
-pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) {
+pub struct Shutdown {
+    slot: Arc<Mutex<Slot>>,
+}
+
+impl Shutdown {
+    /// Tell the server this member is gone, and leave the socket up long enough
+    /// for that close to leave the machine.
+    pub fn hang_up(&self) -> bool {
+        let guard = self.slot.lock().unwrap();
+        if let Some(link) = guard.link.as_ref() {
+            link.logout();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
     let slot = Arc::new(Mutex::new(Slot {
         link: None,
         ear: None,
         generation: 0,
         channel: String::new(),
         resume_channel: String::new(),
+        ptt: ui.get_ptt(),
     }));
     let ask = Arc::new(Mutex::new(Ask::None));
     let notices = Arc::new(AtomicU64::new(0));
@@ -171,6 +191,17 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) {
                 ear.set_deaf(deafened);
             }
             send(&slot, |link| link.deafen(deafened));
+        }
+    });
+
+    ui.on_set_ptt({
+        let slot = slot.clone();
+        move |on| {
+            let mut guard = slot.lock().unwrap();
+            guard.ptt = on;
+            if let Some(ear) = guard.ear.as_ref() {
+                ear.set_ptt(on);
+            }
         }
     });
 
@@ -305,6 +336,7 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) {
         ui.set_confirm_danger(false);
         pose(&ui, &title, "Ryme restarts.", "Update");
     });
+    Shutdown { slot }
 }
 
 fn begin(
@@ -350,6 +382,7 @@ fn begin(
                     if guard.generation != gen {
                         return;
                     }
+                    ear.set_ptt(guard.ptt);
                     guard.ear = Some(ear);
                 }
                 if !mic || !speakers {

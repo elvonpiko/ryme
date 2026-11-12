@@ -242,7 +242,7 @@ async fn read_msg(recv: &mut quinn::RecvStream, buf: &mut Vec<u8>) -> Result<Ser
 }
 
 async fn run(
-    _endpoint: quinn::Endpoint,
+    endpoint: quinn::Endpoint,
     conn: quinn::Connection,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
@@ -292,7 +292,12 @@ async fn run(
             }
         }
     }
-    if !intentional {
+    if intentional {
+        // Dropping the socket is not enough. The server keeps the member until
+        // this close frame arrives, or until the idle timer gives up.
+        conn.close(quinn::VarInt::from_u32(0), b"bye");
+        let _ = tokio::time::timeout(Duration::from_millis(400), endpoint.wait_idle()).await;
+    } else {
         let _ = events.send(Event::Disconnected);
     }
 }

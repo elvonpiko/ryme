@@ -10,6 +10,7 @@ mod update;
 
 mod card_shape;
 mod place;
+mod single;
 
 #[cfg(target_os = "linux")]
 mod x11_frame;
@@ -18,12 +19,16 @@ mod x11_frame;
 mod win_frame;
 
 fn main() -> Result<(), slint::PlatformError> {
+    if !single::primary() {
+        return Ok(());
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("tokio");
     let ui = MainWindow::new()?;
-    live::attach(&ui, rt.handle());
+    let shutdown = live::attach(&ui, rt.handle());
+    single::watch(ui.as_weak());
 
     let weak = ui.as_weak();
     ui.on_minimize(move || {
@@ -67,13 +72,17 @@ fn main() -> Result<(), slint::PlatformError> {
             let _ = ui.window().show();
         }
     });
-    tray.on_quit(|| {
+    tray.on_quit(move || {
+        if shutdown.hang_up() {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
         let _ = slint::quit_event_loop();
     });
     tray.show()?;
 
     // The tray keeps the process alive, so closing the card only hides it.
-    ui.window().on_close_requested(|| slint::CloseRequestResponse::HideWindow);
+    ui.window()
+        .on_close_requested(|| slint::CloseRequestResponse::HideWindow);
 
     ui.run()
 }

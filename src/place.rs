@@ -72,6 +72,7 @@ fn center_in(work: windows_sys::Win32::Foundation::RECT, width: u32, height: u32
 
 #[cfg(target_os = "linux")]
 fn work_center(window: &slint::Window, width: u32, height: u32) -> Option<(i32, i32)> {
+    use x11rb::connection::Connection;
     let _ = window;
     let (conn, screen_num) = x11rb::connect(None).ok()?;
     let (root, screen_w, screen_h) = {

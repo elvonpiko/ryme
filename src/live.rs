@@ -773,7 +773,7 @@ fn pursue(
     };
     let weak = weak.clone();
     let slot = slot.clone();
-    let rt = rt.clone();
+    let task_rt = rt.clone();
     let notices = notices.clone();
     rt.spawn(async move {
         tokio::time::sleep(wait).await;
@@ -781,7 +781,7 @@ fn pursue(
             if slot.lock().unwrap().generation != gen {
                 return;
             }
-            begin(&ui, &slot, &rt, &notices, true, attempt);
+            begin(&ui, &slot, &task_rt, &notices, true, attempt);
         });
     });
 }

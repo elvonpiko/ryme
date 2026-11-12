@@ -265,7 +265,7 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
             ui.set_update_busy(true);
             let weak = weak.clone();
             let ask = ask.clone();
-            let rt = rt.clone();
+            let toast_rt = rt.clone();
             let notices = notices.clone();
             rt.spawn(async move {
                 let status = match tokio::task::spawn_blocking(crate::update::check).await {
@@ -283,10 +283,10 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
                             }
                         }
                         crate::update::Found::Current => {
-                            mention(&ui, &rt, &notices, "Ryme is up to date.");
+                            mention(&ui, &toast_rt, &notices, "Ryme is up to date.");
                         }
                         crate::update::Found::Failed(message) => {
-                            note(&ui, &rt, &notices, &message);
+                            note(&ui, &toast_rt, &notices, &message);
                         }
                     }
                 });

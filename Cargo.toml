@@ -1,6 +1,6 @@
 [package]
 name = "ryme"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 
 [dependencies]
@@ -19,7 +19,7 @@ ureq = { version = "2.12", default-features = false, features = ["tls", "json"] 
 raw-window-handle = "0.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-ksni = "0.3.7"
+ksni = { version = "0.3.7", default-features = false, features = ["async-io", "blocking"] }
 x11rb = { version = "0.13.2", features = ["shape"] }
 
 [target.'cfg(windows)'.dependencies]

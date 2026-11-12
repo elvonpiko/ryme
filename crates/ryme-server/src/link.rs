@@ -11,6 +11,7 @@ pub struct Peer {
     pub user_id: u32,
     pub name: String,
     pub muted: bool,
+    pub card: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +24,7 @@ pub enum Event {
     PeerJoined {
         user_id: u32,
         name: String,
+        card: u64,
     },
     PeerLeft {
         user_id: u32,
@@ -116,7 +118,7 @@ pub enum LinkError {
     Rejected(String),
 }
 
-pub async fn connect(invite: &str, name: &str) -> Result<Live, LinkError> {
+pub async fn connect(invite: &str, name: &str, card: u64) -> Result<Live, LinkError> {
     let parsed = parse_invite(invite).map_err(|_| LinkError::Invite)?;
     let addr = resolve(&parsed.host, parsed.port)?;
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
@@ -137,6 +139,7 @@ pub async fn connect(invite: &str, name: &str) -> Result<Live, LinkError> {
         &mut send,
         &ClientMsg::Hello {
             name: name.to_string(),
+            card,
         },
     )
     .await?;
@@ -214,6 +217,7 @@ fn peers(members: Vec<Member>) -> Vec<Peer> {
             user_id: member.user_id,
             name: member.name,
             muted: member.muted,
+            card: member.card,
         })
         .collect()
 }
@@ -332,7 +336,15 @@ fn drain(buf: &mut Vec<u8>, events: &UnboundedSender<Event>) -> bool {
                         members: peers(members),
                         rooms,
                     },
-                    ServerMsg::PeerJoined { user_id, name } => Event::PeerJoined { user_id, name },
+                    ServerMsg::PeerJoined {
+                        user_id,
+                        name,
+                        card,
+                    } => Event::PeerJoined {
+                        user_id,
+                        name,
+                        card,
+                    },
                     ServerMsg::PeerLeft { user_id } => Event::PeerLeft { user_id },
                     ServerMsg::Chat { user_id, text } => Event::Chat { user_id, text },
                     ServerMsg::Muted { user_id, muted } => Event::Muted { user_id, muted },
@@ -369,7 +381,7 @@ mod tests {
 
     #[tokio::test]
     async fn join_shows_you_and_a_bad_invite_fails() {
-        match connect("nope", "Mara").await {
+        match connect("nope", "Mara", 1).await {
             Err(LinkError::Invite) => {}
             Err(err) => panic!("expected a bad invite, got {err:?}"),
             Ok(_) => panic!("bad invite connected"),
@@ -378,21 +390,21 @@ mod tests {
         let (port, fingerprint, _task) = up().await;
         let mut bad = fingerprint;
         bad[0] ^= 0xff;
-        match connect(&invite(port, bad), "Mara").await {
+        match connect(&invite(port, bad), "Mara", 1).await {
             Err(LinkError::Unreachable) => {}
             Err(err) => panic!("expected a refused pin, got {err:?}"),
             Ok(_) => panic!("wrong fingerprint connected"),
         }
 
         let url = invite(port, fingerprint);
-        let live = connect(&url, "Mara").await.unwrap();
+        let live = connect(&url, "Mara", 1).await.unwrap();
         assert_eq!(live.channel, "Lobby");
         assert_eq!(live.members.len(), 1);
         assert_eq!(live.members[0].name, "Mara");
         assert_eq!(live.members[0].user_id, live.me);
 
         let unspecified = crate::identity::invite_url("0.0.0.0", port, &fingerprint);
-        let again = connect(&unspecified, "Mara").await.unwrap();
+        let again = connect(&unspecified, "Mara", 1).await.unwrap();
         assert_eq!(again.members[0].name, "Mara");
     }
 
@@ -400,8 +412,8 @@ mod tests {
     async fn a_second_client_is_announced_and_logout_drops_them() {
         let (port, fingerprint, _task) = up().await;
         let url = invite(port, fingerprint);
-        let mut mara = connect(&url, "Mara").await.unwrap();
-        let jonas = connect(&url, "Jonas").await.unwrap();
+        let mut mara = connect(&url, "Mara", 1).await.unwrap();
+        let jonas = connect(&url, "Jonas", 2).await.unwrap();
         assert_eq!(jonas.members.len(), 2);
 
         let event = tokio::time::timeout(Duration::from_secs(2), mara.events.recv())
@@ -413,6 +425,7 @@ mod tests {
             Event::PeerJoined {
                 user_id: jonas.me,
                 name: "Jonas".into(),
+                card: 2,
             }
         );
 
@@ -441,7 +454,7 @@ mod tests {
     async fn a_missing_channel_is_refused_and_lobby_stays() {
         let (port, fingerprint, _task) = up().await;
         let url = invite(port, fingerprint);
-        let mut live = connect(&url, "Mara").await.unwrap();
+        let mut live = connect(&url, "Mara", 1).await.unwrap();
         live.link.join("Nope");
         let refused = tokio::time::timeout(Duration::from_secs(2), live.events.recv())
             .await
@@ -475,7 +488,7 @@ mod tests {
         let fingerprint = server.fingerprint();
         tokio::spawn(async move { server.serve().await });
         let url = invite(port, fingerprint);
-        let mut live = connect(&url, "Mara").await.unwrap();
+        let mut live = connect(&url, "Mara", 1).await.unwrap();
         live.link.join("Ranked");
         let joined = tokio::time::timeout(Duration::from_secs(2), live.events.recv())
             .await
@@ -494,8 +507,8 @@ mod tests {
     async fn a_voice_packet_arrives_with_the_real_speaker() {
         let (port, fingerprint, _task) = up().await;
         let url = invite(port, fingerprint);
-        let mara = connect(&url, "Mara").await.unwrap();
-        let jonas = connect(&url, "Jonas").await.unwrap();
+        let mara = connect(&url, "Mara", 1).await.unwrap();
+        let jonas = connect(&url, "Jonas", 2).await.unwrap();
 
         let packet = ryme_proto::encode_voice(&ryme_proto::VoicePacket {
             speaker: 99,

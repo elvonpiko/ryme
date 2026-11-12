@@ -14,6 +14,7 @@ struct User {
     channel: Option<String>,
     muted: bool,
     deafened: bool,
+    card: u64,
 }
 
 pub struct Hub {
@@ -45,7 +46,7 @@ impl Hub {
 
     pub fn handle(&mut self, user: Option<u32>, msg: ClientMsg) -> Step {
         match msg {
-            ClientMsg::Hello { name } => self.hello(user, name),
+            ClientMsg::Hello { name, card } => self.hello(user, name, card),
             ClientMsg::Join { channel } => self.join(user, channel),
             ClientMsg::Leave => self.leave(user),
             ClientMsg::Chat { text } => self.chat(user, text),
@@ -91,9 +92,12 @@ impl Hub {
             .collect()
     }
 
-    fn hello(&mut self, user: Option<u32>, name: String) -> Step {
+    fn hello(&mut self, user: Option<u32>, name: String, card: u64) -> Step {
         if user.is_some() {
             return reject(user, "already here");
+        }
+        if card == 0 {
+            return reject(user, "bad card");
         }
         let id = self.next_id;
         self.next_id += 1;
@@ -104,6 +108,7 @@ impl Hub {
                 channel: None,
                 muted: false,
                 deafened: false,
+                card,
             },
         );
         Step {
@@ -138,6 +143,7 @@ impl Hub {
         }
         let previous = existing.channel.clone();
         let name = existing.name.clone();
+        let card = existing.card;
         if let Some(user) = self.users.get_mut(&id) {
             user.channel = Some(channel.clone());
         }
@@ -155,6 +161,7 @@ impl Hub {
                 ServerMsg::PeerJoined {
                     user_id: id,
                     name: name.clone(),
+                    card,
                 },
             )
         }));
@@ -267,6 +274,7 @@ impl Hub {
                 user_id: *id,
                 name: user.name.clone(),
                 muted: user.muted,
+                card: user.card,
             })
             .collect();
         members.sort_by_key(|member| member.user_id);
@@ -308,8 +316,20 @@ mod tests {
     use ryme_proto::{encode_voice, VoicePacket};
 
     fn hello(hub: &mut Hub, name: &str) -> u32 {
-        let step = hub.handle(None, ClientMsg::Hello { name: name.into() });
+        let step = hub.handle(
+            None,
+            ClientMsg::Hello {
+                name: name.into(),
+                card: card_of(name),
+            },
+        );
         step.user_id.unwrap()
+    }
+
+    fn card_of(name: &str) -> u64 {
+        name.bytes().fold(1u64, |acc, byte| {
+            acc.wrapping_mul(131).wrapping_add(byte as u64)
+        })
     }
 
     fn voice(seq: u32) -> Vec<u8> {
@@ -334,6 +354,7 @@ mod tests {
             Some(mara),
             ClientMsg::Hello {
                 name: "Mara".into(),
+                card: card_of("Mara"),
             },
         );
         assert_eq!(
@@ -365,6 +386,7 @@ mod tests {
                     user_id: mara,
                     name: "Mara".into(),
                     muted: false,
+                    card: card_of("Mara"),
                 }],
                 rooms: vec!["Lobby".into()],
             }]
@@ -383,6 +405,7 @@ mod tests {
                 ServerMsg::PeerJoined {
                     user_id: jonas,
                     name: "Jonas".into(),
+                    card: card_of("Jonas"),
                 }
             )]
         );

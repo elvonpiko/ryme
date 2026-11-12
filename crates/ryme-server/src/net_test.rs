@@ -65,6 +65,7 @@ async fn two_clients_share_voice_until_one_mutes() {
         &mut a_send,
         &ClientMsg::Hello {
             name: "Mara".into(),
+            card: 1,
         },
     )
     .await;
@@ -72,6 +73,7 @@ async fn two_clients_share_voice_until_one_mutes() {
         &mut b_send,
         &ClientMsg::Hello {
             name: "Jonas".into(),
+            card: 2,
         },
     )
     .await;

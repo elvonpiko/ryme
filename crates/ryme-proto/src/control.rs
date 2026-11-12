@@ -11,11 +11,14 @@ pub struct Member {
     pub user_id: u32,
     pub name: String,
     pub muted: bool,
+    /// Stable id from that person's own client. A session id changes on every
+    /// join; this one does not, so a local volume can follow them.
+    pub card: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMsg {
-    Hello { name: String },
+    Hello { name: String, card: u64 },
     Join { channel: String },
     Leave,
     Chat { text: String },
@@ -40,6 +43,7 @@ pub enum ServerMsg {
     PeerJoined {
         user_id: u32,
         name: String,
+        card: u64,
     },
     PeerLeft {
         user_id: u32,
@@ -64,8 +68,9 @@ pub fn clean_label(value: &str, max: usize) -> Result<String, ProtoError> {
 
 pub fn normalize_client(msg: ClientMsg) -> Result<ClientMsg, ProtoError> {
     Ok(match msg {
-        ClientMsg::Hello { name } => ClientMsg::Hello {
+        ClientMsg::Hello { name, card } => ClientMsg::Hello {
             name: clean_label(&name, MAX_NAME)?,
+            card,
         },
         ClientMsg::Join { channel } => ClientMsg::Join {
             channel: clean_label(&channel, MAX_CHANNEL)?,
@@ -94,9 +99,14 @@ pub fn normalize_server(msg: ServerMsg) -> Result<ServerMsg, ProtoError> {
                 .map(|room| clean_label(&room, MAX_CHANNEL))
                 .collect::<Result<Vec<_>, _>>()?,
         },
-        ServerMsg::PeerJoined { user_id, name } => ServerMsg::PeerJoined {
+        ServerMsg::PeerJoined {
+            user_id,
+            name,
+            card,
+        } => ServerMsg::PeerJoined {
             user_id,
             name: clean_label(&name, MAX_NAME)?,
+            card,
         },
         ServerMsg::Chat { user_id, text } => ServerMsg::Chat {
             user_id,
@@ -143,8 +153,15 @@ mod tests {
     fn hello_normalizes_the_stored_name() {
         let msg = normalize_client(ClientMsg::Hello {
             name: "  Kit ".into(),
+            card: 7,
         })
         .unwrap();
-        assert_eq!(msg, ClientMsg::Hello { name: "Kit".into() });
+        assert_eq!(
+            msg,
+            ClientMsg::Hello {
+                name: "Kit".into(),
+                card: 7
+            }
+        );
     }
 }

@@ -76,6 +76,7 @@ mod tests {
     fn two_frames_in_one_buffer() {
         let hello = encode_client(&ClientMsg::Hello {
             name: "Mara".into(),
+            card: 4,
         })
         .unwrap();
         let join = encode_client(&ClientMsg::Join {
@@ -89,7 +90,8 @@ mod tests {
         assert_eq!(
             first,
             ClientMsg::Hello {
-                name: "Mara".into()
+                name: "Mara".into(),
+                card: 4
             }
         );
         let (second, m) = decode_client_frame(&buf[n..]).unwrap().unwrap();
@@ -138,13 +140,15 @@ mod tests {
     fn hello_on_the_wire_trims_the_name() {
         let frame = encode_client(&ClientMsg::Hello {
             name: "  Ravi ".into(),
+            card: 9,
         })
         .unwrap();
         let (msg, _) = decode_client_frame(&frame).unwrap().unwrap();
         assert_eq!(
             msg,
             ClientMsg::Hello {
-                name: "Ravi".into()
+                name: "Ravi".into(),
+                card: 9
             }
         );
     }
@@ -153,6 +157,7 @@ mod tests {
     fn invalid_name_fails_after_a_well_formed_frame() {
         let frame = encode_client(&ClientMsg::Hello {
             name: " \n ".into(),
+            card: 9,
         })
         .unwrap();
         assert_eq!(

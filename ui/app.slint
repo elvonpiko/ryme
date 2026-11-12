@@ -28,8 +28,10 @@ component Mark inherits Rectangle {
     background: transparent;
 
     Path {
-        width: 100%;
-        height: 100%;
+        x: 1px;
+        y: 1px;
+        width: parent.width - 2px;
+        height: parent.height - 2px;
         viewbox-width: 300;
         viewbox-height: 300;
         commands: "M 6 48 C 6 18 24 6 54 6 L 294 6 L 294 246 L 274 262 L 290 278 L 266 294 L 6 294 L 6 48 Z";
@@ -39,10 +41,10 @@ component Mark inherits Rectangle {
     }
 
     Path {
-        x: 0px;
-        y: 0px;
-        width: 100%;
-        height: 100%;
+        x: 1px;
+        y: 1px;
+        width: parent.width - 2px;
+        height: parent.height - 2px;
         viewbox-width: 300;
         viewbox-height: 300;
         commands: "M 100 228 L 100 86 L 128 86 C 170 86 188 98 188 116 L 188 144 L 128 144 L 128 228 Z";
@@ -1048,34 +1050,40 @@ export component MainWindow inherits Window {
         }
     }
 
-    // A note grows from a dot in the middle of the card, in the gap between
-    // the two fields. Longer copy wraps and the bubble gets taller.
-    // It is not a page, so it does not slide.
+    // The note sits in the empty corner beside Join. A short line stays
+    // narrow. A longer one wraps and the bubble grows upward.
+    measure := Text {
+        text: root.toast;
+        wrap: no-wrap;
+        font-family: Theme.sans;
+        font-size: 13px;
+        opacity: 0;
+        height: 0px;
+    }
     toast-bubble := Rectangle {
         property <bool> open: root.toast != "";
-        width: open ? body.preferred-width : 8px;
-        height: open ? body.preferred-height : 8px;
-        x: (parent.width - self.width) / 2;
-        y: (parent.height - self.height) / 2;
+        property <length> text-w: min(measure.preferred-width, 200px);
+        width: open ? text-w + 24px : 8px;
+        height: open ? copy.preferred-height + 20px : 8px;
+        x: parent.width - self.width - 18px;
+        y: parent.height - self.height - 16px;
         border-radius: open ? 14px : 4px;
         clip: true;
         opacity: open ? 1 : 0;
         background: Theme.elevated;
         border-width: 1px;
         border-color: root.toast-danger ? Theme.danger : Theme.frame;
-        animate width, height, border-radius, opacity { duration: 280ms; easing: ease-out; }
+        animate x, y, width, height, border-radius, opacity { duration: 280ms; easing: ease-out; }
 
-        body := VerticalLayout {
-            padding: 14px;
-            Text {
-                text: root.toast;
-                width: 236px;
-                wrap: word-wrap;
-                horizontal-alignment: center;
-                color: root.toast-danger ? Theme.danger : Theme.ink;
-                font-family: Theme.sans;
-                font-size: 13px;
-            }
+        copy := Text {
+            x: 12px;
+            y: 10px;
+            width: parent.text-w;
+            text: root.toast;
+            wrap: word-wrap;
+            color: root.toast-danger ? Theme.danger : Theme.ink;
+            font-family: Theme.sans;
+            font-size: 13px;
         }
     }
 

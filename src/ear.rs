@@ -1198,7 +1198,7 @@ fn pick_device(name: &str, input: bool) -> Option<cpal::Device> {
             host.default_output_device()
         };
     }
-    let devices = if input {
+    let mut devices = if input {
         host.input_devices().ok()?
     } else {
         host.output_devices().ok()?

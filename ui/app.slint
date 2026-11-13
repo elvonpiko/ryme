@@ -176,6 +176,7 @@ component Field inherits Rectangle {
     in-out property <string> value;
     callback submitted();
     height: 36px;
+    vertical-stretch: 0;
     border-radius: 10px;
     background: Theme.surface;
     border-width: 1px;
@@ -742,16 +743,21 @@ export component MainWindow inherits Window {
                                 }
                             }
                             VerticalLayout {
+                                width: 100%;
                                 alignment: center;
                                 spacing: 4px;
-                                Avatar {
-                                    label: seat.initial;
-                                    tint: seat.tint;
-                                    muted: seat.muted || seat.quiet;
-                                    speaking: seat.speaking && !seat.quiet;
+                                HorizontalLayout {
+                                    alignment: center;
+                                    Avatar {
+                                        horizontal-stretch: 0;
+                                        label: seat.initial;
+                                        tint: seat.tint;
+                                        muted: seat.muted || seat.quiet;
+                                        speaking: seat.speaking && !seat.quiet;
+                                    }
                                 }
                                 Text {
-                                    width: 64px;
+                                    width: 100%;
                                     overflow: elide;
                                     text: seat.name;
                                     color: seat.muted || seat.quiet ? Theme.muted : Theme.ink;
@@ -1342,6 +1348,7 @@ export component MainWindow inherits Window {
                 padding-right: 22px;
                 padding-top: 14px;
                 spacing: 6px;
+                vertical-stretch: 0;
                 Text {
                     text: "Your name";
                     color: Theme.muted;
@@ -1400,17 +1407,6 @@ export component MainWindow inherits Window {
                             border-radius: 2px;
                             background: Theme.signal;
                         }
-                    }
-                    Rectangle {
-                        height: 18px;
-                        Text {
-                            text: "Test speakers";
-                            color: welcome-tone.has-hover ? Theme.signal : Theme.muted;
-                            font-family: Theme.sans;
-                            font-size: 12px;
-                            vertical-alignment: center;
-                        }
-                        welcome-tone := TouchArea { clicked => { root.test-speakers(); } }
                     }
                 }
             }

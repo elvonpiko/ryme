@@ -8,7 +8,7 @@ A quiet room for voices. Self-hosted voice chat for friends. One person runs the
 
 [ryme.chat](https://ryme.chat)
 
-0.1.19 is this release. The client offers an update when the tag matches.
+0.1.20 is this release. The client offers an update when the tag matches.
 
 ## Where this is
 

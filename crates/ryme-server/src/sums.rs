@@ -1,7 +1,7 @@
 //! Signature over SHA256SUMS. The checksum file and the signature travel
 //! together, so the signature is what makes the checksum a publisher's.
 
-use ring::signature::{Ed25519KeyPair, UnparsedPublicKey, ED25519};
+use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 
 /// Public half of the release signing key. The private PKCS#8 document is the
 /// `RYME_UPDATE_PKCS8` secret and is not stored in this repository.
@@ -16,7 +16,13 @@ pub fn verify_sums(message: &[u8], signature: &[u8]) -> bool {
 }
 
 pub fn sign_sums(pkcs8: &[u8], message: &[u8]) -> Result<Vec<u8>, String> {
-    let key = Ed25519KeyPair::from_pkcs8(pkcs8).map_err(|_| "bad signing key".to_string())?;
+    // OpenSSL writes a v1 document: the seed, and no public key. ring's strict
+    // parser accepts only v2. The public key embedded in the client is the check.
+    let key = Ed25519KeyPair::from_pkcs8_maybe_unchecked(pkcs8)
+        .map_err(|_| "bad signing key".to_string())?;
+    if key.public_key().as_ref() != UPDATE_PUBLIC {
+        return Err("bad signing key".to_string());
+    }
     Ok(key.sign(message).as_ref().to_vec())
 }
 
@@ -37,5 +43,23 @@ mod tests {
         assert!(own.verify(message, signature.as_ref()).is_ok());
         assert!(!verify_sums(message, signature.as_ref()));
         assert!(!verify_sums(message, &[0; 64]));
+        assert!(sign_sums(doc.as_ref(), message).is_err());
+    }
+
+    #[test]
+    fn the_configured_release_key_matches_the_public_key() {
+        if std::env::var("RYME_SIGN_CHECK").ok().as_deref() != Some("1") {
+            return;
+        }
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let path = std::path::PathBuf::from(home).join(".config/ryme/update.pkcs8");
+        let Ok(pkcs8) = std::fs::read(path) else {
+            return;
+        };
+        let message = b"abc  ryme\n";
+        let signature = sign_sums(&pkcs8, message).expect("release key");
+        assert!(verify_sums(message, &signature));
     }
 }

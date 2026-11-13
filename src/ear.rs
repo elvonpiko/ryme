@@ -1177,7 +1177,7 @@ fn build_output(
 }
 
 #[cfg(not(target_os = "linux"))]
-fn device_label(device: &cpal::Device) -> Option<String> {
+fn cpal_name(device: &cpal::Device) -> Option<String> {
     use cpal::traits::DeviceTrait;
     let name = device.description().ok()?.name().to_string();
     if name.is_empty() {
@@ -1204,7 +1204,7 @@ fn pick_device(name: &str, input: bool) -> Option<cpal::Device> {
         host.output_devices().ok()?
     };
     devices
-        .find(|device| device_label(device).as_deref() == Some(name))
+        .find(|device| cpal_name(device).as_deref() == Some(name))
         .or_else(|| {
             if input {
                 host.default_input_device()
@@ -1567,7 +1567,7 @@ fn cpal_device_names(input: bool) -> Vec<String> {
         return names;
     };
     for device in devices {
-        if let Some(name) = device_label(&device) {
+        if let Some(name) = cpal_name(&device) {
             if !names.contains(&name) {
                 names.push(name);
             }

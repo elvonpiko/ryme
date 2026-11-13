@@ -178,6 +178,7 @@ component Field inherits Rectangle {
     height: 36px;
     vertical-stretch: 0;
     border-radius: 10px;
+    clip: true;
     background: Theme.surface;
     border-width: 1px;
     border-color: edit.has-focus ? Theme.signal : Theme.frame;
@@ -206,8 +207,8 @@ component Field inherits Rectangle {
             property <length> computed-x: 0px;
             x: min(0px, max(parent.width - self.width - self.text-cursor-width, self.computed-x));
             y: 0px;
-            width: max(parent.width - self.text-cursor-width, self.preferred-width);
-            height: 100%;
+            width: parent.width;
+            height: parent.height;
             vertical-alignment: center;
             text <=> root.value;
             single-line: true;

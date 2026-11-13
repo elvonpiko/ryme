@@ -1,11 +1,13 @@
-# The desktop client is not in this image. Build on the machine that will run it,
-# including a Raspberry Pi, so the binary matches that CPU.
+# The desktop client is not in this image. The release build publishes
+# linux/amd64, linux/arm64, and linux/arm/v7 from this file.
 FROM rust:bookworm AS build
 WORKDIR /src
 COPY . .
 RUN cargo build -p ryme-server --release --locked
 
 FROM debian:bookworm-slim
+LABEL org.opencontainers.image.source=https://github.com/elvonpiko/ryme
+LABEL org.opencontainers.image.description="Ryme server. Friends use the desktop client."
 RUN useradd \
       --uid 1542 \
       --user-group \

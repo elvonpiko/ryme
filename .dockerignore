@@ -3,3 +3,5 @@ target
 ryme-data
 fonts
 end-to-end
+bench/load/target
+bench/reach/target

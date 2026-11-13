@@ -2,7 +2,7 @@
 # beside this file, for example: RYME_PUBLIC=voice.example:1542
 services:
   ryme:
-    image: ghcr.io/elvonpiko/ryme-server:0.1.16
+    image: ghcr.io/elvonpiko/ryme-server:0.1.17
     restart: unless-stopped
     read_only: true
     security_opt:

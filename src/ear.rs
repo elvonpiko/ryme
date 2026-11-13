@@ -1177,8 +1177,19 @@ fn build_output(
 }
 
 #[cfg(not(target_os = "linux"))]
+fn device_label(device: &cpal::Device) -> Option<String> {
+    use cpal::traits::DeviceTrait;
+    let name = device.description().ok()?.name().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
 fn pick_device(name: &str, input: bool) -> Option<cpal::Device> {
-    use cpal::traits::{DeviceTrait, HostTrait};
+    use cpal::traits::HostTrait;
     let host = cpal::default_host();
     if name.is_empty() || name == "default" {
         return if input {
@@ -1193,7 +1204,7 @@ fn pick_device(name: &str, input: bool) -> Option<cpal::Device> {
         host.output_devices().ok()?
     };
     devices
-        .find(|device| device.name().ok().as_deref() == Some(name))
+        .find(|device| device_label(device).as_deref() == Some(name))
         .or_else(|| {
             if input {
                 host.default_input_device()
@@ -1544,7 +1555,7 @@ fn linux_device_names() -> Vec<String> {
 
 #[cfg(not(target_os = "linux"))]
 fn cpal_device_names(input: bool) -> Vec<String> {
-    use cpal::traits::{DeviceTrait, HostTrait};
+    use cpal::traits::HostTrait;
     let mut names = vec!["default".to_string()];
     let host = cpal::default_host();
     let devices = if input {
@@ -1556,8 +1567,8 @@ fn cpal_device_names(input: bool) -> Vec<String> {
         return names;
     };
     for device in devices {
-        if let Ok(name) = device.name() {
-            if !name.is_empty() && !names.contains(&name) {
+        if let Some(name) = device_label(&device) {
+            if !names.contains(&name) {
                 names.push(name);
             }
         }

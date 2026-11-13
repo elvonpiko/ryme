@@ -4,17 +4,38 @@
 
 # ryme
 
-A quiet room for voices. One server, one invite, and the same card on Windows, Mac, and Linux. Written in Rust.
+A quiet room for voices. Self-hosted voice chat for friends. One person runs the server. Everyone else installs the client and opens the invite.
 
 [ryme.chat](https://ryme.chat)
 
-0.1.0 is the first release. Ryme is still under development.
+0.1.16 is this release. The client offers an update when the tag matches.
 
-The connection is encrypted, and the invite pins the server. The machine you run handles the audio. A leaked invite is replaced with `--new-invite`.
+## Where this is
+
+The next tag is a small invited beta: admission is checked, the microphone starts in a known state, and the limits below are written down. It is not a public beta.
+
+A public beta needs a clean-machine install, an update of an already-running app, and audio tried on ordinary headsets, Bluetooth, and laptop speakers. A broad launch needs a new person to download, join, and recover without help, and the website to show that same path. None of those are claimed yet.
+
+## Privacy
+
+The connection is encrypted to the server. The server ends that encryption and forwards the encoded audio. People in the room are not end-to-end encrypted to each other. The server does not mix or record the call. It logs its own startup and connection failures.
+
+The invite pins the server and carries a separate admission token. `--new-invite` retires that token and leaves the certificate in place. `--drop <id>` disconnects one session. `--lock` refuses new people; someone already in can reconnect, and `--unlock` opens the room. `--ban <card>` refuses that card until `--unban`. Those commands run on the machine that has the server's data directory. The host key stays there. Everyone with the invite is equal. There are no roles.
+
+## Known limits
+
+- Push-to-talk is one letter, V unless you choose another. Windows can see that key in other applications. macOS and a focused Linux window see it while Ryme is focused. Linux also reads the keyboard device when the session allows it. Wayland often does not. If the key cannot be read, push-to-talk stays closed.
+- Soften noise is a quiet-part expander. It is not a neural denoiser.
+- Phones and tablets are not supported.
+- Headset unplug, sleep and wake, and upgrading a running app need a machine. Automated tests cover admission, a muted microphone, and a slow receiver.
+
+## Security
+
+See [SECURITY.md](SECURITY.md). The license is MIT. See [LICENSE](LICENSE).
 
 ## Server
 
-On Linux, including a Raspberry Pi:
+Written in Rust. On Linux, including a Raspberry Pi:
 
 ```sh
 curl -fsSL https://ryme.chat/install | bash
@@ -30,4 +51,4 @@ The [latest release](https://github.com/elvonpiko/ryme/releases/latest) has a Wi
 
 Issues and pull requests are welcome. Keep a change small.
 
-The card is `ui/app.slint`. The server is the `ryme-server` crate. `cargo test -p ryme-proto -p ryme-server` checks the protocol and the server.
+The card is `ui/app.slint`. The server is the `ryme-server` crate. `cargo test -p ryme-proto -p ryme-server` checks the protocol and the server. `cargo test -p ryme` checks the client. Set `RYME_SOUND=1` to also open the default sound device.

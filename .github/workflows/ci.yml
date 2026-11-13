@@ -13,3 +13,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: test the protocol and the server
         run: cargo test -p ryme-proto -p ryme-server --locked
+
+  client:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: desktop libraries
+        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libxkbcommon-dev libxcb1-dev libasound2-dev
+      # Headset unplug, sleep and wake, and upgrading a running app need a
+      # machine. This job covers the client logic, including a muted mic.
+      - name: test the client
+        run: cargo test -p ryme --locked

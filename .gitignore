@@ -1,4 +1,6 @@
 /target
+/bench/load/target
+/bench/reach/target
 /packaging/windows/stage/
 /packaging/windows/out/
 /ryme-data
@@ -8,3 +10,4 @@
 /fonts/Kalam-*
 /fonts/OFL.txt
 /fonts/DMSans-OFL.txt
+/.wrangler/

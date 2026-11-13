@@ -1433,25 +1433,45 @@ export component MainWindow inherits Window {
         }
     }
 
-    // Off the card. A height of 0 reports no width, and the chip then opens empty.
-    measure := Text {
-        x: -400px;
-        y: 0px;
+    // Measured on the card, invisible. An off-card line reports no width, so the
+    // first error grew an empty chip. The copy inside the chip is clipped while
+    // it grows, so its height cannot be the one the chip opens to.
+    line-measure := Text {
+        x: 22px;
+        y: 8px;
+        height: 16px;
         text: root.toast;
         wrap: no-wrap;
         opacity: 0;
         font-family: Theme.sans;
         font-size: 13px;
     }
+    wrap-measure := Text {
+        x: 22px;
+        y: 8px;
+        width: max(min(line-measure.preferred-width, parent.width - 68px), 1px);
+        text: root.toast;
+        wrap: word-wrap;
+        opacity: 0;
+        font-family: Theme.sans;
+        font-size: 13px;
+    }
+    // One frame after the text is set, the measures above have a real width.
+    property <string> toast-ready: "";
+    Timer {
+        interval: 16ms;
+        running: root.toast != root.toast-ready;
+        triggered => { root.toast-ready = root.toast; }
+    }
     // Above the buttons, on the left. The torn corner stays clear. A dot
     // grows into the line, on the same 240ms ease-out as a page slide.
     toast-bubble := Rectangle {
-        property <bool> open: root.toast != "";
-        property <length> text-w: min(measure.preferred-width, parent.width - 68px);
+        property <length> text-w: min(line-measure.preferred-width, parent.width - 68px);
+        property <bool> open: root.toast-ready != "" && text-w > 0px;
         x: 22px;
         y: parent.height - self.height - 64px;
         width: open ? text-w + 24px : 8px;
-        height: open ? max(copy.preferred-height + 20px, 36px) : 8px;
+        height: open ? max(wrap-measure.preferred-height + 20px, 36px) : 8px;
         border-radius: open ? 14px : 4px;
         clip: true;
         opacity: open ? 1 : 0;

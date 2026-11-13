@@ -1,0 +1,10 @@
+[package]
+name = "ryme-reach"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ryme-proto = { path = "../../crates/ryme-proto" }
+ryme-server = { path = "../../crates/ryme-server" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

@@ -18,18 +18,36 @@ pub struct Member {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMsg {
-    Hello { name: String, card: u64 },
-    Join { channel: String },
+    /// `pass` is the invitation token. `resume` is zero on a first hello.
+    /// A later hello repeats the secret from Welcome to take that session's place.
+    Hello {
+        name: String,
+        card: u64,
+        pass: [u8; 32],
+        resume: [u8; 32],
+    },
+    Join {
+        channel: String,
+    },
     Leave,
-    Chat { text: String },
-    Mute { muted: bool },
-    Deafen { deafened: bool },
+    Chat {
+        text: String,
+    },
+    Mute {
+        muted: bool,
+    },
+    Deafen {
+        deafened: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerMsg {
     Welcome {
         user_id: u32,
+        /// Known only to this client. Present it on the next hello to replace
+        /// this session instead of sitting beside it.
+        resume: [u8; 32],
     },
     Reject {
         reason: String,
@@ -68,9 +86,16 @@ pub fn clean_label(value: &str, max: usize) -> Result<String, ProtoError> {
 
 pub fn normalize_client(msg: ClientMsg) -> Result<ClientMsg, ProtoError> {
     Ok(match msg {
-        ClientMsg::Hello { name, card } => ClientMsg::Hello {
+        ClientMsg::Hello {
+            name,
+            card,
+            pass,
+            resume,
+        } => ClientMsg::Hello {
             name: clean_label(&name, MAX_NAME)?,
             card,
+            pass,
+            resume,
         },
         ClientMsg::Join { channel } => ClientMsg::Join {
             channel: clean_label(&channel, MAX_CHANNEL)?,
@@ -154,13 +179,17 @@ mod tests {
         let msg = normalize_client(ClientMsg::Hello {
             name: "  Kit ".into(),
             card: 7,
+            pass: [1; 32],
+            resume: [0; 32],
         })
         .unwrap();
         assert_eq!(
             msg,
             ClientMsg::Hello {
                 name: "Kit".into(),
-                card: 7
+                card: 7,
+                pass: [1; 32],
+                resume: [0; 32],
             }
         );
     }

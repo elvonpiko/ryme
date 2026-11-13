@@ -3,6 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use ring::rand::SecureRandom;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls13_signature, CryptoProvider};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
@@ -140,13 +141,93 @@ pub fn fingerprint_of(cert_der: &[u8]) -> [u8; 32] {
     fingerprint
 }
 
-pub fn invite_url(host: &str, port: u16, fingerprint: &[u8; 32]) -> String {
+pub fn invite_url(host: &str, port: u16, fingerprint: &[u8; 32], pass: &[u8; 32]) -> String {
     let host = host.trim_matches(|c| c == '[' || c == ']');
+    let fragment = format!("{}.{}", hex_encode(fingerprint), hex_encode(pass));
     if host.contains(':') {
-        format!("ryme://[{host}]:{port}/#{}", hex_encode(fingerprint))
+        format!("ryme://[{host}]:{port}/#{fragment}")
     } else {
-        format!("ryme://{host}:{port}/#{}", hex_encode(fingerprint))
+        format!("ryme://{host}:{port}/#{fragment}")
     }
+}
+
+/// Admission token and the host's local control key. The certificate stays
+/// put when the token is replaced.
+pub struct Door {
+    pub pass: [u8; 32],
+    pub host: [u8; 32],
+}
+
+const ADMIT_FILE: &str = "admit";
+const HOST_FILE: &str = "host.key";
+
+impl Door {
+    pub fn generate() -> Result<Self, ServerError> {
+        Ok(Self {
+            pass: random_32()?,
+            host: random_32()?,
+        })
+    }
+
+    pub fn load_or_create(dir: &Path) -> Result<Self, ServerError> {
+        let pass = match read_secret(dir, ADMIT_FILE)? {
+            Some(pass) => pass,
+            None => {
+                let pass = random_32()?;
+                write_private(&dir.join(ADMIT_FILE), &pass)?;
+                pass
+            }
+        };
+        let host = match read_secret(dir, HOST_FILE)? {
+            Some(host) => host,
+            None => {
+                let host = random_32()?;
+                write_private(&dir.join(HOST_FILE), &host)?;
+                host
+            }
+        };
+        Ok(Self { pass, host })
+    }
+
+    /// Replace the admission token. The certificate and the host key stay.
+    pub fn rotate(dir: &Path) -> Result<Self, ServerError> {
+        let mut door = Self::load_or_create(dir)?;
+        door.pass = random_32()?;
+        write_private(&dir.join(ADMIT_FILE), &door.pass)?;
+        Ok(door)
+    }
+}
+
+fn read_secret(dir: &Path, name: &str) -> Result<Option<[u8; 32]>, ServerError> {
+    let path = dir.join(name);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = read_file(&path)?;
+    let pass: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| ServerError::Message(format!("{name} is not a 32-byte secret")))?;
+    Ok(Some(pass))
+}
+
+pub fn random_32() -> Result<[u8; 32], ServerError> {
+    let mut out = [0u8; 32];
+    ring::rand::SystemRandom::new()
+        .fill(&mut out)
+        .map_err(|_| ServerError::Message("could not draw a random value".into()))?;
+    Ok(out)
+}
+
+/// Compare two secrets without stopping at the first difference.
+pub fn same(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.iter().zip(right) {
+        diff |= a ^ b;
+    }
+    diff == 0
 }
 
 pub fn hex_encode(bytes: &[u8]) -> String {
@@ -258,11 +339,13 @@ mod tests {
         let second = Identity::generate().unwrap();
         assert_ne!(first.fingerprint, second.fingerprint);
 
-        let invite = invite_url("127.0.0.1", 7777, &first.fingerprint);
+        let pass = [9u8; 32];
+        let invite = invite_url("127.0.0.1", 7777, &first.fingerprint, &pass);
         let parsed = parse_invite(&invite).unwrap();
         assert_eq!(parsed.host, "127.0.0.1");
         assert_eq!(parsed.port, 7777);
         assert_eq!(parsed.fingerprint, first.fingerprint);
+        assert_eq!(parsed.pass, pass);
     }
 
     #[test]
@@ -321,6 +404,32 @@ mod tests {
         }
         assert!(dir.join("cert.der").is_file());
         assert!(!dir.join("key.der").is_file());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotating_the_invite_keeps_the_certificate_and_the_host_key() {
+        let dir = scratch("door");
+        let identity = Identity::load_or_create(&dir).unwrap();
+        let first = Door::load_or_create(&dir).unwrap();
+        let rotated = Door::rotate(&dir).unwrap();
+        assert_ne!(rotated.pass, first.pass);
+        assert!(same(&rotated.host, &first.host));
+        let again = Door::load_or_create(&dir).unwrap();
+        assert!(same(&again.pass, &rotated.pass));
+        assert_eq!(
+            Identity::load_or_create(&dir).unwrap().fingerprint,
+            identity.fingerprint
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dir.join("admit"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

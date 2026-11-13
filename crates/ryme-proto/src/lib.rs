@@ -3,6 +3,10 @@
 //! Control frames (hello, join, chat) are length-prefixed and reliable.
 //! Voice is one datagram: a 14-byte header plus an Opus payload. The server
 //! stamps the speaker and forwards the bytes. It does not decode them.
+//!
+//! The QUIC connection is encrypted, and the server is where that encryption
+//! ends. The server handles the encoded audio. Participants are not
+//! end-to-end encrypted to each other.
 
 mod control;
 mod frame;

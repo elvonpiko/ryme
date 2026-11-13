@@ -4,7 +4,10 @@ use crate::ProtoError;
 pub struct Invite {
     pub host: String,
     pub port: u16,
+    /// Certificate pin. This answers which server it is.
     pub fingerprint: [u8; 32],
+    /// Admission token. This answers whether the caller may enter.
+    pub pass: [u8; 32],
 }
 
 pub fn parse_invite(raw: &str) -> Result<Invite, ProtoError> {
@@ -12,7 +15,11 @@ pub fn parse_invite(raw: &str) -> Result<Invite, ProtoError> {
         .trim()
         .strip_prefix("ryme://")
         .ok_or(ProtoError::Invalid)?;
-    let (addr, hex_fp) = rest.split_once("/#").ok_or(ProtoError::Invalid)?;
+    let (addr, fragment) = rest.split_once("/#").ok_or(ProtoError::Invalid)?;
+    let (hex_fp, hex_pass) = fragment.split_once('.').ok_or(ProtoError::Invalid)?;
+    if hex_pass.contains('.') {
+        return Err(ProtoError::Invalid);
+    }
     let (host, port) = addr.rsplit_once(':').ok_or(ProtoError::Invalid)?;
     let host = host.trim_matches(|c| c == '[' || c == ']');
     if host.is_empty() || host.chars().any(|c| c.is_whitespace() || c == '/') {
@@ -26,6 +33,7 @@ pub fn parse_invite(raw: &str) -> Result<Invite, ProtoError> {
         host: host.to_string(),
         port,
         fingerprint: decode_hex(hex_fp)?,
+        pass: decode_hex(hex_pass)?,
     })
 }
 
@@ -57,7 +65,11 @@ mod tests {
     use super::*;
 
     fn sample(host: &str) -> String {
-        format!("ryme://{host}:7777/#{}", "ab".repeat(32))
+        format!(
+            "ryme://{host}:7777/#{}.{}",
+            "ab".repeat(32),
+            "cd".repeat(32)
+        )
     }
 
     #[test]
@@ -66,15 +78,21 @@ mod tests {
         assert_eq!(invite.host, "127.0.0.1");
         assert_eq!(invite.port, 7777);
         assert_eq!(invite.fingerprint, [0xab; 32]);
+        assert_eq!(invite.pass, [0xcd; 32]);
     }
 
     #[test]
     fn accepts_upper_hex_and_surrounding_space() {
-        let raw = format!("  ryme://voice.example:443/#{}  ", "AB".repeat(32));
+        let raw = format!(
+            "  ryme://voice.example:443/#{}.{}  ",
+            "AB".repeat(32),
+            "CD".repeat(32)
+        );
         let invite = parse_invite(&raw).unwrap();
         assert_eq!(invite.host, "voice.example");
         assert_eq!(invite.port, 443);
         assert_eq!(invite.fingerprint, [0xab; 32]);
+        assert_eq!(invite.pass, [0xcd; 32]);
     }
 
     #[test]
@@ -92,5 +110,6 @@ mod tests {
         assert!(parse_invite("ryme://127.0.0.1:0/#aabb").is_err());
         assert!(parse_invite(&format!("ryme://:7777/#{}", "aa".repeat(32))).is_err());
         assert!(parse_invite(&format!("ryme://bad host:1/#{}", "aa".repeat(32))).is_err());
+        assert!(parse_invite(&format!("ryme://127.0.0.1:7777/#{}", "aa".repeat(32))).is_err());
     }
 }

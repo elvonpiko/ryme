@@ -62,6 +62,8 @@ pub struct Live {
     pub events: UnboundedReceiver<Event>,
     /// Datagrams in and out. The audio thread owns this; control stays on `link`.
     pub voice: VoicePipe,
+    /// Secret for the next hello, so a reconnect replaces this session.
+    pub resume: [u8; 32],
 }
 
 /// Voice packets cross here so the audio thread never waits on the socket.
@@ -73,6 +75,12 @@ pub struct VoicePipe {
 impl VoicePipe {
     pub fn send(&self, packet: Vec<u8>) {
         let _ = self.outgoing.try_send(packet);
+    }
+
+    /// A sender the bench can move onto its own task. `send` drops a packet when
+    /// the queue is full; waiting here means a slow path is not counted as sent.
+    pub fn queue(&self) -> tokio::sync::mpsc::Sender<Vec<u8>> {
+        self.outgoing.clone()
     }
 
     pub fn try_recv(&self) -> Option<Vec<u8>> {
@@ -115,24 +123,33 @@ impl Link {
 pub enum LinkError {
     Invite,
     Unreachable,
+    Timeout,
+    Pin,
+    Address,
     Rejected(String),
 }
 
-pub async fn connect(invite: &str, name: &str, card: u64) -> Result<Live, LinkError> {
+pub async fn connect(
+    invite: &str,
+    name: &str,
+    card: u64,
+    resume: [u8; 32],
+) -> Result<Live, LinkError> {
     let parsed = parse_invite(invite).map_err(|_| LinkError::Invite)?;
-    let addr = resolve(&parsed.host, parsed.port)?;
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
-        .map_err(|_| LinkError::Unreachable)?;
-    endpoint.set_default_client_config(
-        client_config(parsed.fingerprint).map_err(|_| LinkError::Unreachable)?,
-    );
-    let connecting = endpoint
-        .connect(addr, "ryme")
-        .map_err(|_| LinkError::Unreachable)?;
-    let conn = tokio::time::timeout(Duration::from_secs(4), connecting)
-        .await
-        .map_err(|_| LinkError::Unreachable)?
-        .map_err(|_| LinkError::Unreachable)?;
+    let addrs = addresses(&parsed.host, parsed.port)?;
+    let mut last = LinkError::Unreachable;
+    let mut opened = None;
+    for addr in addrs {
+        match dial(addr, parsed.fingerprint).await {
+            Ok(opened_conn) => {
+                opened = Some(opened_conn);
+                break;
+            }
+            Err(LinkError::Pin) => return Err(LinkError::Pin),
+            Err(err) => last = err,
+        }
+    }
+    let (endpoint, conn) = opened.ok_or(last)?;
     let (mut send, mut recv) = conn.open_bi().await.map_err(|_| LinkError::Unreachable)?;
 
     write_msg(
@@ -140,12 +157,14 @@ pub async fn connect(invite: &str, name: &str, card: u64) -> Result<Live, LinkEr
         &ClientMsg::Hello {
             name: name.to_string(),
             card,
+            pass: parsed.pass,
+            resume,
         },
     )
     .await?;
     let mut buf = Vec::new();
-    let me = match read_msg(&mut recv, &mut buf).await? {
-        ServerMsg::Welcome { user_id } => user_id,
+    let (me, resume) = match read_msg(&mut recv, &mut buf).await? {
+        ServerMsg::Welcome { user_id, resume } => (user_id, resume),
         ServerMsg::Reject { reason } => return Err(LinkError::Rejected(reason)),
         _ => return Err(LinkError::Unreachable),
     };
@@ -194,20 +213,65 @@ pub async fn connect(invite: &str, name: &str, card: u64) -> Result<Live, LinkEr
             incoming: voice_in_rx,
             outgoing: voice_out_tx,
         },
+        resume,
     })
 }
 
-fn resolve(host: &str, port: u16) -> Result<SocketAddr, LinkError> {
+async fn dial(
+    addr: SocketAddr,
+    fingerprint: [u8; 32],
+) -> Result<(quinn::Endpoint, quinn::Connection), LinkError> {
+    let mut endpoint =
+        quinn::Endpoint::client(bind_for(addr).parse().unwrap()).map_err(|_| LinkError::Address)?;
+    endpoint
+        .set_default_client_config(client_config(fingerprint).map_err(|_| LinkError::Unreachable)?);
+    let connecting = endpoint
+        .connect(addr, "ryme")
+        .map_err(|_| LinkError::Unreachable)?;
+    let conn = tokio::time::timeout(Duration::from_secs(4), connecting)
+        .await
+        .map_err(|_| LinkError::Timeout)?
+        .map_err(classify)?;
+    Ok((endpoint, conn))
+}
+
+fn classify(err: impl std::fmt::Display) -> LinkError {
+    let text = err.to_string().to_ascii_lowercase();
+    if text.contains("fingerprint") {
+        LinkError::Pin
+    } else {
+        LinkError::Unreachable
+    }
+}
+
+fn bind_for(addr: SocketAddr) -> &'static str {
+    if addr.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    }
+}
+
+fn addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>, LinkError> {
     let host = match host {
         "0.0.0.0" => "127.0.0.1",
         "::" | "[::]" => "::1",
         other => other,
     };
-    (host, port)
+    let mut seen = Vec::new();
+    for addr in (host, port)
         .to_socket_addrs()
-        .ok()
-        .and_then(|mut addrs| addrs.next())
-        .ok_or(LinkError::Unreachable)
+        .map_err(|_| LinkError::Address)?
+    {
+        if !seen.contains(&addr) {
+            seen.push(addr);
+        }
+    }
+    if seen.is_empty() {
+        Err(LinkError::Address)
+    } else {
+        Ok(seen)
+    }
 }
 
 fn peers(members: Vec<Member>) -> Vec<Peer> {
@@ -238,7 +302,7 @@ async fn read_msg(recv: &mut quinn::RecvStream, buf: &mut Vec<u8>) -> Result<Ser
         }
         let n = tokio::time::timeout(Duration::from_secs(4), recv.read(&mut tmp))
             .await
-            .map_err(|_| LinkError::Unreachable)?
+            .map_err(|_| LinkError::Timeout)?
             .map_err(|_| LinkError::Unreachable)?
             .ok_or(LinkError::Unreachable)?;
         buf.extend_from_slice(&tmp[..n]);
@@ -367,53 +431,54 @@ mod tests {
     use super::*;
     use crate::Server;
 
-    async fn up() -> (u16, [u8; 32], tokio::task::JoinHandle<()>) {
+    async fn up() -> (u16, [u8; 32], [u8; 32], tokio::task::JoinHandle<()>) {
         let server = Server::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let port = server.port();
         let fingerprint = server.fingerprint();
+        let pass = server.pass();
         let task = tokio::spawn(async move { server.serve().await });
-        (port, fingerprint, task)
+        (port, fingerprint, pass, task)
     }
 
-    fn invite(port: u16, fingerprint: [u8; 32]) -> String {
-        crate::identity::invite_url("127.0.0.1", port, &fingerprint)
+    fn invite(port: u16, fingerprint: [u8; 32], pass: [u8; 32]) -> String {
+        crate::identity::invite_url("127.0.0.1", port, &fingerprint, &pass)
     }
 
     #[tokio::test]
     async fn join_shows_you_and_a_bad_invite_fails() {
-        match connect("nope", "Mara", 1).await {
+        match connect("nope", "Mara", 1, [0; 32]).await {
             Err(LinkError::Invite) => {}
             Err(err) => panic!("expected a bad invite, got {err:?}"),
             Ok(_) => panic!("bad invite connected"),
         }
 
-        let (port, fingerprint, _task) = up().await;
+        let (port, fingerprint, pass, _task) = up().await;
         let mut bad = fingerprint;
         bad[0] ^= 0xff;
-        match connect(&invite(port, bad), "Mara", 1).await {
-            Err(LinkError::Unreachable) => {}
+        match connect(&invite(port, bad, pass), "Mara", 1, [0; 32]).await {
+            Err(LinkError::Pin) => {}
             Err(err) => panic!("expected a refused pin, got {err:?}"),
             Ok(_) => panic!("wrong fingerprint connected"),
         }
 
-        let url = invite(port, fingerprint);
-        let live = connect(&url, "Mara", 1).await.unwrap();
+        let url = invite(port, fingerprint, pass);
+        let live = connect(&url, "Mara", 1, [0; 32]).await.unwrap();
         assert_eq!(live.channel, "Lobby");
         assert_eq!(live.members.len(), 1);
         assert_eq!(live.members[0].name, "Mara");
         assert_eq!(live.members[0].user_id, live.me);
 
-        let unspecified = crate::identity::invite_url("0.0.0.0", port, &fingerprint);
-        let again = connect(&unspecified, "Mara", 1).await.unwrap();
+        let unspecified = crate::identity::invite_url("0.0.0.0", port, &fingerprint, &pass);
+        let again = connect(&unspecified, "Mara", 3, [0; 32]).await.unwrap();
         assert_eq!(again.members[0].name, "Mara");
     }
 
     #[tokio::test]
     async fn a_second_client_is_announced_and_logout_drops_them() {
-        let (port, fingerprint, _task) = up().await;
-        let url = invite(port, fingerprint);
-        let mut mara = connect(&url, "Mara", 1).await.unwrap();
-        let jonas = connect(&url, "Jonas", 2).await.unwrap();
+        let (port, fingerprint, pass, _task) = up().await;
+        let url = invite(port, fingerprint, pass);
+        let mut mara = connect(&url, "Mara", 1, [0; 32]).await.unwrap();
+        let jonas = connect(&url, "Jonas", 2, [0; 32]).await.unwrap();
         assert_eq!(jonas.members.len(), 2);
 
         let event = tokio::time::timeout(Duration::from_secs(2), mara.events.recv())
@@ -452,9 +517,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_channel_is_refused_and_lobby_stays() {
-        let (port, fingerprint, _task) = up().await;
-        let url = invite(port, fingerprint);
-        let mut live = connect(&url, "Mara", 1).await.unwrap();
+        let (port, fingerprint, pass, _task) = up().await;
+        let url = invite(port, fingerprint, pass);
+        let mut live = connect(&url, "Mara", 1, [0; 32]).await.unwrap();
         live.link.join("Nope");
         let refused = tokio::time::timeout(Duration::from_secs(2), live.events.recv())
             .await
@@ -486,9 +551,10 @@ mod tests {
         server.allow("Ranked");
         let port = server.port();
         let fingerprint = server.fingerprint();
+        let pass = server.pass();
         tokio::spawn(async move { server.serve().await });
-        let url = invite(port, fingerprint);
-        let mut live = connect(&url, "Mara", 1).await.unwrap();
+        let url = invite(port, fingerprint, pass);
+        let mut live = connect(&url, "Mara", 1, [0; 32]).await.unwrap();
         live.link.join("Ranked");
         let joined = tokio::time::timeout(Duration::from_secs(2), live.events.recv())
             .await
@@ -505,10 +571,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_voice_packet_arrives_with_the_real_speaker() {
-        let (port, fingerprint, _task) = up().await;
-        let url = invite(port, fingerprint);
-        let mara = connect(&url, "Mara", 1).await.unwrap();
-        let jonas = connect(&url, "Jonas", 2).await.unwrap();
+        let (port, fingerprint, pass, _task) = up().await;
+        let url = invite(port, fingerprint, pass);
+        let mara = connect(&url, "Mara", 1, [0; 32]).await.unwrap();
+        let jonas = connect(&url, "Jonas", 2, [0; 32]).await.unwrap();
 
         let packet = ryme_proto::encode_voice(&ryme_proto::VoicePacket {
             speaker: 99,
@@ -535,5 +601,41 @@ mod tests {
         assert_eq!(voice.seq, 7);
         assert_eq!(voice.payload, vec![1, 2, 3, 4]);
         assert!(mara.voice.try_recv().is_none());
+    }
+
+    #[test]
+    fn the_local_socket_matches_the_address_family() {
+        assert_eq!(bind_for(SocketAddr::from(([127, 0, 0, 1], 1))), "0.0.0.0:0");
+        assert_eq!(
+            bind_for(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 1))),
+            "[::]:0"
+        );
+    }
+
+    #[test]
+    fn a_literal_keeps_its_family_and_an_unspecified_host_is_local() {
+        let v4 = addresses("127.0.0.1", 1542).unwrap();
+        assert!(v4.iter().all(|addr| addr.is_ipv4()));
+        let local = addresses("0.0.0.0", 1542).unwrap();
+        assert_eq!(local, vec![SocketAddr::from(([127, 0, 0, 1], 1542))]);
+    }
+
+    #[tokio::test]
+    async fn a_retired_invite_is_refused_and_a_resume_replaces_the_session() {
+        let (port, fingerprint, pass, _task) = up().await;
+        let url = invite(port, fingerprint, pass);
+        let mut bad = pass;
+        bad[0] ^= 0xff;
+        let retired = crate::identity::invite_url("127.0.0.1", port, &fingerprint, &bad);
+        match connect(&retired, "Mara", 1, [0; 32]).await {
+            Err(LinkError::Rejected(reason)) => assert_eq!(reason, "invite was retired"),
+            Err(err) => panic!("expected a retired invite, got {err:?}"),
+            Ok(_) => panic!("a retired invite was admitted"),
+        }
+
+        let first = connect(&url, "Mara", 4, [0; 32]).await.unwrap();
+        let second = connect(&url, "Mara", 4, first.resume).await.unwrap();
+        assert_ne!(second.me, first.me);
+        assert_ne!(second.resume, first.resume);
     }
 }

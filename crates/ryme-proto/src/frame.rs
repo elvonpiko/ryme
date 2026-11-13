@@ -77,6 +77,8 @@ mod tests {
         let hello = encode_client(&ClientMsg::Hello {
             name: "Mara".into(),
             card: 4,
+            pass: [3; 32],
+            resume: [0; 32],
         })
         .unwrap();
         let join = encode_client(&ClientMsg::Join {
@@ -91,7 +93,9 @@ mod tests {
             first,
             ClientMsg::Hello {
                 name: "Mara".into(),
-                card: 4
+                card: 4,
+                pass: [3; 32],
+                resume: [0; 32],
             }
         );
         let (second, m) = decode_client_frame(&buf[n..]).unwrap().unwrap();
@@ -141,6 +145,8 @@ mod tests {
         let frame = encode_client(&ClientMsg::Hello {
             name: "  Ravi ".into(),
             card: 9,
+            pass: [3; 32],
+            resume: [0; 32],
         })
         .unwrap();
         let (msg, _) = decode_client_frame(&frame).unwrap().unwrap();
@@ -148,7 +154,9 @@ mod tests {
             msg,
             ClientMsg::Hello {
                 name: "Ravi".into(),
-                card: 9
+                card: 9,
+                pass: [3; 32],
+                resume: [0; 32],
             }
         );
     }
@@ -158,6 +166,8 @@ mod tests {
         let frame = encode_client(&ClientMsg::Hello {
             name: " \n ".into(),
             card: 9,
+            pass: [3; 32],
+            resume: [0; 32],
         })
         .unwrap();
         assert_eq!(

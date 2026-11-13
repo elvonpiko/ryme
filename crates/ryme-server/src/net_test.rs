@@ -51,6 +51,7 @@ async fn two_clients_share_voice_until_one_mutes() {
     let server = Server::bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let port = server.port();
     let fingerprint = server.fingerprint();
+    let pass = server.pass();
     assert!(server.invite("127.0.0.1").contains(&format!(":{port}/#")));
     tokio::spawn(async move {
         server.serve().await;
@@ -66,6 +67,8 @@ async fn two_clients_share_voice_until_one_mutes() {
         &ClientMsg::Hello {
             name: "Mara".into(),
             card: 1,
+            pass,
+            resume: [0; 32],
         },
     )
     .await;
@@ -74,16 +77,18 @@ async fn two_clients_share_voice_until_one_mutes() {
         &ClientMsg::Hello {
             name: "Jonas".into(),
             card: 2,
+            pass,
+            resume: [0; 32],
         },
     )
     .await;
     assert!(matches!(
         next_msg(&mut a_recv, &mut a_buf).await,
-        ServerMsg::Welcome { user_id: 1 }
+        ServerMsg::Welcome { user_id: 1, .. }
     ));
     assert!(matches!(
         next_msg(&mut b_recv, &mut b_buf).await,
-        ServerMsg::Welcome { user_id: 2 }
+        ServerMsg::Welcome { user_id: 2, .. }
     ));
 
     send_msg(

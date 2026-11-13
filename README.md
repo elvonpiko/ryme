@@ -35,13 +35,15 @@ See [SECURITY.md](SECURITY.md). The license is MIT. See [LICENSE](LICENSE).
 
 ## Server
 
-Written in Rust. On Linux, including a Raspberry Pi:
+Written in Rust. On Linux, including a Raspberry Pi.
+
+The short start is the image [ghcr.io/elvonpiko/ryme-server](https://github.com/elvonpiko/ryme/pkgs/container/ryme-server), tagged with the release. Or install the binary and run it:
 
 ```sh
 curl -fsSL https://ryme.chat/install | bash
 ```
 
-Set `RYME_PUBLIC` to the address friends can reach, then run `ryme-server`. Rooms, Docker, and tunnels are documented on [ryme.chat](https://ryme.chat).
+`RYME_PUBLIC` is the one host friends use: the public IP, or a domain that points at it. The server listens on UDP 1542 and prints `ryme://that-host:1542/#…`. The setup, the firewall, and a home router are on [ryme.chat](https://ryme.chat/docs/docker).
 
 ## Clients
 

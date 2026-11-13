@@ -158,6 +158,22 @@ component Avatar inherits Rectangle {
     }
 }
 
+// Charcoal-white night. No moon. A page that covers the card draws its own,
+// because its ground would hide the marks on the page underneath.
+component Stars inherits Rectangle {
+    width: 100%;
+    height: 100%;
+    background: transparent;
+    Rectangle { x: 104px; y: 20px; width: 2px; height: 2px; border-radius: 1px; background: #e0e0e0; opacity: 0.45; }
+    Rectangle { x: 168px; y: 30px; width: 2px; height: 2px; border-radius: 1px; background: #e0e0e0; opacity: 0.55; }
+    Rectangle { x: 214px; y: 16px; width: 2px; height: 2px; border-radius: 1px; background: #e0e0e0; opacity: 0.75; }
+    Rectangle { x: 246px; y: 38px; width: 2px; height: 2px; border-radius: 1px; background: #e0e0e0; opacity: 0.35; }
+    Rectangle { x: 188px; y: 52px; width: 2px; height: 2px; border-radius: 1px; background: #e0e0e0; opacity: 0.28; }
+    Rectangle { x: 272px; y: 58px; width: 2px; height: 2px; border-radius: 1px; background: #e0e0e0; opacity: 0.50; }
+    Rectangle { x: 358px; y: 54px; width: 2px; height: 2px; border-radius: 1px; background: #e0e0e0; opacity: 0.42; }
+    Rectangle { x: 352px; y: 156px; width: 2px; height: 2px; border-radius: 1px; background: #e0e0e0; opacity: 0.32; }
+}
+
 // Same stroke as the card rim, held in from the edges so the tear stays the outline.
 component Hairline inherits Rectangle {
     height: 1px;
@@ -471,7 +487,6 @@ export component MainWindow inherits Window {
     in-out property <float> mic-level: 0;
     in-out property <string> input-name: "Default";
     in-out property <string> output-name: "Default";
-    in-out property <[string]> servers: [];
     in-out property <string> mic-line: root.muted ? "Muted" : root.ptt ? (root.keyed ? "Mic live" : "Hold " + root.talk-key + " to talk") : "Mic live";
     in-out property <[Band]> bands: [];
     in-out property <int> picked: -1;
@@ -536,16 +551,8 @@ export component MainWindow inherits Window {
         fill: Theme.bg;
     }
 
-    // Stars only — charcoal-white night, minimal, no moon.
-    // Fits the clean dark design of a lightweight Teamspeak/Mumble alternative.
-    Rectangle { x: 104px; y: 20px; width: 2px; height: 2px; border-radius: 1px; background: #e0e0e0; opacity: 0.45; }
-    Rectangle { x: 168px; y: 30px; width: 2px; height: 2px; border-radius: 1px; background: #e0e0e0; opacity: 0.55; }
-    Rectangle { x: 214px; y: 16px; width: 2px; height: 2px; border-radius: 1px; background: #e0e0e0; opacity: 0.75; }
-    Rectangle { x: 246px; y: 38px; width: 2px; height: 2px; border-radius: 1px; background: #e0e0e0; opacity: 0.35; }
-    Rectangle { x: 188px; y: 52px; width: 2px; height: 2px; border-radius: 1px; background: #e0e0e0; opacity: 0.28; }
-    Rectangle { x: 272px; y: 58px; width: 2px; height: 2px; border-radius: 1px; background: #e0e0e0; opacity: 0.50; }
-    Rectangle { x: 358px; y: 54px; width: 2px; height: 2px; border-radius: 1px; background: #e0e0e0; opacity: 0.42; }
-    Rectangle { x: 352px; y: 156px; width: 2px; height: 2px; border-radius: 1px; background: #e0e0e0; opacity: 0.32; }
+    // A full-card page paints its own ground, so each page draws these itself.
+    Stars { }
 
     VerticalLayout {
         Rectangle {
@@ -887,6 +894,7 @@ export component MainWindow inherits Window {
         height: 100%;
         background: Theme.bg;
         animate y { duration: 240ms; easing: ease-out; }
+        Stars { }
         // Eat clicks on the empty canvas so they don't reach the page underneath.
         TouchArea {
             width: 100%;
@@ -1287,6 +1295,7 @@ export component MainWindow inherits Window {
         height: 100%;
         background: Theme.bg;
         animate y { duration: 240ms; easing: ease-out; }
+        Stars { }
         TouchArea { width: 100%; height: 100%; }
 
         VerticalLayout {
@@ -1374,21 +1383,6 @@ export component MainWindow inherits Window {
                 Field {
                     placeholder: "ryme://host:port/#…";
                     value <=> root.invite;
-                }
-                if root.servers.length > 0 : VerticalLayout {
-                    spacing: 1px;
-                    for server in root.servers : Rectangle {
-                        height: 16px;
-                        Text {
-                            text: server;
-                            color: saved.has-hover ? Theme.signal : Theme.muted;
-                            font-family: Theme.sans;
-                            font-size: 11px;
-                            vertical-alignment: center;
-                            overflow: elide;
-                        }
-                        saved := TouchArea { clicked => { root.invite = server; } }
-                    }
                 }
             }
 

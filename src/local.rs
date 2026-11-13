@@ -380,35 +380,11 @@ fn device_name(name: &str) -> String {
     }
 }
 
-/// Invites this person has joined, newest first. A click fills the field.
-pub fn load_servers() -> Vec<String> {
-    let Some(path) = dir().map(|dir| dir.join("servers")) else {
-        return Vec::new();
-    };
-    let Ok(text) = fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    text.lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("ryme://") && !line.contains(char::is_whitespace))
-        .take(8)
-        .map(str::to_string)
-        .collect()
-}
-
-pub fn remember_server(invite: &str) {
-    let invite = invite.trim();
-    if !invite.starts_with("ryme://") || invite.contains(char::is_whitespace) {
-        return;
+/// The clickable list of old invites is gone. Drop the file so it cannot return.
+pub fn forget_servers() {
+    if let Some(path) = dir().map(|dir| dir.join("servers")) {
+        let _ = fs::remove_file(path);
     }
-    let mut list = load_servers();
-    list.retain(|item| item != invite);
-    list.insert(0, invite.to_string());
-    list.truncate(8);
-    let Some(path) = dir().map(|dir| dir.join("servers")) else {
-        return;
-    };
-    let _ = write_private(&path, list.join("\n").as_bytes());
 }
 
 /// A second launch, or a ryme:// open, leaves the link here for the running card.

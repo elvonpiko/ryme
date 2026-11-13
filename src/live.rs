@@ -164,7 +164,7 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
     ui.set_talk_key(audio.key.to_string().into());
     ui.set_input_name(short_device(&audio.input).into());
     ui.set_output_name(short_device(&audio.output).into());
-    show_servers(ui);
+    local::forget_servers();
     let staged = local::take_staged_invite();
     let slot = Arc::new(Mutex::new(Slot {
         link: None,
@@ -575,14 +575,6 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
     Shutdown { slot }
 }
 
-fn show_servers(ui: &MainWindow) {
-    let servers: Vec<slint::SharedString> = local::load_servers()
-        .into_iter()
-        .map(slint::SharedString::from)
-        .collect();
-    ui.set_servers(ModelRc::new(VecModel::from(servers)));
-}
-
 fn short_device(name: &str) -> String {
     let name = if name == "default" { "Default" } else { name };
     let count = name.chars().count();
@@ -882,9 +874,6 @@ fn begin(
                                     switches.3,
                                     ticket,
                                 );
-                                local::remember_server(&invite);
-                                let weak = weak.clone();
-                                let _ = weak.upgrade_in_event_loop(|ui| show_servers(&ui));
                             }
                             let want = slot.lock().unwrap().channel.clone();
                             if let Some(ear) = slot.lock().unwrap().ear.as_ref() {

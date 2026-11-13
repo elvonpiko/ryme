@@ -6,7 +6,7 @@
 //! resampled on that thread.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -42,8 +42,27 @@ pub struct Ear {
     denoise: Arc<AtomicBool>,
     vkey: Arc<AtomicBool>,
     levels: Arc<Mutex<HashMap<u32, Mix>>>,
+    input: Arc<Mutex<String>>,
+    output: Arc<Mutex<String>>,
+    reset_in: Arc<AtomicBool>,
+    reset_out: Arc<AtomicBool>,
+    peak: Arc<AtomicU32>,
+    tone_left: Arc<AtomicU32>,
     pub mic: bool,
     pub speakers: bool,
+    thread: Option<JoinHandle<()>>,
+}
+
+/// Local microphone and speakers, with no server. The welcome card uses this
+/// so a person can see the meter and hear a tone before they invite anyone.
+pub struct Preview {
+    stop: Arc<AtomicBool>,
+    input: Arc<Mutex<String>>,
+    output: Arc<Mutex<String>>,
+    reset_in: Arc<AtomicBool>,
+    reset_out: Arc<AtomicBool>,
+    peak: Arc<AtomicU32>,
+    tone_left: Arc<AtomicU32>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -69,13 +88,94 @@ impl Ear {
         self.denoise.store(on, Ordering::Relaxed);
     }
 
-    /// V, as seen by the window. The audio thread also reads the keyboard.
+    /// The configured letter, as seen by the window. The audio thread also reads
+    /// the keyboard where the platform allows it.
     pub fn set_vkey(&self, down: bool) {
         self.vkey.store(down, Ordering::Relaxed);
+        WINDOW_KEY.store(down, Ordering::Relaxed);
     }
 
     pub fn set_levels(&self, levels: HashMap<u32, Mix>) {
         *self.levels.lock().unwrap() = levels;
+    }
+
+    /// 0 to 100, from the microphone. Stays available while muted, so a test
+    /// does not transmit.
+    pub fn level(&self) -> u32 {
+        self.peak.load(Ordering::Relaxed)
+    }
+
+    pub fn play_tone(&self) {
+        self.tone_left.store(40, Ordering::Relaxed);
+    }
+
+    pub fn set_input(&self, name: &str) {
+        *self.input.lock().unwrap() = device_label(name);
+        self.reset_in.store(true, Ordering::Relaxed);
+    }
+
+    pub fn set_output(&self, name: &str) {
+        *self.output.lock().unwrap() = device_label(name);
+        self.reset_out.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Preview {
+    pub fn start(input: &str, output: &str) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let input = Arc::new(Mutex::new(device_label(input)));
+        let output = Arc::new(Mutex::new(device_label(output)));
+        let reset_in = Arc::new(AtomicBool::new(false));
+        let reset_out = Arc::new(AtomicBool::new(false));
+        let peak = Arc::new(AtomicU32::new(0));
+        let tone_left = Arc::new(AtomicU32::new(0));
+        let thread = thread::spawn({
+            let stop = stop.clone();
+            let input = input.clone();
+            let output = output.clone();
+            let reset_in = reset_in.clone();
+            let reset_out = reset_out.clone();
+            let peak = peak.clone();
+            let tone_left = tone_left.clone();
+            move || preview_loop(stop, input, output, reset_in, reset_out, peak, tone_left)
+        });
+        Self {
+            stop,
+            input,
+            output,
+            reset_in,
+            reset_out,
+            peak,
+            tone_left,
+            thread: Some(thread),
+        }
+    }
+
+    pub fn level(&self) -> u32 {
+        self.peak.load(Ordering::Relaxed)
+    }
+
+    pub fn play_tone(&self) {
+        self.tone_left.store(40, Ordering::Relaxed);
+    }
+
+    pub fn set_input(&self, name: &str) {
+        *self.input.lock().unwrap() = device_label(name);
+        self.reset_in.store(true, Ordering::Relaxed);
+    }
+
+    pub fn set_output(&self, name: &str) {
+        *self.output.lock().unwrap() = device_label(name);
+        self.reset_out.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for Preview {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -88,15 +188,43 @@ impl Drop for Ear {
     }
 }
 
-pub fn open(pipe: VoicePipe, me: u32, speaking: UnboundedSender<(u32, bool)>) -> Ear {
+/// Microphone state the audio thread starts with. Transmission stays off
+/// (`live` is false) until the caller has the intended room.
+pub struct Gate {
+    pub muted: bool,
+    pub deaf: bool,
+    pub ptt: bool,
+    pub denoise: bool,
+}
+
+/// True only when this client is in the intended room, the mic is open, and
+/// push-to-talk is either off or held.
+pub fn may_send(live: bool, muted: bool, keyed: bool) -> bool {
+    live && !muted && keyed
+}
+
+pub fn open(
+    pipe: VoicePipe,
+    me: u32,
+    speaking: UnboundedSender<(u32, bool)>,
+    gate: Gate,
+    input: &str,
+    output: &str,
+) -> Ear {
     let stop = Arc::new(AtomicBool::new(false));
-    let muted = Arc::new(AtomicBool::new(false));
-    let deaf = Arc::new(AtomicBool::new(false));
-    let live = Arc::new(AtomicBool::new(true));
-    let ptt = Arc::new(AtomicBool::new(false));
-    let denoise = Arc::new(AtomicBool::new(true));
+    let muted = Arc::new(AtomicBool::new(gate.muted));
+    let deaf = Arc::new(AtomicBool::new(gate.deaf));
+    let live = Arc::new(AtomicBool::new(false));
+    let ptt = Arc::new(AtomicBool::new(gate.ptt));
+    let denoise = Arc::new(AtomicBool::new(gate.denoise));
     let vkey = Arc::new(AtomicBool::new(false));
     let levels = Arc::new(Mutex::new(HashMap::new()));
+    let input = Arc::new(Mutex::new(device_label(input)));
+    let output = Arc::new(Mutex::new(device_label(output)));
+    let reset_in = Arc::new(AtomicBool::new(false));
+    let reset_out = Arc::new(AtomicBool::new(false));
+    let peak = Arc::new(AtomicU32::new(0));
+    let tone_left = Arc::new(AtomicU32::new(0));
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     let thread = thread::spawn({
         let stop = stop.clone();
@@ -107,9 +235,16 @@ pub fn open(pipe: VoicePipe, me: u32, speaking: UnboundedSender<(u32, bool)>) ->
         let denoise = denoise.clone();
         let vkey = vkey.clone();
         let levels = levels.clone();
+        let input = input.clone();
+        let output = output.clone();
+        let reset_in = reset_in.clone();
+        let reset_out = reset_out.clone();
+        let peak = peak.clone();
+        let tone_left = tone_left.clone();
         move || {
             run(
-                pipe, me, speaking, stop, muted, deaf, live, ptt, denoise, vkey, levels, ready_tx,
+                pipe, me, speaking, stop, muted, deaf, live, ptt, denoise, vkey, levels, input,
+                output, reset_in, reset_out, peak, tone_left, ready_tx,
             )
         }
     });
@@ -128,6 +263,12 @@ pub fn open(pipe: VoicePipe, me: u32, speaking: UnboundedSender<(u32, bool)>) ->
         denoise,
         vkey,
         levels,
+        input,
+        output,
+        reset_in,
+        reset_out,
+        peak,
+        tone_left,
         mic: opened.mic,
         speakers: opened.speakers,
         thread: Some(thread),
@@ -151,10 +292,17 @@ fn run(
     denoise: Arc<AtomicBool>,
     vkey: Arc<AtomicBool>,
     levels: Arc<Mutex<HashMap<u32, Mix>>>,
+    input: Arc<Mutex<String>>,
+    output: Arc<Mutex<String>>,
+    reset_in: Arc<AtomicBool>,
+    reset_out: Arc<AtomicBool>,
+    peak: Arc<AtomicU32>,
+    tone_left: Arc<AtomicU32>,
     ready: std::sync::mpsc::SyncSender<Opened>,
 ) {
-    let (cap_rate, mut cap_rx, mic, cap_thread) = start_capture(stop.clone());
-    let (play_rate, mut play_tx, speakers_on, play_thread) = start_playback(stop.clone());
+    let (cap_rate, mut cap_rx, mic, cap_thread) = start_capture(stop.clone(), input, reset_in);
+    let (play_rate, mut play_tx, speakers_on, play_thread) =
+        start_playback(stop.clone(), output, reset_out);
     let _ = ready.send(Opened {
         mic,
         speakers: speakers_on,
@@ -177,6 +325,7 @@ fn run(
     let mut cap_48 = Vec::<f32>::new();
     let mut pending_play = Vec::<f32>::new();
     let frame_device = (play_rate / 100).max(1) as usize;
+    let mut tone_phase = 0.0f32;
 
     while !stop.load(Ordering::Relaxed) {
         while let Some(packet) = pipe.try_recv() {
@@ -187,7 +336,11 @@ fn run(
         } else {
             true
         };
-        if muted.load(Ordering::Relaxed) || !live.load(Ordering::Relaxed) || !keyed {
+        if !may_send(
+            live.load(Ordering::Relaxed),
+            muted.load(Ordering::Relaxed),
+            keyed,
+        ) {
             tell(&speaking, &mut shown, me, false);
         }
         if encoder.is_some() {
@@ -197,8 +350,12 @@ fn run(
                 frame.copy_from_slice(&cap_48[..FRAME]);
                 cap_48.drain(..FRAME);
                 shape_frame(&mut frame, denoise.load(Ordering::Relaxed), &mut tone);
-                let sending =
-                    live.load(Ordering::Relaxed) && !muted.load(Ordering::Relaxed) && keyed;
+                remember_peak(&peak, &frame);
+                let sending = may_send(
+                    live.load(Ordering::Relaxed),
+                    muted.load(Ordering::Relaxed),
+                    keyed,
+                );
                 let talking = sending && mine.tick(&frame);
                 tell(&speaking, &mut shown, me, talking);
                 if sending {
@@ -220,7 +377,12 @@ fn run(
                 if deaf.load(Ordering::Relaxed) {
                     mix.fill(0.0);
                 }
-                if heard {
+                let testing = tone_left.load(Ordering::Relaxed) > 0;
+                if testing {
+                    let _ = tone_left.fetch_sub(1, Ordering::Relaxed);
+                    add_tone(&mut mix, &mut tone_phase);
+                }
+                if heard || testing {
                     play_pace.convert(&mix, &mut pending_play);
                 }
             }
@@ -513,12 +675,85 @@ impl Pace {
     }
 }
 
+fn device_label(name: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() || name.contains(['\n', '\r']) {
+        "default".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+fn remember_peak(peak: &AtomicU32, frame: &[f32]) {
+    let loud = frame
+        .iter()
+        .fold(0.0f32, |loud, sample| loud.max(sample.abs()));
+    peak.store((loud * 100.0).clamp(0.0, 100.0) as u32, Ordering::Relaxed);
+}
+
+fn add_tone(mix: &mut [f32], phase: &mut f32) {
+    let step = std::f32::consts::TAU * 440.0 / RATE as f32;
+    for sample in mix.iter_mut() {
+        *sample = (*sample + phase.sin() * 0.2).clamp(-1.0, 1.0);
+        *phase += step;
+    }
+}
+
+fn preview_loop(
+    stop: Arc<AtomicBool>,
+    input: Arc<Mutex<String>>,
+    output: Arc<Mutex<String>>,
+    reset_in: Arc<AtomicBool>,
+    reset_out: Arc<AtomicBool>,
+    peak: Arc<AtomicU32>,
+    tone_left: Arc<AtomicU32>,
+) {
+    let (cap_rate, mut cap_rx, _, cap_thread) = start_capture(stop.clone(), input, reset_in);
+    let (play_rate, mut play_tx, _, play_thread) = start_playback(stop.clone(), output, reset_out);
+    let mut cap_pace = Pace::new(cap_rate, RATE);
+    let mut play_pace = Pace::new(RATE, play_rate);
+    let mut cap_48 = Vec::<f32>::new();
+    let mut pending = Vec::<f32>::new();
+    let mut phase = 0.0f32;
+    while !stop.load(Ordering::Relaxed) {
+        pull_capture(&mut cap_rx, &mut cap_pace, &mut cap_48);
+        while cap_48.len() >= FRAME {
+            let mut frame = [0f32; FRAME];
+            frame.copy_from_slice(&cap_48[..FRAME]);
+            cap_48.drain(..FRAME);
+            remember_peak(&peak, &frame);
+        }
+        if play_tx.is_some() && tone_left.load(Ordering::Relaxed) > 0 {
+            let _ = tone_left.fetch_sub(1, Ordering::Relaxed);
+            let mut mix = [0f32; FRAME];
+            add_tone(&mut mix, &mut phase);
+            play_pace.convert(&mix, &mut pending);
+            if let Some(tx) = play_tx.as_mut() {
+                let written = {
+                    let (done, _) = tx.push_partial_slice(&pending);
+                    done.len()
+                };
+                pending.drain(..written);
+            }
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    if let Some(thread) = cap_thread {
+        let _ = thread.join();
+    }
+    if let Some(thread) = play_thread {
+        let _ = thread.join();
+    }
+}
+
 fn start_capture(
     stop: Arc<AtomicBool>,
+    name: Arc<Mutex<String>>,
+    reset: Arc<AtomicBool>,
 ) -> (u32, Option<Consumer<f32>>, bool, Option<JoinHandle<()>>) {
     let (producer, consumer) = RingBuffer::<f32>::new(RING);
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-    let thread = thread::spawn(move || capture_thread(stop, producer, ready_tx));
+    let thread = thread::spawn(move || capture_thread(stop, producer, ready_tx, name, reset));
     match ready_rx.recv_timeout(Duration::from_secs(2)) {
         Ok((true, rate)) => (rate, Some(consumer), true, Some(thread)),
         _ => (RATE, None, false, Some(thread)),
@@ -527,10 +762,12 @@ fn start_capture(
 
 fn start_playback(
     stop: Arc<AtomicBool>,
+    name: Arc<Mutex<String>>,
+    reset: Arc<AtomicBool>,
 ) -> (u32, Option<Producer<f32>>, bool, Option<JoinHandle<()>>) {
     let (producer, consumer) = RingBuffer::<f32>::new(RING);
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-    let thread = thread::spawn(move || playback_thread(stop, consumer, ready_tx));
+    let thread = thread::spawn(move || playback_thread(stop, consumer, ready_tx, name, reset));
     match ready_rx.recv_timeout(Duration::from_secs(2)) {
         Ok((true, rate)) => (rate, Some(producer), true, Some(thread)),
         _ => (RATE, None, false, Some(thread)),
@@ -542,32 +779,55 @@ fn capture_thread(
     stop: Arc<AtomicBool>,
     mut producer: Producer<f32>,
     ready: std::sync::mpsc::SyncSender<(bool, u32)>,
+    name: Arc<Mutex<String>>,
+    reset: Arc<AtomicBool>,
 ) {
-    let Some(pcm) = alsa::open(true) else {
-        let _ = ready.send((false, RATE));
-        return;
-    };
-    let _ = ready.send((true, pcm.rate));
-    let mut buf = vec![0i16; FRAME * pcm.channels as usize];
+    let mut pcm: Option<alsa::Pcm> = None;
+    let mut announced = false;
+    let mut channels = 1usize;
+    let mut buf = vec![0i16; FRAME];
     while !stop.load(Ordering::Relaxed) {
+        if pcm.is_none() || reset.swap(false, Ordering::Relaxed) {
+            if let Some(old) = pcm.take() {
+                unsafe { alsa::snd_pcm_close(old.pcm) };
+            }
+            let chosen = name.lock().unwrap().clone();
+            pcm = alsa::open(true, &chosen);
+            if let Some(opened) = pcm.as_ref() {
+                channels = opened.channels as usize;
+                buf.resize(FRAME * channels, 0);
+            }
+            if !announced {
+                let rate = pcm.as_ref().map(|opened| opened.rate).unwrap_or(RATE);
+                let _ = ready.send((pcm.is_some(), rate));
+                announced = true;
+            }
+            if pcm.is_none() {
+                thread::sleep(Duration::from_millis(400));
+                continue;
+            }
+        }
+        let Some(handle) = pcm.as_ref().map(|opened| opened.pcm) else {
+            continue;
+        };
         let read = unsafe {
-            alsa::snd_pcm_readi(pcm.pcm, buf.as_mut_ptr().cast(), FRAME as std::ffi::c_ulong)
+            alsa::snd_pcm_readi(handle, buf.as_mut_ptr().cast(), FRAME as std::ffi::c_ulong)
         };
         if read <= 0 {
-            if !alsa::again(read) {
-                unsafe { alsa::snd_pcm_recover(pcm.pcm, read as i32, 1) };
+            if !alsa::again(read) && unsafe { alsa::snd_pcm_recover(handle, read as i32, 1) } < 0 {
+                if let Some(old) = pcm.take() {
+                    unsafe { alsa::snd_pcm_close(old.pcm) };
+                }
             }
             thread::sleep(Duration::from_millis(2));
             continue;
         }
         let frames = (read as usize).min(FRAME);
-        push_i16(
-            &mut producer,
-            &buf[..frames * pcm.channels as usize],
-            pcm.channels as usize,
-        );
+        push_i16(&mut producer, &buf[..frames * channels], channels);
     }
-    unsafe { alsa::snd_pcm_close(pcm.pcm) };
+    if let Some(old) = pcm {
+        unsafe { alsa::snd_pcm_close(old.pcm) };
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -575,15 +835,37 @@ fn playback_thread(
     stop: Arc<AtomicBool>,
     mut consumer: Consumer<f32>,
     ready: std::sync::mpsc::SyncSender<(bool, u32)>,
+    name: Arc<Mutex<String>>,
+    reset: Arc<AtomicBool>,
 ) {
-    let Some(pcm) = alsa::open(false) else {
-        let _ = ready.send((false, RATE));
-        return;
-    };
-    let _ = ready.send((true, pcm.rate));
-    let channels = pcm.channels as usize;
-    let mut buf = vec![0i16; FRAME * channels];
+    let mut pcm: Option<alsa::Pcm> = None;
+    let mut announced = false;
+    let mut channels = 1usize;
+    let mut buf = vec![0i16; FRAME];
     while !stop.load(Ordering::Relaxed) {
+        if pcm.is_none() || reset.swap(false, Ordering::Relaxed) {
+            if let Some(old) = pcm.take() {
+                unsafe { alsa::snd_pcm_close(old.pcm) };
+            }
+            let chosen = name.lock().unwrap().clone();
+            pcm = alsa::open(false, &chosen);
+            if let Some(opened) = pcm.as_ref() {
+                channels = opened.channels as usize;
+                buf.resize(FRAME * channels, 0);
+            }
+            if !announced {
+                let rate = pcm.as_ref().map(|opened| opened.rate).unwrap_or(RATE);
+                let _ = ready.send((pcm.is_some(), rate));
+                announced = true;
+            }
+            if pcm.is_none() {
+                thread::sleep(Duration::from_millis(400));
+                continue;
+            }
+        }
+        let Some(handle) = pcm.as_ref().map(|opened| opened.pcm) else {
+            continue;
+        };
         for frame in 0..FRAME {
             let sample = consumer.pop().unwrap_or(0.0);
             let sample = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
@@ -595,23 +877,29 @@ fn playback_thread(
         while sent < FRAME && !stop.load(Ordering::Relaxed) {
             let wrote = unsafe {
                 alsa::snd_pcm_writei(
-                    pcm.pcm,
+                    handle,
                     buf[sent * channels..].as_ptr().cast(),
                     (FRAME - sent) as std::ffi::c_ulong,
                 )
             };
             if wrote <= 0 {
-                if !alsa::again(wrote) {
-                    unsafe { alsa::snd_pcm_recover(pcm.pcm, wrote as i32, 1) };
+                if !alsa::again(wrote)
+                    && unsafe { alsa::snd_pcm_recover(handle, wrote as i32, 1) } < 0
+                {
+                    if let Some(old) = pcm.take() {
+                        unsafe { alsa::snd_pcm_close(old.pcm) };
+                    }
                 }
                 thread::sleep(Duration::from_millis(2));
-                continue;
+                break;
             }
             let wrote = (wrote as usize).min(FRAME - sent);
             sent += wrote;
         }
     }
-    unsafe { alsa::snd_pcm_close(pcm.pcm) };
+    if let Some(old) = pcm {
+        unsafe { alsa::snd_pcm_close(old.pcm) };
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -681,8 +969,9 @@ mod alsa {
         pub channels: u32,
     }
 
-    pub fn open(capture: bool) -> Option<Pcm> {
-        let name = CString::new("default").ok()?;
+    pub fn open(capture: bool, device: &str) -> Option<Pcm> {
+        let label = if device.is_empty() { "default" } else { device };
+        let name = CString::new(label).ok()?;
         let mut pcm = std::ptr::null_mut();
         let stream = if capture { 1 } else { 0 };
         if unsafe { snd_pcm_open(&mut pcm, name.as_ptr(), stream, 0) } < 0 || pcm.is_null() {
@@ -747,77 +1036,171 @@ fn capture_thread(
     stop: Arc<AtomicBool>,
     mut producer: Producer<f32>,
     ready: std::sync::mpsc::SyncSender<(bool, u32)>,
+    name: Arc<Mutex<String>>,
+    reset: Arc<AtomicBool>,
 ) {
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-    let Some(device) = cpal::default_host().default_input_device() else {
-        let _ = ready.send((false, RATE));
-        return;
-    };
-    let Ok(supported) = device.default_input_config() else {
-        let _ = ready.send((false, RATE));
-        return;
-    };
-    let chosen = prefer_f32(&device, supported, true);
-    let channels = chosen.channels() as usize;
-    let rate = chosen.sample_rate();
-    let config = stream_config(&chosen);
-    let Ok(stream) = device.build_input_stream_raw(
-        config,
-        chosen.sample_format(),
-        move |data, _| push_captured(&mut producer, data, channels),
-        |_| {},
-        None,
-    ) else {
-        let _ = ready.send((false, RATE));
-        return;
-    };
-    if stream.play().is_err() {
-        let _ = ready.send((false, RATE));
-        return;
-    }
-    let _ = ready.send((true, rate));
+    let mut announced = false;
     while !stop.load(Ordering::Relaxed) {
-        thread::sleep(Duration::from_millis(20));
+        let broken = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(8);
+        let chosen = name.lock().unwrap().clone();
+        let built = build_input(&chosen, tx, broken.clone());
+        if !announced {
+            let report = match &built {
+                Some((_, rate)) => (true, *rate),
+                None => (false, RATE),
+            };
+            let _ = ready.send(report);
+            announced = true;
+        }
+        let Some((stream, _)) = built else {
+            thread::sleep(Duration::from_millis(400));
+            continue;
+        };
+        while !stop.load(Ordering::Relaxed)
+            && !broken.load(Ordering::Relaxed)
+            && !reset.swap(false, Ordering::Relaxed)
+        {
+            while let Ok(samples) = rx.try_recv() {
+                for sample in samples {
+                    if producer.push(sample).is_err() {
+                        break;
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(stream);
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
     }
 }
 
 #[cfg(not(target_os = "linux"))]
 fn playback_thread(
     stop: Arc<AtomicBool>,
-    mut consumer: Consumer<f32>,
+    consumer: Consumer<f32>,
     ready: std::sync::mpsc::SyncSender<(bool, u32)>,
+    name: Arc<Mutex<String>>,
+    reset: Arc<AtomicBool>,
 ) {
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-    let Some(device) = cpal::default_host().default_output_device() else {
-        let _ = ready.send((false, RATE));
-        return;
-    };
-    let Ok(supported) = device.default_output_config() else {
-        let _ = ready.send((false, RATE));
-        return;
-    };
+    let shared = Arc::new(Mutex::new(consumer));
+    let mut announced = false;
+    while !stop.load(Ordering::Relaxed) {
+        let broken = Arc::new(AtomicBool::new(false));
+        let chosen = name.lock().unwrap().clone();
+        let built = build_output(&chosen, shared.clone(), broken.clone());
+        if !announced {
+            let report = match &built {
+                Some((_, rate)) => (true, *rate),
+                None => (false, RATE),
+            };
+            let _ = ready.send(report);
+            announced = true;
+        }
+        let Some((stream, _)) = built else {
+            thread::sleep(Duration::from_millis(400));
+            continue;
+        };
+        while !stop.load(Ordering::Relaxed)
+            && !broken.load(Ordering::Relaxed)
+            && !reset.swap(false, Ordering::Relaxed)
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
+        drop(stream);
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn build_input(
+    name: &str,
+    tx: std::sync::mpsc::SyncSender<Vec<f32>>,
+    broken: Arc<AtomicBool>,
+) -> Option<(cpal::Stream, u32)> {
+    use cpal::traits::{DeviceTrait, StreamTrait};
+    let device = pick_device(name, true)?;
+    let supported = device.default_input_config().ok()?;
+    let chosen = prefer_f32(&device, supported, true);
+    let channels = chosen.channels() as usize;
+    let rate = chosen.sample_rate();
+    let stream = device
+        .build_input_stream_raw(
+            stream_config(&chosen),
+            chosen.sample_format(),
+            move |data, _| {
+                let mut mono = Vec::new();
+                push_captured_vec(&mut mono, data, channels);
+                let _ = tx.try_send(mono);
+            },
+            move |_| broken.store(true, Ordering::Relaxed),
+            None,
+        )
+        .ok()?;
+    stream.play().ok()?;
+    Some((stream, rate))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn build_output(
+    name: &str,
+    shared: Arc<Mutex<Consumer<f32>>>,
+    broken: Arc<AtomicBool>,
+) -> Option<(cpal::Stream, u32)> {
+    use cpal::traits::{DeviceTrait, StreamTrait};
+    let device = pick_device(name, false)?;
+    let supported = device.default_output_config().ok()?;
     let chosen = prefer_f32(&device, supported, false);
     let channels = chosen.channels() as usize;
     let rate = chosen.sample_rate();
-    let config = stream_config(&chosen);
-    let Ok(stream) = device.build_output_stream_raw(
-        config,
-        chosen.sample_format(),
-        move |data, _| fill_captured(data, channels, &mut consumer),
-        |_| {},
-        None,
-    ) else {
-        let _ = ready.send((false, RATE));
-        return;
+    let stream = device
+        .build_output_stream_raw(
+            stream_config(&chosen),
+            chosen.sample_format(),
+            move |data, _| {
+                if let Ok(mut consumer) = shared.lock() {
+                    fill_captured(data, channels, &mut consumer);
+                }
+            },
+            move |_| broken.store(true, Ordering::Relaxed),
+            None,
+        )
+        .ok()?;
+    stream.play().ok()?;
+    Some((stream, rate))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pick_device(name: &str, input: bool) -> Option<cpal::Device> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let host = cpal::default_host();
+    if name.is_empty() || name == "default" {
+        return if input {
+            host.default_input_device()
+        } else {
+            host.default_output_device()
+        };
+    }
+    let devices = if input {
+        host.input_devices().ok()?
+    } else {
+        host.output_devices().ok()?
     };
-    if stream.play().is_err() {
-        let _ = ready.send((false, RATE));
-        return;
-    }
-    let _ = ready.send((true, rate));
-    while !stop.load(Ordering::Relaxed) {
-        thread::sleep(Duration::from_millis(20));
-    }
+    devices
+        .find(|device| device.name().ok().as_deref() == Some(name))
+        .or_else(|| {
+            if input {
+                host.default_input_device()
+            } else {
+                host.default_output_device()
+            }
+        })
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -869,6 +1252,15 @@ fn choose_f32(
         })
         .map(|range| range.with_sample_rate(rate))
         .unwrap_or(fallback)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn push_captured_vec(into: &mut Vec<f32>, data: &cpal::Data, channels: usize) {
+    let (mut producer, mut consumer) = RingBuffer::<f32>::new(data.len().max(64) * 2);
+    push_captured(&mut producer, data, channels);
+    while let Ok(sample) = consumer.pop() {
+        into.push(sample);
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1086,8 +1478,93 @@ fn push_i16(producer: &mut Producer<f32>, samples: &[i16], channels: usize) {
     }
 }
 
-/// V, wherever the card is. A desktop we cannot read does not mute an open mic
-/// that the switch has put into push-to-talk.
+static TALK: AtomicU8 = AtomicU8::new(b'V');
+static WINDOW_KEY: AtomicBool = AtomicBool::new(false);
+
+/// The talk key is one letter. Windows can see it in other applications.
+/// macOS and a focused Linux window see it while Ryme is the focused app.
+/// Linux also reads the keyboard device when the session allows it. A desktop
+/// that reports nothing stays closed, so push-to-talk does not become open mic.
+pub fn set_talk_key(letter: char) {
+    let letter = letter.to_ascii_uppercase();
+    if letter.is_ascii_uppercase() {
+        TALK.store(letter as u8, Ordering::Relaxed);
+    }
+}
+
+pub fn talk_key() -> char {
+    TALK.load(Ordering::Relaxed) as char
+}
+
+pub fn key_is_down() -> bool {
+    WINDOW_KEY.load(Ordering::Relaxed) || key_held()
+}
+
+/// Names the settings card can offer. `default` is always first. On Linux the
+/// rest are the cards ALSA already knows. Elsewhere they are the host devices.
+pub fn input_names() -> Vec<String> {
+    device_names(true)
+}
+
+pub fn output_names() -> Vec<String> {
+    device_names(false)
+}
+
+fn device_names(input: bool) -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = input;
+        return linux_device_names();
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        cpal_device_names(input)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_device_names() -> Vec<String> {
+    let mut names = vec!["default".to_string()];
+    let Ok(text) = std::fs::read_to_string("/proc/asound/cards") else {
+        return names;
+    };
+    for line in text.lines() {
+        let Some(id) = line.trim().split_whitespace().next() else {
+            continue;
+        };
+        if id.chars().all(|ch| ch.is_ascii_digit()) {
+            let name = format!("plughw:{id}");
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cpal_device_names(input: bool) -> Vec<String> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let mut names = vec!["default".to_string()];
+    let host = cpal::default_host();
+    let devices = if input {
+        host.input_devices()
+    } else {
+        host.output_devices()
+    };
+    let Ok(devices) = devices else {
+        return names;
+    };
+    for device in devices {
+        if let Ok(name) = device.name() {
+            if !name.is_empty() && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
 fn key_held() -> bool {
     #[cfg(windows)]
     {
@@ -1113,8 +1590,8 @@ fn win_key_held() -> bool {
     extern "system" {
         fn GetAsyncKeyState(key: i32) -> i16;
     }
-    // VK_V. The high bit is set while it is down.
-    unsafe { GetAsyncKeyState(0x56) < 0 }
+    // The high bit is set while the letter is down. VK_A is 0x41.
+    unsafe { GetAsyncKeyState(talk_key() as i32) < 0 }
 }
 
 #[cfg(target_os = "macos")]
@@ -1123,8 +1600,7 @@ fn mac_key_held() -> bool {
     extern "C" {
         fn CGEventSourceKeyState(state: i32, key: u16) -> bool;
     }
-    // HID system state, kVK_ANSI_V.
-    unsafe { CGEventSourceKeyState(1, 0x09) }
+    unsafe { CGEventSourceKeyState(1, mac_hid(talk_key())) }
 }
 
 #[cfg(target_os = "linux")]
@@ -1146,6 +1622,7 @@ fn evdev_key_held() -> bool {
 struct Evdev {
     files: Vec<std::fs::File>,
     held: i32,
+    code: u16,
 }
 
 #[cfg(target_os = "linux")]
@@ -1165,11 +1642,20 @@ impl Evdev {
             };
             files.push(file);
         }
-        Self { files, held: 0 }
+        Self {
+            files,
+            held: 0,
+            code: evdev_code(talk_key()),
+        }
     }
 
     fn down(&mut self) -> bool {
         use std::io::Read;
+        let code_now = evdev_code(talk_key());
+        if code_now != self.code {
+            self.code = code_now;
+            self.held = 0;
+        }
         let mut dead = Vec::new();
         for (index, file) in self.files.iter_mut().enumerate() {
             let mut buf = [0u8; 24];
@@ -1179,8 +1665,8 @@ impl Evdev {
                         let kind = u16::from_ne_bytes([buf[16], buf[17]]);
                         let code = u16::from_ne_bytes([buf[18], buf[19]]);
                         let value = i32::from_ne_bytes([buf[20], buf[21], buf[22], buf[23]]);
-                        // EV_KEY, KEY_V. Repeat (2) does not change the hold.
-                        if kind == 1 && code == 47 {
+                        // EV_KEY. Repeat (2) does not change the hold.
+                        if kind == 1 && code == self.code {
                             if value == 1 {
                                 self.held = self.held.saturating_add(1);
                             } else if value == 0 {
@@ -1236,6 +1722,10 @@ fn linux_key_held() -> Option<bool> {
 #[cfg(target_os = "linux")]
 struct XKeys {
     conn: x11rb::rust_connection::RustConnection,
+    first: u8,
+    per: usize,
+    keysyms: Vec<u32>,
+    letter: char,
     codes: Vec<u8>,
     at: std::time::Instant,
     down: bool,
@@ -1262,18 +1752,18 @@ impl XKeys {
         if per == 0 {
             return None;
         }
-        let mut codes = Vec::new();
-        for (index, group) in reply.keysyms.chunks(per).enumerate() {
-            // XK_v and XK_V.
-            if group.iter().any(|sym| *sym == 0x76 || *sym == 0x56) {
-                codes.push(first.saturating_add(index as u8));
-            }
-        }
+        let keysyms = reply.keysyms;
+        let letter = talk_key();
+        let codes = codes_for(first, per, &keysyms, letter);
         if codes.is_empty() {
             return None;
         }
         Some(Self {
             conn,
+            first,
+            per,
+            keysyms,
+            letter,
             codes,
             at: std::time::Instant::now() - Duration::from_secs(1),
             down: false,
@@ -1282,6 +1772,12 @@ impl XKeys {
 
     fn down(&mut self) -> Option<bool> {
         use x11rb::protocol::xproto::ConnectionExt;
+        let letter = talk_key();
+        if letter != self.letter {
+            self.letter = letter;
+            self.codes = codes_for(self.first, self.per, &self.keysyms, letter);
+            self.down = false;
+        }
         if self.at.elapsed() < Duration::from_millis(20) {
             return Some(self.down);
         }
@@ -1299,9 +1795,84 @@ impl XKeys {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn codes_for(first: u8, per: usize, keysyms: &[u32], letter: char) -> Vec<u8> {
+    if per == 0 {
+        return Vec::new();
+    }
+    let lower = letter.to_ascii_lowercase() as u32;
+    let upper = letter.to_ascii_uppercase() as u32;
+    let mut codes = Vec::new();
+    for (index, group) in keysyms.chunks(per).enumerate() {
+        if group.iter().any(|sym| *sym == lower || *sym == upper) {
+            codes.push(first.saturating_add(index as u8));
+        }
+    }
+    codes
+}
+
+fn evdev_code(letter: char) -> u16 {
+    // Linux evdev KEY_A through KEY_Z. V is 47.
+    const KEYS: [u16; 26] = [
+        30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20, 22, 47, 17,
+        45, 21, 44,
+    ];
+    let index = (letter.to_ascii_uppercase() as u8).saturating_sub(b'A') as usize;
+    KEYS.get(index).copied().unwrap_or(47)
+}
+
+fn mac_hid(letter: char) -> u16 {
+    match letter.to_ascii_uppercase() {
+        'A' => 0x00,
+        'S' => 0x01,
+        'D' => 0x02,
+        'F' => 0x03,
+        'H' => 0x04,
+        'G' => 0x05,
+        'Z' => 0x06,
+        'X' => 0x07,
+        'C' => 0x08,
+        'V' => 0x09,
+        'B' => 0x0B,
+        'Q' => 0x0C,
+        'W' => 0x0D,
+        'E' => 0x0E,
+        'R' => 0x0F,
+        'Y' => 0x10,
+        'T' => 0x11,
+        'O' => 0x1F,
+        'U' => 0x20,
+        'I' => 0x22,
+        'P' => 0x23,
+        'L' => 0x25,
+        'J' => 0x26,
+        'K' => 0x28,
+        'N' => 0x2D,
+        'M' => 0x2E,
+        _ => 0x09,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_talk_key_maps_v_and_offers_a_default_device() {
+        assert_eq!(evdev_code('V'), 47);
+        assert_eq!(evdev_code('a'), 30);
+        assert_eq!(mac_hid('V'), 0x09);
+        assert_eq!(input_names().first().map(String::as_str), Some("default"));
+    }
+
+    #[test]
+    fn a_muted_or_unkeyed_mic_sends_nothing() {
+        assert!(!may_send(false, false, true), "not in the room yet");
+        assert!(!may_send(false, true, false), "startup before the room");
+        assert!(!may_send(true, true, true), "muted");
+        assert!(!may_send(true, false, false), "push-to-talk is up");
+        assert!(may_send(true, false, true));
+    }
 
     #[test]
     fn soften_pulls_room_noise_down_and_leaves_a_voice() {
@@ -1403,8 +1974,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn the_default_sound_device_can_be_opened() {
-        let mic = super::alsa::open(true);
-        let speakers = super::alsa::open(false);
+        // A runner without a sound card is not a failed client. Set RYME_SOUND=1
+        // on a machine that has one.
+        if std::env::var("RYME_SOUND").is_err() {
+            return;
+        }
+        let mic = super::alsa::open(true, "default");
+        let speakers = super::alsa::open(false, "default");
         let mic_ok = mic.is_some();
         let speakers_ok = speakers.is_some();
         if let Some(pcm) = mic {

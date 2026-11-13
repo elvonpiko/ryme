@@ -21,7 +21,11 @@ mod x11_frame;
 mod win_frame;
 
 fn main() -> Result<(), slint::PlatformError> {
-    if !single::primary() {
+    if let Some(url) = std::env::args().find(|arg| arg.starts_with("ryme://")) {
+        local::stage_invite(&url);
+    }
+    let handoff = std::env::args().any(|arg| arg == "--handoff");
+    if !single::claim(handoff) {
         return Ok(());
     }
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -89,5 +93,22 @@ fn keep_in_tray(ui: &MainWindow, shutdown: live::Shutdown) -> Result<(), slint::
         let _ = slint::quit_event_loop();
     });
     tray.show()?;
+    let tray_weak = tray.as_weak();
+    let ui_weak = ui.as_weak();
+    let timer = slint::Timer::default();
+    timer.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_millis(400),
+        move || {
+            let Some(ui) = ui_weak.upgrade() else {
+                return;
+            };
+            let Some(tray) = tray_weak.upgrade() else {
+                return;
+            };
+            tray.set_mic_status(ui.get_mic_line());
+        },
+    );
+    std::mem::forget(timer);
     ui.run()
 }

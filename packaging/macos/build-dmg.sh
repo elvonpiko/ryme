@@ -38,6 +38,10 @@ do
   sips -z "$size" "$size" "$icon" --out "$iset/$name" >/dev/null
 done
 iconutil -c icns "$iset" -o "$app/Contents/Resources/ryme.icns"
+if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+  codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$app"
+  codesign --verify --strict --verbose=2 "$app"
+fi
 ln -s /Applications "$stage/Applications"
 
 hdiutil create \

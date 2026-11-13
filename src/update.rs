@@ -15,10 +15,12 @@ const CURRENT: &str = env!("CARGO_PKG_VERSION");
 const LATEST: &str = "https://api.github.com/repos/elvonpiko/ryme/releases/latest";
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 enum Kind {
     WindowsSetup,
     Replace,
     Deb,
+    Disk,
 }
 
 struct Ready {
@@ -60,10 +62,9 @@ pub fn check() -> Found {
     if !allowed(&url) {
         return Found::Failed("Could not check for an update.".into());
     }
-    let dir = std::env::temp_dir().join("ryme-update");
-    if fs::create_dir_all(&dir).is_err() {
+    let Some(dir) = crate::local::update_dir() else {
         return Found::Failed("Could not save the update.".into());
-    }
+    };
     let path = dir.join(name);
     if download(&url, &path).is_err() {
         return Found::Failed("Could not download the update.".into());
@@ -79,6 +80,26 @@ pub fn check() -> Found {
     let Ok(sums) = fs::read_to_string(&sums_path) else {
         return Found::Failed("Could not check the update.".into());
     };
+    let sig_url = format!(
+        "https://github.com/elvonpiko/ryme/releases/download/{}/SHA256SUMS.sig",
+        release.tag
+    );
+    let sig_path = dir.join("SHA256SUMS.sig");
+    if download(&sig_url, &sig_path).is_err() {
+        let _ = fs::remove_file(&path);
+        return Found::Failed("The update was not signed.".into());
+    }
+    let Ok(sig_text) = fs::read_to_string(&sig_path) else {
+        return Found::Failed("The update was not signed.".into());
+    };
+    let Some(signature) = decode_hex(sig_text.trim()) else {
+        let _ = fs::remove_file(&path);
+        return Found::Failed("The update was not signed.".into());
+    };
+    if !ryme_server::verify_sums(sums.as_bytes(), &signature) {
+        let _ = fs::remove_file(&path);
+        return Found::Failed("The update was not signed.".into());
+    }
     let Some(want) = sum_for(&sums, name) else {
         let _ = fs::remove_file(&path);
         return Found::Failed("Could not check the update.".into());
@@ -185,6 +206,7 @@ fn install(ready: &Ready) -> Result<(), String> {
         Kind::WindowsSetup => install_setup(&ready.path),
         Kind::Replace => install_replace(&ready.path),
         Kind::Deb => install_deb(&ready.path),
+        Kind::Disk => install_disk(&ready.path),
     }
 }
 
@@ -193,6 +215,7 @@ fn install_setup(path: &Path) -> Result<(), String> {
     {
         use std::os::windows::process::CommandExt;
         const DETACHED: u32 = 0x0000_0008 | 0x0000_0200 | 0x0100_0000;
+        crate::single::release();
         std::process::Command::new(path)
             .args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"])
             .creation_flags(DETACHED)
@@ -209,6 +232,11 @@ fn install_setup(path: &Path) -> Result<(), String> {
 
 fn install_replace(new_file: &Path) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|_| "could not find Ryme".to_string())?;
+    if app_bundle(&exe).is_some() {
+        return Err("This Mac build has to be updated from the disk image.".into());
+    }
+    let backup = exe.with_extension("previous");
+    fs::copy(&exe, &backup).map_err(|_| "could not save the update".to_string())?;
     let staged = exe.with_extension("new");
     fs::copy(new_file, &staged).map_err(|_| "could not save the update".to_string())?;
     #[cfg(unix)]
@@ -217,11 +245,91 @@ fn install_replace(new_file: &Path) -> Result<(), String> {
         fs::set_permissions(&staged, fs::Permissions::from_mode(0o755))
             .map_err(|_| "could not save the update".to_string())?;
     }
-    fs::rename(&staged, &exe).map_err(|_| "could not replace Ryme".to_string())?;
-    std::process::Command::new(&exe)
+    if fs::rename(&staged, &exe).is_err() {
+        let _ = fs::copy(&backup, &exe);
+        return Err("could not replace Ryme".into());
+    }
+    crate::single::release();
+    if std::process::Command::new(&exe)
+        .arg("--handoff")
         .spawn()
-        .map_err(|_| "could not restart Ryme".to_string())?;
+        .is_err()
+    {
+        let _ = fs::copy(&backup, &exe);
+        return Err("could not restart Ryme".into());
+    }
     Ok(())
+}
+
+fn install_disk(dmg: &Path) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|_| "could not find Ryme".to_string())?;
+    let Some(app) = app_bundle(&exe) else {
+        return Err("Open the Ryme disk image and drag it to Applications.".into());
+    };
+    let mount = crate::local::update_dir()
+        .ok_or_else(|| "could not save the update".to_string())?
+        .join("mount");
+    let _ = fs::remove_dir_all(&mount);
+    fs::create_dir_all(&mount).map_err(|_| "could not save the update".to_string())?;
+    let attached = std::process::Command::new("hdiutil")
+        .args(["attach", "-nobrowse", "-readonly", "-mountpoint"])
+        .arg(&mount)
+        .arg(dmg)
+        .status()
+        .map_err(|_| "could not open the update".to_string())?;
+    if !attached.success() {
+        return Err("could not open the update".into());
+    }
+    let incoming = mount.join("Ryme.app");
+    let parent = app
+        .parent()
+        .ok_or_else(|| "could not replace Ryme".to_string())?;
+    let staged = parent.join("Ryme.app.next");
+    let backup = parent.join("Ryme.app.previous");
+    let _ = fs::remove_dir_all(&staged);
+    let copied = std::process::Command::new("ditto")
+        .arg(&incoming)
+        .arg(&staged)
+        .status();
+    let _ = std::process::Command::new("hdiutil")
+        .args(["detach", "-force"])
+        .arg(&mount)
+        .status();
+    if !matches!(copied, Ok(status) if status.success()) {
+        let _ = fs::remove_dir_all(&staged);
+        return Err("could not save the update".into());
+    }
+    let _ = fs::remove_dir_all(&backup);
+    if fs::rename(&app, &backup).is_err() {
+        let _ = fs::remove_dir_all(&staged);
+        return Err("could not replace Ryme".into());
+    }
+    if fs::rename(&staged, &app).is_err() {
+        let _ = fs::rename(&backup, &app);
+        return Err("could not replace Ryme".into());
+    }
+    crate::single::release();
+    if std::process::Command::new("open")
+        .arg(&app)
+        .args(["--args", "--handoff"])
+        .spawn()
+        .is_err()
+    {
+        let _ = fs::remove_dir_all(&app);
+        let _ = fs::rename(&backup, &app);
+        return Err("could not restart Ryme".into());
+    }
+    Ok(())
+}
+
+fn app_bundle(exe: &Path) -> Option<PathBuf> {
+    let mut cur = exe.parent()?;
+    loop {
+        if cur.extension().and_then(|ext| ext.to_str()) == Some("app") {
+            return Some(cur.to_path_buf());
+        }
+        cur = cur.parent()?;
+    }
 }
 
 fn install_deb(path: &Path) -> Result<(), String> {
@@ -234,7 +342,9 @@ fn install_deb(path: &Path) -> Result<(), String> {
         return Err("The update was not installed.".into());
     }
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ryme"));
+    crate::single::release();
     std::process::Command::new(exe)
+        .arg("--handoff")
         .spawn()
         .map_err(|_| "Ryme was updated. Open it again.".to_string())?;
     Ok(())
@@ -251,9 +361,9 @@ fn asset() -> Option<(&'static str, Kind)> {
         return Some(("ryme-amd64.deb", Kind::Deb));
     }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    return Some(("ryme-aarch64-apple-darwin", Kind::Replace));
+    return Some(("Ryme-mac-arm64.dmg", Kind::Disk));
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    return Some(("ryme-x86_64-apple-darwin", Kind::Replace));
+    return Some(("Ryme-mac-intel.dmg", Kind::Disk));
     #[cfg(not(any(
         all(windows, target_arch = "x86_64"),
         all(target_os = "linux", target_arch = "x86_64"),
@@ -309,6 +419,31 @@ fn sha256_file(path: &Path) -> io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn decode_hex(text: &str) -> Option<Vec<u8>> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 128 || bytes.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(64);
+    let mut index = 0;
+    while index < bytes.len() {
+        let hi = nibble(bytes[index])?;
+        let lo = nibble(bytes[index + 1])?;
+        out.push((hi << 4) | lo);
+        index += 2;
+    }
+    Some(out)
+}
+
+fn nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn sum_for<'a>(sums: &'a str, name: &str) -> Option<&'a str> {
     for line in sums.lines() {
         let mut parts = line.split_whitespace();
@@ -350,7 +485,8 @@ impl Ready {
 
 #[cfg(test)]
 mod tests {
-    use super::{allowed, is_newer, sum_for};
+    use super::{allowed, app_bundle, decode_hex, is_newer, sum_for};
+    use std::path::Path;
 
     #[test]
     fn a_newer_tag_is_newer() {
@@ -365,6 +501,23 @@ mod tests {
         let sums = "abc  ryme-amd64.deb\ndef  Ryme-Setup-x64.exe\n";
         assert_eq!(sum_for(sums, "Ryme-Setup-x64.exe"), Some("def"));
         assert_eq!(sum_for(sums, "missing"), None);
+    }
+
+    #[test]
+    fn a_signature_is_64_bytes_of_hex() {
+        assert!(decode_hex(&"ab".repeat(64)).unwrap().len() == 64);
+        assert!(decode_hex("abcd").is_none());
+        assert!(decode_hex(&"zz".repeat(64)).is_none());
+    }
+
+    #[test]
+    fn an_executable_inside_the_bundle_is_not_the_bundle() {
+        let exe = Path::new("/Applications/Ryme.app/Contents/MacOS/Ryme");
+        assert_eq!(
+            app_bundle(exe).as_deref(),
+            Some(Path::new("/Applications/Ryme.app"))
+        );
+        assert!(app_bundle(Path::new("/usr/bin/ryme")).is_none());
     }
 
     #[test]

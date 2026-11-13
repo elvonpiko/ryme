@@ -44,6 +44,9 @@ Name: "{commondesktop}\Ryme"; Filename: "{app}\ryme.exe"; Tasks: desktopicon
 
 [Registry]
 Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{code:SystemPath}"; Tasks: addpath
+Root: HKLM; Subkey: "Software\Classes\ryme"; ValueType: string; ValueName: ""; ValueData: "URL:Ryme invite"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "Software\Classes\ryme"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""
+Root: HKLM; Subkey: "Software\Classes\ryme\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\ryme.exe"" ""%1"""
 
 [Run]
 Filename: "{tmp}\vc_redist.x64.exe"; Parameters: "/install /quiet /norestart"; StatusMsg: "Installing the Microsoft Visual C++ runtime..."; Flags: waituntilterminated; Check: not VCRedistInstalled

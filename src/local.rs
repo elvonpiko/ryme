@@ -9,6 +9,11 @@ pub struct Saved {
     pub channel: String,
     pub resume: bool,
     pub denoise: bool,
+    pub muted: bool,
+    pub deaf: bool,
+    pub ptt: bool,
+    /// Secret from the last Welcome. A later hello uses it to replace that session.
+    pub ticket: [u8; 32],
 }
 
 #[derive(Clone, Copy)]
@@ -18,7 +23,10 @@ pub struct Level {
 }
 
 pub fn load() -> Option<Saved> {
-    let text = fs::read_to_string(path()?).ok()?;
+    parse(&fs::read_to_string(path()?).ok()?)
+}
+
+fn parse(text: &str) -> Option<Saved> {
     let mut lines = text.lines();
     if lines.next()? != "v1" {
         return None;
@@ -28,6 +36,10 @@ pub fn load() -> Option<Saved> {
     let channel = lines.next().unwrap_or("Lobby").to_string();
     let resume = lines.next()? == "1";
     let denoise = lines.next().map(|line| line != "0").unwrap_or(true);
+    let muted = lines.next().map(|line| line == "1").unwrap_or(false);
+    let deaf = lines.next().map(|line| line == "1").unwrap_or(false);
+    let ptt = lines.next().map(|line| line == "1").unwrap_or(false);
+    let ticket = lines.next().and_then(decode_hex).unwrap_or([0; 32]);
     if name.is_empty() || invite.is_empty() || name.contains('\n') || invite.contains('\n') {
         return None;
     }
@@ -37,6 +49,10 @@ pub fn load() -> Option<Saved> {
         channel,
         resume,
         denoise,
+        muted,
+        deaf,
+        ptt,
+        ticket,
     })
 }
 
@@ -53,18 +69,33 @@ pub fn store(saved: &Saved) {
         }
     }
     let body = format!(
-        "v1\n{}\n{}\n{}\n{}\n{}\n",
+        "v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
         saved.name,
         saved.invite,
         saved.channel,
         if saved.resume { "1" } else { "0" },
-        if saved.denoise { "1" } else { "0" }
+        if saved.denoise { "1" } else { "0" },
+        if saved.muted { "1" } else { "0" },
+        if saved.deaf { "1" } else { "0" },
+        if saved.ptt { "1" } else { "0" },
+        hex_encode(&saved.ticket)
     );
     let _ = write_private(&path, body.as_bytes());
 }
 
 fn path() -> Option<PathBuf> {
     Some(dir()?.join("session"))
+}
+
+pub(crate) fn update_dir() -> Option<PathBuf> {
+    let dir = dir()?.join("update");
+    fs::create_dir_all(&dir).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+    }
+    Some(dir)
 }
 
 /// This install's stable id. Other people store a volume against it.
@@ -197,6 +228,29 @@ pub fn store_levels(server: &[u8; 32], levels: &HashMap<u64, Level>) {
     let _ = write_private(&path, body.as_bytes());
 }
 
+fn decode_hex(text: &str) -> Option<[u8; 32]> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for index in 0..32 {
+        let hi = nibble(bytes[index * 2])?;
+        let lo = nibble(bytes[index * 2 + 1])?;
+        out[index] = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+fn nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -252,6 +306,129 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.sync_all()?;
     fs::rename(tmp, path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse;
+
+    #[test]
+    fn an_older_session_stays_quiet_about_the_microphone() {
+        let saved = parse("v1\nMara\nryme://127.0.0.1:1542/#ab\nLobby\n1\n1\n").unwrap();
+        assert!(!saved.muted);
+        assert!(!saved.deaf);
+        assert!(!saved.ptt);
+        assert!(saved.denoise);
+    }
+
+    #[test]
+    fn microphone_switches_roundtrip() {
+        let saved = parse("v1\nMara\nryme://h:1/#ab\nRanked\n1\n0\n1\n0\n1\n").unwrap();
+        assert!(saved.muted);
+        assert!(!saved.deaf);
+        assert!(saved.ptt);
+        assert!(!saved.denoise);
+        assert_eq!(saved.channel, "Ranked");
+    }
+}
+
+pub struct AudioPref {
+    pub input: String,
+    pub output: String,
+    pub key: char,
+}
+
+pub fn load_audio() -> AudioPref {
+    let text = dir()
+        .and_then(|dir| fs::read_to_string(dir.join("audio")).ok())
+        .unwrap_or_default();
+    let mut lines = text.lines();
+    let input = device_name(lines.next().unwrap_or("default"));
+    let output = device_name(lines.next().unwrap_or("default"));
+    let key = lines
+        .next()
+        .and_then(|line| line.chars().next())
+        .filter(|ch| ch.is_ascii_alphabetic())
+        .map(|ch| ch.to_ascii_uppercase())
+        .unwrap_or('V');
+    AudioPref { input, output, key }
+}
+
+pub fn store_audio(pref: &AudioPref) {
+    let Some(path) = dir().map(|dir| dir.join("audio")) else {
+        return;
+    };
+    let key = if pref.key.is_ascii_alphabetic() {
+        pref.key.to_ascii_uppercase()
+    } else {
+        'V'
+    };
+    let body = format!(
+        "{}\n{}\n{key}\n",
+        device_name(&pref.input),
+        device_name(&pref.output)
+    );
+    let _ = write_private(&path, body.as_bytes());
+}
+
+fn device_name(name: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() || name.contains(['\n', '\r']) {
+        "default".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+/// Invites this person has joined, newest first. A click fills the field.
+pub fn load_servers() -> Vec<String> {
+    let Some(path) = dir().map(|dir| dir.join("servers")) else {
+        return Vec::new();
+    };
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("ryme://") && !line.contains(char::is_whitespace))
+        .take(8)
+        .map(str::to_string)
+        .collect()
+}
+
+pub fn remember_server(invite: &str) {
+    let invite = invite.trim();
+    if !invite.starts_with("ryme://") || invite.contains(char::is_whitespace) {
+        return;
+    }
+    let mut list = load_servers();
+    list.retain(|item| item != invite);
+    list.insert(0, invite.to_string());
+    list.truncate(8);
+    let Some(path) = dir().map(|dir| dir.join("servers")) else {
+        return;
+    };
+    let _ = write_private(&path, list.join("\n").as_bytes());
+}
+
+/// A second launch, or a ryme:// open, leaves the link here for the running card.
+pub fn stage_invite(invite: &str) {
+    let invite = invite.trim();
+    if !invite.starts_with("ryme://") || invite.contains(char::is_whitespace) {
+        return;
+    }
+    let Some(path) = dir().map(|dir| dir.join("open-invite")) else {
+        return;
+    };
+    let _ = write_private(&path, invite.as_bytes());
+}
+
+pub fn take_staged_invite() -> Option<String> {
+    let path = dir()?.join("open-invite");
+    let text = fs::read_to_string(&path).ok()?;
+    let _ = fs::remove_file(path);
+    let text = text.trim().to_string();
+    text.starts_with("ryme://").then_some(text)
 }
 
 fn temp_path(path: &Path) -> PathBuf {

@@ -10,6 +10,11 @@ use ksni::blocking::TrayMethods;
 use ksni::menu::StandardItem;
 
 static STOP: Mutex<Option<crate::live::Shutdown>> = Mutex::new(None);
+static STATUS: Mutex<String> = Mutex::new(String::new());
+
+pub fn set_status(text: &str) {
+    *STATUS.lock().unwrap() = text.to_string();
+}
 
 struct LinuxTray;
 
@@ -31,8 +36,10 @@ impl ksni::Tray for LinuxTray {
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {
+        let description = STATUS.lock().unwrap().clone();
         ksni::ToolTip {
             title: "Ryme".into(),
+            description,
             ..Default::default()
         }
     }

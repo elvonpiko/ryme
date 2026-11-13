@@ -25,23 +25,59 @@ pub fn show_now() {
         if let Some(ui) = weak.upgrade() {
             ui.window().set_minimized(false);
             let _ = ui.window().show();
+            if let Some(url) = crate::local::take_staged_invite() {
+                if ui.get_inside() {
+                    ui.set_toast("Already in a room.".into());
+                    ui.set_toast_danger(false);
+                } else {
+                    ui.set_invite(url.into());
+                }
+            }
         }
     });
 }
 
-/// True when this process owns the session. False when another Ryme is already
-/// running and has been asked to show its card.
-pub fn primary() -> bool {
+/// Own the session. A handoff retries briefly and does not raise the process
+/// that is leaving, so the replacement is not told to exit.
+pub fn claim(handoff: bool) -> bool {
+    let tries = if handoff { 40 } else { 1 };
+    for _ in 0..tries {
+        if own(handoff) {
+            return true;
+        }
+        if !handoff {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
+}
+
+/// Drop the single-instance lock before starting the replacement process.
+pub fn release() {
     #[cfg(windows)]
-    {
-        return win_primary();
+    if let Some(handle) = LOCK.lock().unwrap().take() {
+        unsafe { CloseHandle(handle as *mut std::ffi::c_void) };
     }
     #[cfg(unix)]
     {
-        return unix_primary();
+        *LISTENER.lock().unwrap() = None;
+        *SOCKET.lock().unwrap() = None;
+    }
+}
+
+fn own(handoff: bool) -> bool {
+    #[cfg(windows)]
+    {
+        return win_primary(handoff);
+    }
+    #[cfg(unix)]
+    {
+        return unix_primary(handoff);
     }
     #[cfg(not(any(windows, unix)))]
     {
+        let _ = handoff;
         true
     }
 }
@@ -67,7 +103,10 @@ pub fn show_message() -> u32 {
 static SHOW_MSG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[cfg(windows)]
-fn win_primary() -> bool {
+static LOCK: Mutex<Option<usize>> = Mutex::new(None);
+
+#[cfg(windows)]
+fn win_primary(handoff: bool) -> bool {
     let name: Vec<u16> = "Local\\Ryme\0".encode_utf16().collect();
     let handle = unsafe { CreateMutexW(std::ptr::null(), 1, name.as_ptr()) };
     if handle.is_null() {
@@ -75,11 +114,12 @@ fn win_primary() -> bool {
     }
     if unsafe { GetLastError() } == 183 {
         unsafe { CloseHandle(handle) };
-        raise_existing();
+        if !handoff {
+            raise_existing();
+        }
         return false;
     }
-    // The raw handle stays open until this process exits. That is the lock.
-    let _keep = handle;
+    *LOCK.lock().unwrap() = Some(handle as usize);
     true
 }
 
@@ -138,9 +178,9 @@ extern "system" {
 static LISTENER: Mutex<Option<std::os::unix::net::UnixListener>> = Mutex::new(None);
 
 #[cfg(unix)]
-fn unix_primary() -> bool {
+fn unix_primary(handoff: bool) -> bool {
     let path = socket_path();
-    if poke(&path) {
+    if !handoff && poke(&path) {
         return false;
     }
     if let Some(parent) = path.parent() {
@@ -153,6 +193,7 @@ fn unix_primary() -> bool {
             *SOCKET.lock().unwrap() = Some(SocketPath(path));
             true
         }
+        Err(_) if handoff => false,
         Err(_) => !poke(&path),
     }
 }
@@ -164,7 +205,11 @@ fn poke(path: &std::path::Path) -> bool {
 
 #[cfg(unix)]
 fn spawn_listener() {
-    let listener = LISTENER.lock().unwrap().take();
+    let listener = LISTENER
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|listener| listener.try_clone().ok());
     let Some(listener) = listener else {
         return;
     };

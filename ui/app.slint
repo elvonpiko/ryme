@@ -429,6 +429,10 @@ export component MainWindow inherits Window {
     callback confirm-yes();
     callback confirm-no();
     callback check-update();
+    callback cycle-input();
+    callback cycle-output();
+    callback test-speakers();
+    callback choose-key(string);
 
     in-out property <int> joined: -1;
     in-out property <int> panel: 0; // 0 home, 1 channels, 2 chat, 3 settings
@@ -459,6 +463,14 @@ export component MainWindow inherits Window {
     changed denoise => {
         root.set-denoise(root.denoise);
     }
+    in-out property <string> talk-key: "V";
+    in-out property <bool> capture-key: false;
+    in-out property <bool> keyed: false;
+    in-out property <float> mic-level: 0;
+    in-out property <string> input-name: "Default";
+    in-out property <string> output-name: "Default";
+    in-out property <[string]> servers: [];
+    in-out property <string> mic-line: root.muted ? "Muted" : root.ptt ? (root.keyed ? "Mic live" : "Hold " + root.talk-key + " to talk") : "Mic live";
     in-out property <[Band]> bands: [];
     in-out property <int> picked: -1;
     in-out property <string> picked-name: "";
@@ -491,14 +503,19 @@ export component MainWindow inherits Window {
         width: 0px;
         height: 0px;
         key-pressed(event) => {
-            if (event.text == "v" || event.text == "V") {
+            if (root.capture-key) {
+                root.choose-key(event.text);
+                root.capture-key = false;
+                return accept;
+            }
+            if (event.text.to-lowercase() == root.talk-key.to-lowercase()) {
                 root.v-key(true);
                 return accept;
             }
             reject
         }
         key-released(event) => {
-            if (event.text == "v" || event.text == "V") {
+            if (event.text.to-lowercase() == root.talk-key.to-lowercase()) {
                 root.v-key(false);
                 return accept;
             }
@@ -670,13 +687,14 @@ export component MainWindow inherits Window {
             height: 18px;
             Text {
                 text: root.reconnecting ? "Reconnecting."
-                    : root.joined < 0 ? "Not in a channel"
-                    : root.channels[root.joined].members.length == 0 ? "Empty"
-                    : ("" + root.channels[root.joined].members.length + " in channel");
+                    : root.joined < 0 ? root.mic-line
+                    : root.channels[root.joined].members.length == 0 ? root.mic-line + " · Empty"
+                    : root.mic-line + " · " + root.channels[root.joined].members.length + " in channel";
                 color: Theme.muted;
                 font-family: Theme.sans;
                 font-size: 13px;
                 vertical-alignment: center;
+                overflow: elide;
             }
         }
 
@@ -1113,16 +1131,61 @@ export component MainWindow inherits Window {
                             HorizontalLayout {
                                 alignment: space-between;
                                 Text { text: "Microphone"; color: Theme.ink; font-family: Theme.sans; font-size: 14px; font-weight: 500; vertical-alignment: center; }
-                                Text { text: "Default"; color: Theme.muted; font-family: Theme.sans; font-size: 14px; vertical-alignment: center; }
+                                Text {
+                                    text: root.input-name;
+                                    color: mic-row.has-hover ? Theme.signal : Theme.muted;
+                                    font-family: Theme.sans;
+                                    font-size: 14px;
+                                    vertical-alignment: center;
+                                    width: 140px;
+                                    overflow: elide;
+                                    horizontal-alignment: right;
+                                }
+                            }
+                            mic-row := TouchArea { clicked => { root.cycle-input(); } }
+                        }
+                        Rectangle {
+                            height: 6px;
+                            border-radius: 3px;
+                            background: Theme.frame;
+                            Rectangle {
+                                x: 0;
+                                y: 0;
+                                width: parent.width * root.mic-level;
+                                height: 100%;
+                                border-radius: 3px;
+                                background: Theme.signal;
                             }
                         }
+                        Rectangle { height: 8px; }
                         Rectangle {
                             height: 34px;
                             HorizontalLayout {
                                 alignment: space-between;
                                 Text { text: "Speakers"; color: Theme.ink; font-family: Theme.sans; font-size: 14px; font-weight: 500; vertical-alignment: center; }
-                                Text { text: "Default"; color: Theme.muted; font-family: Theme.sans; font-size: 14px; vertical-alignment: center; }
+                                Text {
+                                    text: root.output-name;
+                                    color: speaker-row.has-hover ? Theme.signal : Theme.muted;
+                                    font-family: Theme.sans;
+                                    font-size: 14px;
+                                    vertical-alignment: center;
+                                    width: 140px;
+                                    overflow: elide;
+                                    horizontal-alignment: right;
+                                }
                             }
+                            speaker-row := TouchArea { clicked => { root.cycle-output(); } }
+                        }
+                        Rectangle {
+                            height: 28px;
+                            Text {
+                                text: "Test speakers";
+                                color: tone-row.has-hover ? Theme.signal : Theme.muted;
+                                font-family: Theme.sans;
+                                font-size: 13px;
+                                vertical-alignment: center;
+                            }
+                            tone-row := TouchArea { clicked => { root.test-speakers(); } }
                         }
                         Rectangle {
                             height: 36px;
@@ -1132,12 +1195,23 @@ export component MainWindow inherits Window {
                                 HorizontalLayout {
                                     spacing: 10px;
                                     alignment: center;
-                                    if root.ptt : Text {
-                                        text: "Hold V";
-                                        color: Theme.muted;
-                                        font-family: Theme.sans;
-                                        font-size: 12px;
-                                        vertical-alignment: center;
+                                    if root.ptt : Rectangle {
+                                        HorizontalLayout {
+                                            alignment: center;
+                                            Text {
+                                                text: root.capture-key ? "Press a letter" : "Hold " + root.talk-key;
+                                                color: key-row.has-hover ? Theme.signal : Theme.muted;
+                                                font-family: Theme.sans;
+                                                font-size: 12px;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                        key-row := TouchArea {
+                                            clicked => {
+                                                root.capture-key = true;
+                                                keys.focus();
+                                            }
+                                        }
                                     }
                                     VerticalLayout {
                                         alignment: center;
@@ -1146,6 +1220,14 @@ export component MainWindow inherits Window {
                                 }
                             }
                         }
+                        Text {
+                            text: "Windows sees this key in other apps. Linux and Mac see it while this window is focused. Linux also reads the keyboard when the session allows it.";
+                            wrap: word-wrap;
+                            color: Theme.muted;
+                            font-family: Theme.sans;
+                            font-size: 11px;
+                        }
+                        Rectangle { height: 8px; }
                         Rectangle {
                             height: 36px;
                             HorizontalLayout {
@@ -1280,12 +1362,58 @@ export component MainWindow inherits Window {
                     font-weight: 500;
                 }
                 Field {
-                    placeholder: "ryme://host:port";
+                    placeholder: "ryme://host:port/#…";
                     value <=> root.invite;
+                }
+                if root.servers.length > 0 : VerticalLayout {
+                    spacing: 1px;
+                    for server in root.servers : Rectangle {
+                        height: 16px;
+                        Text {
+                            text: server;
+                            color: saved.has-hover ? Theme.signal : Theme.muted;
+                            font-family: Theme.sans;
+                            font-size: 11px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                        saved := TouchArea { clicked => { root.invite = server; } }
+                    }
                 }
             }
 
-            Rectangle { vertical-stretch: 1; }
+            Rectangle {
+                vertical-stretch: 1;
+                VerticalLayout {
+                    padding-left: 22px;
+                    padding-right: 22px;
+                    padding-top: 8px;
+                    alignment: start;
+                    spacing: 4px;
+                    Rectangle {
+                        height: 4px;
+                        border-radius: 2px;
+                        background: Theme.frame;
+                        Rectangle {
+                            width: parent.width * root.mic-level;
+                            height: 100%;
+                            border-radius: 2px;
+                            background: Theme.signal;
+                        }
+                    }
+                    Rectangle {
+                        height: 18px;
+                        Text {
+                            text: "Test speakers";
+                            color: welcome-tone.has-hover ? Theme.signal : Theme.muted;
+                            font-family: Theme.sans;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                        }
+                        welcome-tone := TouchArea { clicked => { root.test-speakers(); } }
+                    }
+                }
+            }
 
             HorizontalLayout {
                 padding-left: 22px;
@@ -1305,23 +1433,37 @@ export component MainWindow inherits Window {
         }
     }
 
-    // Beside Join. The line keeps a real width from the start, so the first
-    // error is text on the elevated chip instead of an empty dark one.
+    // Off the card. A height of 0 reports no width, and the chip then opens empty.
+    measure := Text {
+        x: -400px;
+        y: 0px;
+        text: root.toast;
+        wrap: no-wrap;
+        opacity: 0;
+        font-family: Theme.sans;
+        font-size: 13px;
+    }
+    // Above the buttons, on the left. The torn corner stays clear. A dot
+    // grows into the line, on the same 240ms ease-out as a page slide.
     toast-bubble := Rectangle {
-        visible: root.toast != "";
-        x: parent.width - self.width - 18px;
-        y: parent.height - self.height - 16px;
-        width: 224px;
-        height: max(40px, copy.preferred-height + 20px);
-        border-radius: 14px;
+        property <bool> open: root.toast != "";
+        property <length> text-w: min(measure.preferred-width, parent.width - 68px);
+        x: 22px;
+        y: parent.height - self.height - 64px;
+        width: open ? text-w + 24px : 8px;
+        height: open ? max(copy.preferred-height + 20px, 36px) : 8px;
+        border-radius: open ? 14px : 4px;
+        clip: true;
+        opacity: open ? 1 : 0;
         background: Theme.elevated;
         border-width: 1px;
         border-color: root.toast-danger ? Theme.danger : Theme.frame;
+        animate y, width, height, border-radius, opacity { duration: 240ms; easing: ease-out; }
 
         copy := Text {
             x: 12px;
             y: 10px;
-            width: 200px;
+            width: max(parent.text-w, 1px);
             text: root.toast;
             wrap: word-wrap;
             color: root.toast-danger ? Theme.danger : Theme.ink;
@@ -1388,8 +1530,9 @@ export component MainWindow inherits Window {
 }
 
 export component RymeTray inherits SystemTrayIcon {
+    in-out property <string> mic-status: "Ryme";
     icon: @image-url("icon.svg");
-    tooltip: "Ryme";
+    tooltip: root.mic-status;
     callback show-window();
     callback quit();
 

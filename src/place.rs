@@ -79,8 +79,7 @@ fn work_center(window: &slint::Window, width: u32, height: u32) -> Option<(i32, 
         let screen = conn.setup().roots.get(screen_num)?;
         (screen.root, screen.width_in_pixels, screen.height_in_pixels)
     };
-    let (x, y, w, h) =
-        work_area(&conn, root).unwrap_or((0, 0, screen_w as i32, screen_h as i32));
+    let (x, y, w, h) = work_area(&conn, root).unwrap_or((0, 0, screen_w as i32, screen_h as i32));
     Some((x + (w - width as i32) / 2, y + (h - height as i32) / 2))
 }
 
@@ -90,7 +89,12 @@ fn work_area(
     root: u32,
 ) -> Option<(i32, i32, i32, i32)> {
     use x11rb::protocol::xproto::{AtomEnum, ConnectionExt};
-    let atom = conn.intern_atom(false, b"_NET_WORKAREA").ok()?.reply().ok()?.atom;
+    let atom = conn
+        .intern_atom(false, b"_NET_WORKAREA")
+        .ok()?
+        .reply()
+        .ok()?
+        .atom;
     let reply = conn
         .get_property(false, root, atom, AtomEnum::CARDINAL, 0, 4)
         .ok()?

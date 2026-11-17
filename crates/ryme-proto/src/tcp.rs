@@ -1,6 +1,6 @@
 //! One TCP connection carries both paths. Each frame is a tag, a length, and
-//! the bytes the other path already uses. Voice is not reliable: the sender
-//! drops a frame rather than wait for a stalled socket.
+//! the bytes the other path already uses. Voice is not reliable: a full queue
+//! drops the oldest frame rather than wait for a stalled socket.
 
 use crate::{ProtoError, MAX_FRAME};
 

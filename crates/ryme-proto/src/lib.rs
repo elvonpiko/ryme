@@ -14,9 +14,10 @@ mod invite;
 mod tcp;
 mod voice;
 
-pub use control::{ClientMsg, Member, ServerMsg, MAX_CHANNEL, MAX_CHAT, MAX_NAME};
+pub use control::{ClientMsg, Member, ServerMsg, MAX_CHANNEL, MAX_CHAT, MAX_NAME, NAME_BYTES};
 pub use frame::{
-    decode_client_frame, decode_server_frame, encode_client, encode_server, MAX_FRAME,
+    decode_client_frame, decode_server_frame, encode_client, encode_server, take_client_frame,
+    ClientFrame, MAX_FRAME,
 };
 pub use invite::{format_invite, parse_invite, Invite, DEFAULT_PORT};
 pub use tcp::{decode_tagged, encode_tagged, TCP_CONTROL, TCP_MAX, TCP_VOICE};

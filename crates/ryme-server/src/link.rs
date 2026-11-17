@@ -82,23 +82,84 @@ pub struct Live {
 
 /// Voice packets cross here so the audio thread never waits on the socket.
 pub struct VoicePipe {
-    incoming: std::sync::mpsc::Receiver<Vec<u8>>,
-    outgoing: tokio::sync::mpsc::Sender<Vec<u8>>,
+    incoming: std::sync::Arc<Inbox>,
+    outgoing: Outbox,
+}
+
+/// Frames the audio thread has not played yet. A full inbox drops the oldest.
+struct Inbox {
+    cap: usize,
+    items: std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>,
+}
+
+impl Inbox {
+    fn new(cap: usize) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            cap: cap.max(1),
+            items: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        })
+    }
+
+    fn push(&self, packet: Vec<u8>) {
+        let mut items = self.items.lock().unwrap();
+        while items.len() >= self.cap {
+            items.pop_front();
+        }
+        items.push_back(packet);
+    }
+
+    fn pop(&self) -> Option<Vec<u8>> {
+        self.items.lock().unwrap().pop_front()
+    }
+}
+
+#[derive(Clone)]
+enum Outbox {
+    /// QUIC. A full queue drops the packet the audio thread just handed over.
+    Wait(tokio::sync::mpsc::Sender<Vec<u8>>),
+    /// TCP. A full queue drops the oldest frame and keeps the newest.
+    Fresh(crate::queue::NewestSender<Vec<u8>>),
+}
+
+/// The bench waits on this. The audio thread uses [`VoicePipe::send`] instead,
+/// which never blocks.
+pub struct VoiceQueue {
+    inner: Outbox,
+}
+
+impl VoiceQueue {
+    pub async fn send(&self, packet: Vec<u8>) -> Result<(), ()> {
+        match &self.inner {
+            Outbox::Wait(tx) => tx.send(packet).await.map_err(|_| ()),
+            Outbox::Fresh(tx) => {
+                tx.offer(packet);
+                Ok(())
+            }
+        }
+    }
 }
 
 impl VoicePipe {
     pub fn send(&self, packet: Vec<u8>) {
-        let _ = self.outgoing.try_send(packet);
+        match &self.outgoing {
+            Outbox::Wait(tx) => {
+                let _ = tx.try_send(packet);
+            }
+            Outbox::Fresh(tx) => tx.offer(packet),
+        }
     }
 
-    /// A sender the bench can move onto its own task. `send` drops a packet when
-    /// the queue is full; waiting here means a slow path is not counted as sent.
-    pub fn queue(&self) -> tokio::sync::mpsc::Sender<Vec<u8>> {
-        self.outgoing.clone()
+    /// A sender the bench can move onto its own task. On QUIC, waiting here
+    /// means a slow path is not counted as sent. On TCP the queue keeps the
+    /// newest frames and this returns as soon as the frame is accepted.
+    pub fn queue(&self) -> VoiceQueue {
+        VoiceQueue {
+            inner: self.outgoing.clone(),
+        }
     }
 
     pub fn try_recv(&self) -> Option<Vec<u8>> {
-        self.incoming.try_recv().ok()
+        self.incoming.pop()
     }
 }
 
@@ -276,8 +337,8 @@ async fn finish_quic(
 
     let (cmd_tx, cmd_rx) = unbounded_channel();
     let (event_tx, events) = unbounded_channel();
-    let (voice_out_tx, voice_out_rx) = tokio::sync::mpsc::channel(32);
-    let (voice_in_tx, voice_in_rx) = std::sync::mpsc::sync_channel(64);
+    let (voice_out_tx, voice_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+    let voice_in = Inbox::new(64);
     let (delay_tx, delay) = tokio::sync::watch::channel(None);
     tokio::spawn(run(
         endpoint,
@@ -288,7 +349,7 @@ async fn finish_quic(
         cmd_rx,
         event_tx,
         voice_out_rx,
-        voice_in_tx,
+        std::sync::Arc::clone(&voice_in),
         delay_tx,
     ));
 
@@ -300,8 +361,8 @@ async fn finish_quic(
         link: Link { cmd: cmd_tx },
         events,
         voice: VoicePipe {
-            incoming: voice_in_rx,
-            outgoing: voice_out_tx,
+            incoming: voice_in,
+            outgoing: Outbox::Wait(voice_out_tx),
         },
         resume,
         tcp: false,
@@ -352,8 +413,8 @@ async fn finish_tcp(
 
     let (cmd_tx, cmd_rx) = unbounded_channel();
     let (event_tx, events) = unbounded_channel();
-    let (voice_out_tx, voice_out_rx) = tokio::sync::mpsc::channel(TCP_VOICE_QUEUE);
-    let (voice_in_tx, voice_in_rx) = std::sync::mpsc::sync_channel(64);
+    let (voice_out_tx, voice_out_rx) = crate::queue::newest(TCP_VOICE_QUEUE);
+    let voice_in = Inbox::new(64);
     let (dead_tx, dead_rx) = tokio::sync::watch::channel(false);
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let clock = std::time::Instant::now();
@@ -372,7 +433,7 @@ async fn finish_tcp(
         read,
         acc,
         event_tx.clone(),
-        voice_in_tx,
+        std::sync::Arc::clone(&voice_in),
         dead_tx,
         stop_rx,
         clock,
@@ -389,8 +450,8 @@ async fn finish_tcp(
         link: Link { cmd: cmd_tx },
         events,
         voice: VoicePipe {
-            incoming: voice_in_rx,
-            outgoing: voice_out_tx,
+            incoming: voice_in,
+            outgoing: Outbox::Fresh(voice_out_tx),
         },
         resume,
         tcp: true,
@@ -427,9 +488,11 @@ async fn dial_tcp(
     stream
         .set_nodelay(true)
         .map_err(|_| LinkError::Unreachable)?;
+    crate::queue::limit_send_buffer(&stream);
     let config = tls_client_config(fingerprint).map_err(|_| LinkError::Unreachable)?;
     let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
-    let name = rustls::pki_types::ServerName::try_from("ryme").map_err(|_| LinkError::Unreachable)?;
+    let name =
+        rustls::pki_types::ServerName::try_from("ryme").map_err(|_| LinkError::Unreachable)?;
     tokio::time::timeout(Duration::from_secs(4), connector.connect(name, stream))
         .await
         .map_err(|_| LinkError::Timeout)?
@@ -499,7 +562,7 @@ fn take_control(acc: &mut Vec<u8>) -> Result<Option<ServerMsg>, LinkError> {
 
 async fn write_tcp_out<W>(
     mut write: W,
-    mut voice_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    mut voice_rx: crate::queue::NewestReceiver<Vec<u8>>,
     mut cmd_rx: UnboundedReceiver<Cmd>,
     dead: tokio::sync::watch::Sender<bool>,
     stop: tokio::sync::watch::Sender<bool>,
@@ -566,7 +629,7 @@ async fn read_tcp_in<R>(
     mut read: R,
     mut acc: Vec<u8>,
     events: UnboundedSender<Event>,
-    voice_in: std::sync::mpsc::SyncSender<Vec<u8>>,
+    voice_in: std::sync::Arc<Inbox>,
     dead: tokio::sync::watch::Sender<bool>,
     mut stop: tokio::sync::watch::Receiver<bool>,
     clock: std::time::Instant,
@@ -608,7 +671,7 @@ async fn read_tcp_in<R>(
 fn drain_tcp_in(
     acc: &mut Vec<u8>,
     events: &UnboundedSender<Event>,
-    voice_in: &std::sync::mpsc::SyncSender<Vec<u8>>,
+    voice_in: &Inbox,
     clock: std::time::Instant,
     pending: &tokio::sync::watch::Receiver<Option<u64>>,
     delay: &tokio::sync::watch::Sender<Option<u32>>,
@@ -619,7 +682,7 @@ fn drain_tcp_in(
                 let owned = payload.to_vec();
                 acc.drain(..n);
                 if tag == TCP_VOICE {
-                    let _ = voice_in.try_send(owned);
+                    voice_in.push(owned);
                     continue;
                 }
                 if tag != TCP_CONTROL {
@@ -639,10 +702,7 @@ fn drain_tcp_in(
     }
 }
 
-async fn watch_tcp(
-    mut dead: tokio::sync::watch::Receiver<bool>,
-    events: UnboundedSender<Event>,
-) {
+async fn watch_tcp(mut dead: tokio::sync::watch::Receiver<bool>, events: UnboundedSender<Event>) {
     if dead.changed().await.is_ok() && *dead.borrow() {
         let _ = events.send(Event::Disconnected);
     }
@@ -731,7 +791,7 @@ async fn run(
     mut cmd_rx: UnboundedReceiver<Cmd>,
     events: UnboundedSender<Event>,
     mut voice_out: tokio::sync::mpsc::Receiver<Vec<u8>>,
-    voice_in: std::sync::mpsc::SyncSender<Vec<u8>>,
+    voice_in: std::sync::Arc<Inbox>,
     delay: tokio::sync::watch::Sender<Option<u32>>,
 ) {
     let mut tmp = [0u8; 2048];
@@ -765,7 +825,7 @@ async fn run(
             datagram = conn.read_datagram() => {
                 match datagram {
                     Ok(packet) => {
-                        let _ = voice_in.try_send(packet.to_vec());
+                        voice_in.push(packet.to_vec());
                     }
                     Err(_) => break,
                 }
@@ -822,11 +882,7 @@ fn note_pong(
     let _ = delay.send(Some(ms.min(9_999)));
 }
 
-fn drain(
-    buf: &mut Vec<u8>,
-    events: &UnboundedSender<Event>,
-    mut on_pong: impl FnMut(u64),
-) -> bool {
+fn drain(buf: &mut Vec<u8>, events: &UnboundedSender<Event>, mut on_pong: impl FnMut(u64)) -> bool {
     loop {
         match decode_server_frame(buf) {
             Ok(Some((msg, n))) => {
@@ -884,6 +940,16 @@ mod tests {
         let pass = server.pass();
         let task = tokio::spawn(async move { server.serve().await });
         (port, fingerprint, pass, task)
+    }
+
+    #[test]
+    fn a_full_inbox_keeps_the_newest_frame() {
+        let inbox = Inbox::new(2);
+        inbox.push(vec![1]);
+        inbox.push(vec![2]);
+        inbox.push(vec![3]);
+        assert_eq!(inbox.pop(), Some(vec![2]));
+        assert_eq!(inbox.pop(), Some(vec![3]));
     }
 
     fn invite(port: u16, fingerprint: [u8; 32], pass: [u8; 32]) -> String {
@@ -959,6 +1025,50 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(left, Event::PeerLeft { user_id: jonas.me });
+    }
+
+    #[tokio::test]
+    async fn a_long_chat_is_refused_and_the_call_stays() {
+        let (port, fingerprint, pass, _task) = up().await;
+        let url = invite(port, fingerprint, pass);
+        let name = "你".repeat(20);
+        let mut live = connect(&url, &name, 1, [0; 32]).await.unwrap();
+        assert_eq!(live.members[0].name, name);
+
+        live.link.chat("   ");
+        let refused = tokio::time::timeout(Duration::from_secs(2), live.events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            refused,
+            Event::Rejected {
+                reason: "message was not sent".into(),
+            }
+        );
+
+        live.link.chat("a".repeat(401));
+        let again = tokio::time::timeout(Duration::from_secs(2), live.events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(again, Event::Rejected { .. }),
+            "a long line dropped the call: {again:?}"
+        );
+
+        live.link.chat("still here");
+        let chat = tokio::time::timeout(Duration::from_secs(2), live.events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            chat,
+            Event::Chat {
+                user_id: live.me,
+                text: "still here".into(),
+            }
+        );
     }
 
     #[tokio::test]
@@ -1128,6 +1238,54 @@ mod tests {
         let heard = ryme_proto::decode_voice(&heard).unwrap();
         assert_eq!(heard.speaker, tcp.me);
         assert_eq!(heard.payload, vec![8, 8]);
+    }
+
+    #[tokio::test]
+    async fn tcp_callers_keep_a_recent_voice_frame() {
+        let (port, fingerprint, pass, _task) = up().await;
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let mouth = connect_tcp(addr, fingerprint, "Mouth", 1, pass, [0; 32])
+            .await
+            .unwrap();
+        let ear = connect_tcp(addr, fingerprint, "Ear", 2, pass, [0; 32])
+            .await
+            .unwrap();
+        let last = 200u32;
+        let mut heard = 0u32;
+        for seq in 1..=last {
+            let packet = ryme_proto::encode_voice(&ryme_proto::VoicePacket {
+                speaker: 0,
+                seq,
+                timestamp: seq.wrapping_mul(480),
+                flags: 0,
+                payload: vec![1, 2, 3, 4],
+            })
+            .unwrap();
+            mouth.voice.send(packet);
+            while let Some(bytes) = ear.voice.try_recv() {
+                let voice = ryme_proto::decode_voice(&bytes).unwrap();
+                heard = heard.max(voice.seq);
+            }
+            if seq % 10 == 0 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            if let Some(bytes) = ear.voice.try_recv() {
+                let voice = ryme_proto::decode_voice(&bytes).unwrap();
+                heard = heard.max(voice.seq);
+                if heard + 15 >= last {
+                    break;
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        assert!(
+            heard + 15 >= last,
+            "newest voice heard was {heard}, sent {last}"
+        );
     }
 
     async fn wait_voice(live: &Live) -> Vec<u8> {

@@ -14,9 +14,31 @@ pub fn encode_server(msg: &ServerMsg) -> Result<Vec<u8>, ProtoError> {
     encode_frame(msg)
 }
 
-pub fn decode_client_frame(buf: &[u8]) -> Result<Option<(ClientMsg, usize)>, ProtoError> {
+#[derive(Debug, PartialEq, Eq)]
+pub enum ClientFrame {
+    Message(ClientMsg),
+    /// The bytes were a whole frame. The server should skip them and refuse
+    /// the request. Closing the connection here drops the call.
+    Refused,
+}
+
+/// Like [`decode_client_frame`], but a name or chat line the server will not
+/// keep is [`ClientFrame::Refused`] instead of a hard error.
+pub fn take_client_frame(buf: &[u8]) -> Result<Option<(ClientFrame, usize)>, ProtoError> {
     match decode_frame(buf)? {
-        Some((msg, n)) => Ok(Some((normalize_client(msg)?, n))),
+        Some((msg, n)) => match normalize_client(msg) {
+            Ok(msg) => Ok(Some((ClientFrame::Message(msg), n))),
+            Err(ProtoError::Invalid) => Ok(Some((ClientFrame::Refused, n))),
+            Err(err) => Err(err),
+        },
+        None => Ok(None),
+    }
+}
+
+pub fn decode_client_frame(buf: &[u8]) -> Result<Option<(ClientMsg, usize)>, ProtoError> {
+    match take_client_frame(buf)? {
+        Some((ClientFrame::Message(msg), n)) => Ok(Some((msg, n))),
+        Some((ClientFrame::Refused, _)) => Err(ProtoError::Invalid),
         None => Ok(None),
     }
 }
@@ -174,5 +196,23 @@ mod tests {
             decode_client_frame(&frame).unwrap_err(),
             ProtoError::Invalid
         );
+        match take_client_frame(&frame).unwrap().unwrap() {
+            (ClientFrame::Refused, n) => assert_eq!(n, frame.len()),
+            other => panic!("expected a skippable frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_refused_chat_does_not_eat_the_next_frame() {
+        let bad = encode_client(&ClientMsg::Chat { text: "   ".into() }).unwrap();
+        let good = encode_client(&ClientMsg::Chat { text: "hey".into() }).unwrap();
+        let mut buf = bad.clone();
+        buf.extend_from_slice(&good);
+        let (frame, n) = take_client_frame(&buf).unwrap().unwrap();
+        assert_eq!(frame, ClientFrame::Refused);
+        assert_eq!(n, bad.len());
+        let (msg, m) = decode_client_frame(&buf[n..]).unwrap().unwrap();
+        assert_eq!(msg, ClientMsg::Chat { text: "hey".into() });
+        assert_eq!(n + m, buf.len());
     }
 }

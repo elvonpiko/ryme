@@ -181,8 +181,8 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
     let audio = local::load_audio();
     crate::ear::set_talk_key(audio.key);
     ui.set_talk_key(audio.key.to_string().into());
-    ui.set_input_name(short_device(&audio.input).into());
-    ui.set_output_name(short_device(&audio.output).into());
+    ui.set_input_name(short_device(&audio.input, true).into());
+    ui.set_output_name(short_device(&audio.output, false).into());
     local::forget_servers();
     let staged = local::take_staged_invite();
     let slot = Arc::new(Mutex::new(Slot {
@@ -248,7 +248,18 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
 
     ui.on_send_chat({
         let slot = slot.clone();
-        move |text| send(&slot, |link| link.chat(text.to_string()))
+        let ui_weak = ui.as_weak();
+        let rt = rt.clone();
+        let notices = notices.clone();
+        move |text| {
+            let Some(text) = fit_chat(&text) else {
+                if let Some(ui) = ui_weak.upgrade() {
+                    note(&ui, &rt, &notices, "That line was empty.");
+                }
+                return;
+            };
+            send(&slot, |link| link.chat(text));
+        }
     });
 
     ui.on_set_mute({
@@ -603,11 +614,27 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
 
     let meter_slot = slot.clone();
     let meter_ui = ui.as_weak();
+    let meter_rt = rt.clone();
+    let meter_notices = notices.clone();
     rt.spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut switched = None;
             let level = {
-                let guard = meter_slot.lock().unwrap();
+                let mut guard = meter_slot.lock().unwrap();
+                if let Some((input, applied)) = device_fault(&guard) {
+                    if input {
+                        guard.input = applied.clone();
+                    } else {
+                        guard.output = applied.clone();
+                    }
+                    local::store_audio(&local::AudioPref {
+                        input: guard.input.clone(),
+                        output: guard.output.clone(),
+                        key: crate::ear::talk_key(),
+                    });
+                    switched = Some((input, applied));
+                }
                 guard
                     .ear
                     .as_ref()
@@ -616,9 +643,24 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
                     .unwrap_or(0)
             };
             let keyed = crate::ear::key_is_down();
+            let toast_rt = meter_rt.clone();
+            let toast_notices = meter_notices.clone();
             let _ = meter_ui.upgrade_in_event_loop(move |ui| {
                 ui.set_mic_level(level as f32 / 100.0);
                 ui.set_keyed(keyed);
+                if let Some((input, applied)) = switched {
+                    if input {
+                        ui.set_input_name(short_device(&applied, true).into());
+                    } else {
+                        ui.set_output_name(short_device(&applied, false).into());
+                    }
+                    let text = if input {
+                        "That microphone did not open."
+                    } else {
+                        "Those speakers did not open."
+                    };
+                    toast(&ui, &toast_rt, &toast_notices, text, true);
+                }
                 #[cfg(target_os = "linux")]
                 crate::linux_tray::set_status(&ui.get_mic_line());
             });
@@ -632,8 +674,67 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
     Shutdown { slot }
 }
 
-fn short_device(name: &str) -> String {
-    let name = if name == "default" { "Default" } else { name };
+fn device_fault(guard: &Slot) -> Option<(bool, String)> {
+    if let Some(ear) = guard.ear.as_ref() {
+        if ear.take_input_fault() {
+            return Some((true, ear.applied_input()));
+        }
+        if ear.take_output_fault() {
+            return Some((false, ear.applied_output()));
+        }
+        return None;
+    }
+    if let Some(preview) = guard.preview.as_ref() {
+        if preview.take_input_fault() {
+            return Some((true, preview.applied_input()));
+        }
+        if preview.take_output_fault() {
+            return Some((false, preview.applied_output()));
+        }
+    }
+    None
+}
+
+fn fit_name(name: &str) -> String {
+    let mut out = String::new();
+    let mut chars = 0usize;
+    for ch in name.trim().chars() {
+        if ch.is_control() {
+            continue;
+        }
+        if chars == ryme_proto::MAX_NAME {
+            break;
+        }
+        if out.len() + ch.len_utf8() > ryme_proto::NAME_BYTES {
+            break;
+        }
+        out.push(ch);
+        chars += 1;
+    }
+    out
+}
+
+fn fit_chat(text: &str) -> Option<String> {
+    let flat: String = text
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    let mut out = String::new();
+    for ch in flat.trim().chars() {
+        if out.len() + ch.len_utf8() > ryme_proto::MAX_CHAT {
+            break;
+        }
+        out.push(ch);
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn short_device(name: &str, input: bool) -> String {
+    let name = crate::ear::device_caption(name, input);
     let count = name.chars().count();
     if count > 16 {
         let short: String = name.chars().take(15).collect();
@@ -668,7 +769,7 @@ fn cycle_device(ui: &MainWindow, slot: &Arc<Mutex<Slot>>, input: bool) {
         if let Some(preview) = guard.preview.as_ref() {
             preview.set_input(&next);
         }
-        ui.set_input_name(short_device(&next).into());
+        ui.set_input_name(short_device(&next, true).into());
     } else {
         guard.output = next.clone();
         if let Some(ear) = guard.ear.as_ref() {
@@ -677,7 +778,7 @@ fn cycle_device(ui: &MainWindow, slot: &Arc<Mutex<Slot>>, input: bool) {
         if let Some(preview) = guard.preview.as_ref() {
             preview.set_output(&next);
         }
-        ui.set_output_name(short_device(&next).into());
+        ui.set_output_name(short_device(&next, false).into());
     }
     local::store_audio(&local::AudioPref {
         input: guard.input.clone(),
@@ -704,7 +805,12 @@ fn begin(
     retry: bool,
     attempt: u32,
 ) {
-    let name = ui.get_display_name().to_string();
+    let name = fit_name(&ui.get_display_name());
+    if name.is_empty() {
+        note(ui, rt, notices, "Add a name.");
+        return;
+    }
+    ui.set_display_name(name.clone().into());
     let invite = ui.get_invite().to_string();
     let muted = ui.get_muted();
     let deafened = ui.get_deafened();
@@ -792,6 +898,7 @@ fn begin(
                     let guard = slot.lock().unwrap();
                     (guard.input.clone(), guard.output.clone())
                 };
+                let tcp = live.tcp;
                 let ear = crate::ear::open(
                     live.voice,
                     live.me,
@@ -804,6 +911,7 @@ fn begin(
                     },
                     &input,
                     &output,
+                    tcp,
                 );
                 let (mic, speakers) = (ear.mic, ear.speakers);
                 {
@@ -1463,7 +1571,9 @@ fn explain(err: LinkError) -> String {
     match err {
         LinkError::Invite => "That invite is not a ryme link.".into(),
         LinkError::Unreachable => "Could not reach that server.".into(),
-        LinkError::Timeout => "The server did not answer. Check that UDP or TCP can get through.".into(),
+        LinkError::Timeout => {
+            "The server did not answer. Check that UDP or TCP can get through.".into()
+        }
         LinkError::Pin => "This invite does not match that server. Ask for a new link.".into(),
         LinkError::Address => "That address did not resolve.".into(),
         LinkError::Rejected(reason) => reason,

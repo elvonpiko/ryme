@@ -993,11 +993,7 @@ mod tests {
                 name: "Mara".into(),
                 card: card_of("Mara"),
                 pass: [7; 32],
-                resume: hub
-                    .users
-                    .get(&mara)
-                    .map(|user| user.resume)
-                    .unwrap(),
+                resume: hub.users.get(&mara).map(|user| user.resume).unwrap(),
             },
         );
         let ServerMsg::Welcome { user_id, .. } = welcome.to_self[0] else {

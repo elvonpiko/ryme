@@ -1,6 +1,7 @@
 mod hub;
 mod identity;
 mod link;
+mod queue;
 mod server;
 mod session;
 mod sums;
@@ -9,7 +10,7 @@ mod sums;
 mod net_test;
 
 pub use identity::{client_config, Door, Identity};
-pub use link::{connect, Event, Link, LinkError, Live, Peer, VoicePipe};
+pub use link::{connect, Event, Link, LinkError, Live, Peer, VoicePipe, VoiceQueue};
 pub use server::Server;
 pub use sums::{sign_sums, verify_sums};
 

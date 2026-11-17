@@ -27,7 +27,10 @@ pub fn format_invite(host: &str, port: u16, fingerprint: &[u8; 32], pass: &[u8; 
     } else {
         format!("{host}:{port}")
     };
-    format!("https://ryme.chat/#{place}/{}", encode_token(fingerprint, pass))
+    format!(
+        "https://ryme.chat/#{place}/{}",
+        encode_token(fingerprint, pass)
+    )
 }
 
 pub fn parse_invite(raw: &str) -> Result<Invite, ProtoError> {

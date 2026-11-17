@@ -1085,11 +1085,13 @@ export component MainWindow inherits Window {
                     content-height: chat-lines.preferred-height;
                     property <bool> stick: true;
                     property <length> span: chat-lines.preferred-height;
-                    changed span => {
+                    function pin-bottom() {
                         if (self.stick && self.height > 0px) {
                             self.content-y = min(0px, self.height - self.span);
                         }
                     }
+                    changed span => { self.pin-bottom(); }
+                    changed height => { self.pin-bottom(); }
                     changed content-y => {
                         self.stick = self.content-y <= min(0px, self.height - self.content-height) + 8px;
                     }
@@ -1114,7 +1116,7 @@ export component MainWindow inherits Window {
                             Text {
                                 text: line.body;
                                 horizontal-stretch: 1;
-                                overflow: elide;
+                                wrap: word-wrap;
                                 color: Theme.ink;
                                 font-family: Theme.sans;
                                 font-size: 14px;

@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use ryme_proto::{
-    decode_client_frame, decode_tagged, encode_server, encode_tagged, stamp_speaker, ClientMsg,
-    ProtoError, ServerMsg, TCP_CONTROL, TCP_VOICE,
+    decode_tagged, encode_server, encode_tagged, stamp_speaker, take_client_frame, ClientFrame,
+    ClientMsg, ProtoError, ServerMsg, TCP_CONTROL, TCP_VOICE,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -15,6 +15,7 @@ use tokio::sync::watch;
 
 use crate::hub::{Hub, Step};
 use crate::identity;
+use crate::queue::{self, NewestReceiver, NewestSender};
 
 /// Room history is up to 200 lines, sent when someone joins. The queue has to
 /// hold that burst. A frame that does not fit is dropped; it does not end the call.
@@ -22,7 +23,9 @@ const CONTROL_QUEUE: usize = 256;
 const TCP_VOICE_QUEUE: usize = 6;
 const MAX_CONNECTIONS: usize = 64;
 const CONTROL_PER_SECOND: u32 = 30;
-const VOICE_PER_SECOND: u32 = 120;
+// A TCP read can deliver a backlog in one go. The outbound queue keeps the
+// newest frames of that burst. This cap only stops a flood.
+const VOICE_PER_SECOND: u32 = 500;
 const ADMIT_WAIT: Duration = Duration::from_secs(5);
 // A slow TCP write must not be cancelled. Two seconds was cutting a voice
 // frame in half on a laggy link and the session then dropped and reconnected.
@@ -65,8 +68,8 @@ impl VoiceTx {
 enum VoiceOut {
     /// QUIC replaces a datagram the writer has not sent.
     Latest(VoiceTx),
-    /// TCP drops a new frame when six are already waiting.
-    Bounded(Sender<Bytes>),
+    /// TCP keeps six frames and drops the oldest when a newer one arrives.
+    Bounded(NewestSender<Bytes>),
 }
 
 #[derive(Clone)]
@@ -320,8 +323,16 @@ fn drain_frames(
     pace: &mut Pace,
 ) -> Result<bool, ProtoError> {
     loop {
-        match decode_client_frame(buf)? {
-            Some((msg, n)) => {
+        match take_client_frame(buf)? {
+            Some((ClientFrame::Refused, n)) => {
+                buf.drain(..n);
+                // A bad line is a no. It is not a reason to drop the call.
+                let _ = pipes.control.try_send(ServerMsg::Reject {
+                    reason: "message was not sent".into(),
+                });
+                continue;
+            }
+            Some((ClientFrame::Message(msg), n)) => {
                 buf.drain(..n);
                 if let ClientMsg::Ping { token } = msg {
                     // A full control queue drops the echo. It does not close the call.
@@ -382,9 +393,7 @@ async fn write_out(
 fn offer_voice(voice: &VoiceOut, packet: Bytes) {
     match voice {
         VoiceOut::Latest(tx) => tx.offer(packet),
-        VoiceOut::Bounded(tx) => {
-            let _ = tx.try_send(packet);
-        }
+        VoiceOut::Bounded(tx) => tx.offer(packet),
     }
 }
 
@@ -396,7 +405,7 @@ where
     let (fail_tx, mut fail_rx) = watch::channel(false);
     let (mut read, write) = tokio::io::split(stream);
     let (control_tx, control_rx) = tokio::sync::mpsc::channel(CONTROL_QUEUE);
-    let (voice_tx, voice_rx) = tokio::sync::mpsc::channel(TCP_VOICE_QUEUE);
+    let (voice_tx, voice_rx) = queue::newest(TCP_VOICE_QUEUE);
     let (close_tx, mut close_rx) = tokio::sync::mpsc::channel(1);
     let pipes = Pipes {
         control: control_tx,
@@ -487,7 +496,7 @@ where
 async fn write_tcp<W>(
     mut write: W,
     mut control_rx: Receiver<ServerMsg>,
-    mut voice_rx: Receiver<Bytes>,
+    mut voice_rx: NewestReceiver<Bytes>,
     fail: watch::Sender<bool>,
 ) where
     W: AsyncWrite + Unpin,

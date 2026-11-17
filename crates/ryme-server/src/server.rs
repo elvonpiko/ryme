@@ -119,6 +119,7 @@ impl Server {
                     tokio::spawn(async move {
                         let handshake = async {
                             stream.set_nodelay(true).map_err(|_| ())?;
+                            crate::queue::limit_send_buffer(&stream);
                             match tokio::time::timeout(Duration::from_secs(5), acceptor.accept(stream)).await {
                                 Ok(Ok(tls)) => Ok(tls),
                                 _ => Err(()),
@@ -157,8 +158,8 @@ fn listen(addr: SocketAddr, identity: &Identity) -> Result<quinn::Endpoint, Serv
 }
 
 fn listen_tcp(addr: SocketAddr) -> Result<tokio::net::TcpListener, ServerError> {
-    let listener = std::net::TcpListener::bind(addr)
-        .map_err(|err| ServerError::Message(err.to_string()))?;
+    let listener =
+        std::net::TcpListener::bind(addr).map_err(|err| ServerError::Message(err.to_string()))?;
     listener
         .set_nonblocking(true)
         .map_err(|err| ServerError::Message(err.to_string()))?;

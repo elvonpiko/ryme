@@ -4,12 +4,11 @@
 //! tick in sequence order. A missing frame is reported as a loss so the Opus
 //! decoder can conceal it. If losses keep happening the wait grows. If the
 //! buffer stays deep and healthy, one frame is skipped so the delay can fall.
+//! A burst is trimmed to the newest frames immediately, so a stall is not
+//! replayed from the beginning.
 
 use std::collections::BTreeMap;
 
-const START: usize = 3;
-const MIN_DEPTH: usize = 2;
-const MAX_DEPTH: usize = 8;
 const COMFORT: u32 = 100;
 const JUMP: i32 = 64;
 
@@ -25,6 +24,9 @@ pub enum Play {
 pub struct Jitter {
     next: Option<u32>,
     started: bool,
+    start: usize,
+    min_depth: usize,
+    max_depth: usize,
     target: usize,
     queued: BTreeMap<u32, Vec<u8>>,
     underrun: u32,
@@ -32,11 +34,25 @@ pub struct Jitter {
 }
 
 impl Jitter {
+    /// QUIC. A few frames of cushion, and a short maximum wait.
     pub fn new() -> Self {
+        Self::profile(3, 2, 8)
+    }
+
+    /// TCP. Loss hides in the kernel for longer, so the cushion can grow
+    /// further before a missing frame gives up.
+    pub fn tcp() -> Self {
+        Self::profile(5, 3, 20)
+    }
+
+    fn profile(start: usize, min_depth: usize, max_depth: usize) -> Self {
         Self {
             next: None,
             started: false,
-            target: START,
+            start,
+            min_depth,
+            max_depth,
+            target: start,
             queued: BTreeMap::new(),
             underrun: 0,
             comfortable: 0,
@@ -61,17 +77,35 @@ impl Jitter {
             }
         }
         self.queued.insert(seq, payload);
-        if self.queued.len() > 24 {
-            if let Some(oldest) = self.queued.keys().next().copied() {
-                self.queued.remove(&oldest);
-                if self.next == Some(oldest) {
-                    self.next = Some(oldest.wrapping_add(1));
-                }
-            }
+        self.catch_up();
+    }
+
+    /// Keep at most `target + 1` frames. A burst skips ahead to those instead
+    /// of playing the stale audio that arrived with them.
+    fn catch_up(&mut self) {
+        let keep = self.target + 1;
+        while self.queued.len() > keep {
+            let Some(oldest) = self.queued.keys().next().copied() else {
+                break;
+            };
+            self.queued.remove(&oldest);
+        }
+        let Some(oldest) = self.queued.keys().next().copied() else {
+            return;
+        };
+        let stale = self
+            .next
+            .is_some_and(|next| oldest.wrapping_sub(next) as i32 > 0);
+        if stale {
+            self.next = Some(oldest);
+            self.started = true;
+            self.underrun = 0;
+            self.comfortable = 0;
+            return;
         }
         if !self.started && self.queued.len() >= self.target {
-            self.next = self.queued.keys().next().copied();
-            self.started = self.next.is_some();
+            self.next = Some(oldest);
+            self.started = true;
         }
     }
 
@@ -97,7 +131,7 @@ impl Jitter {
             self.comfortable = 0;
             self.underrun = self.underrun.saturating_add(1);
             if self.underrun >= 4 {
-                self.target = (self.target + 1).min(MAX_DEPTH);
+                self.target = (self.target + 1).min(self.max_depth);
                 self.underrun = 0;
             }
             Play::Loss
@@ -105,14 +139,10 @@ impl Jitter {
     }
 
     fn shrink_if_deep(&mut self) {
-        if self.comfortable > COMFORT
-            && self.queued.len() > self.target + 2
-            && self.target > MIN_DEPTH
-        {
-            if let Some(next) = self.next {
-                self.queued.remove(&next);
-                self.next = Some(next.wrapping_add(1));
-            }
+        // A burst is already trimmed in `catch_up`, so the queue never sits
+        // deeper than the target. A long healthy stretch still lowers the
+        // target, and the next push drops the frame that no longer fits.
+        if self.comfortable > COMFORT && self.target > self.min_depth {
             self.target -= 1;
             self.comfortable = 0;
         }
@@ -124,7 +154,7 @@ impl Jitter {
         self.next = None;
         self.underrun = 0;
         self.comfortable = 0;
-        self.target = START;
+        self.target = self.start;
     }
 }
 
@@ -179,5 +209,30 @@ mod tests {
             .filter(|pair| pair[1] != pair[0].wrapping_add(1))
             .count();
         assert!(gaps >= 1, "played {played:?}");
+    }
+
+    #[test]
+    fn a_burst_plays_from_the_newest_frames() {
+        let mut jitter = Jitter::new();
+        for seq in 1..=50 {
+            jitter.push(seq, vec![seq as u8]);
+        }
+        assert_eq!(jitter.pull(), Play::Packet(vec![47]));
+        assert_eq!(jitter.pull(), Play::Packet(vec![48]));
+    }
+
+    #[test]
+    fn tcp_waits_longer_and_still_drops_a_burst() {
+        let mut jitter = Jitter::tcp();
+        for seq in 1..=4 {
+            jitter.push(seq, vec![seq as u8]);
+        }
+        assert_eq!(jitter.pull(), Play::Wait);
+        jitter.push(5, vec![5]);
+        assert_eq!(jitter.pull(), Play::Packet(vec![1]));
+        for seq in 6..=40 {
+            jitter.push(seq, vec![seq as u8]);
+        }
+        assert_eq!(jitter.pull(), Play::Packet(vec![35]));
     }
 }

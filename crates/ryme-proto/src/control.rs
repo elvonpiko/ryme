@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use crate::ProtoError;
 
 pub const MAX_NAME: usize = 32;
+/// A name may be 32 characters. CJK is more than one byte, so the byte cap is wider.
+pub const NAME_BYTES: usize = 128;
 pub const MAX_CHANNEL: usize = 32;
 pub const MAX_CHAT: usize = 400;
 
@@ -90,6 +92,21 @@ pub enum ServerMsg {
     },
 }
 
+/// A display name: trimmed, no control characters, at most 32 characters and
+/// [`NAME_BYTES`] bytes.
+pub fn clean_name(value: &str) -> Result<String, ProtoError> {
+    let trimmed = value.trim();
+    let chars = trimmed.chars().count();
+    if trimmed.is_empty()
+        || chars > MAX_NAME
+        || trimmed.len() > NAME_BYTES
+        || trimmed.chars().any(|c| c.is_control())
+    {
+        return Err(ProtoError::Invalid);
+    }
+    Ok(trimmed.to_string())
+}
+
 pub fn clean_label(value: &str, max: usize) -> Result<String, ProtoError> {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.len() > max || trimmed.chars().any(|c| c.is_control()) {
@@ -106,7 +123,7 @@ pub fn normalize_client(msg: ClientMsg) -> Result<ClientMsg, ProtoError> {
             pass,
             resume,
         } => ClientMsg::Hello {
-            name: clean_label(&name, MAX_NAME)?,
+            name: clean_name(&name)?,
             card,
             pass,
             resume,
@@ -144,7 +161,7 @@ pub fn normalize_server(msg: ServerMsg) -> Result<ServerMsg, ProtoError> {
             card,
         } => ServerMsg::PeerJoined {
             user_id,
-            name: clean_label(&name, MAX_NAME)?,
+            name: clean_name(&name)?,
             card,
         },
         ServerMsg::Chat { user_id, text } => ServerMsg::Chat {
@@ -152,7 +169,7 @@ pub fn normalize_server(msg: ServerMsg) -> Result<ServerMsg, ProtoError> {
             text: clean_label(&text, MAX_CHAT)?,
         },
         ServerMsg::Past { name, text, mine } => ServerMsg::Past {
-            name: clean_label(&name, MAX_NAME)?,
+            name: clean_name(&name)?,
             text: clean_label(&text, MAX_CHAT)?,
             mine,
         },
@@ -166,7 +183,13 @@ mod tests {
 
     #[test]
     fn trims_a_name() {
-        assert_eq!(clean_label("  Mara  ", MAX_NAME).unwrap(), "Mara");
+        assert_eq!(clean_name("  Mara  ").unwrap(), "Mara");
+        let cjk = "你".repeat(20);
+        assert_eq!(clean_name(&cjk).unwrap(), cjk);
+        assert_eq!(
+            clean_name(&"你".repeat(MAX_NAME + 1)).unwrap_err(),
+            ProtoError::Invalid
+        );
     }
 
     #[test]

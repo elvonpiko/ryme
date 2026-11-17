@@ -262,6 +262,24 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
         }
     });
 
+    ui.on_copy_link({
+        let ui_weak = ui.as_weak();
+        let rt = rt.clone();
+        let notices = notices.clone();
+        move |link| {
+            let copied = copy_text(link.as_str());
+            if let Some(ui) = ui_weak.upgrade() {
+                toast(
+                    &ui,
+                    &rt,
+                    &notices,
+                    if copied { "Copied." } else { "Could not copy." },
+                    !copied,
+                );
+            }
+        }
+    });
+
     ui.on_set_mute({
         let slot = slot.clone();
         move |muted| {
@@ -1543,11 +1561,73 @@ fn lines(room: &Room) -> ModelRc<Line> {
         .iter()
         .map(|(author, body, mine)| Line {
             author: author.clone().into(),
-            body: body.clone().into(),
+            link: first_link(body).into(),
+            body: chat_body(body).into(),
             mine: *mine,
         })
         .collect::<Vec<_>>();
     ModelRc::new(VecModel::from(lines))
+}
+
+/// The first http, https, or steam address in a line. Empty when there is none.
+fn first_link(text: &str) -> String {
+    const SCHEMES: [&str; 3] = ["https://", "http://", "steam://"];
+    let folded = text.to_ascii_lowercase();
+    let Some(start) = SCHEMES
+        .iter()
+        .filter_map(|scheme| folded.find(scheme))
+        .min()
+    else {
+        return String::new();
+    };
+    let rest = &text[start..];
+    let end = rest
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map(|(index, _)| index)
+        .unwrap_or(rest.len());
+    let url = rest[..end].trim_end_matches(|ch: char| {
+        matches!(
+            ch,
+            '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '"' | '\''
+        )
+    });
+    let folded_url = url.to_ascii_lowercase();
+    if SCHEMES
+        .iter()
+        .any(|scheme| folded_url.starts_with(scheme) && url.len() > scheme.len())
+    {
+        url.to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn copy_text(text: &str) -> bool {
+    arboard::Clipboard::new()
+        .and_then(|mut clipboard| clipboard.set_text(text))
+        .is_ok()
+}
+
+/// Break a long token so the small card can wrap it. The mark is invisible.
+fn chat_body(text: &str) -> String {
+    const RUN: usize = 16;
+    let mut out = String::new();
+    let mut run = 0usize;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            run = 0;
+            out.push(ch);
+            continue;
+        }
+        if run == RUN {
+            out.push('\u{200b}');
+            run = 0;
+        }
+        out.push(ch);
+        run += 1;
+    }
+    out
 }
 
 fn member(peer: &Peer, speaking: bool) -> Member {
@@ -1630,8 +1710,8 @@ fn pursue(
 #[cfg(test)]
 mod tests {
     use super::{
-        arrival, explain, next_try, pace, place_label, Arrival, Room, AGAIN_WAIT, ATTEMPTS,
-        QUIET_WAIT,
+        arrival, chat_body, explain, first_link, next_try, pace, place_label, Arrival, Room,
+        AGAIN_WAIT, ATTEMPTS, QUIET_WAIT,
     };
     use ryme_proto::Invite;
     use ryme_server::{Event, LinkError};
@@ -1647,6 +1727,30 @@ mod tests {
         assert_eq!(next_try(1, true), Some(2));
         assert_eq!(next_try(2, true), None);
         assert_eq!(next_try(2, false), Some(0));
+    }
+
+    #[test]
+    fn a_long_token_can_wrap_inside_the_card() {
+        assert_eq!(chat_body("hello there"), "hello there");
+        let shown = chat_body("https://example.com/this/is/a/very/long/path");
+        let longest = shown
+            .split(|ch: char| ch.is_whitespace() || ch == '\u{200b}')
+            .map(|piece| piece.chars().count())
+            .max()
+            .unwrap_or(0);
+        assert!(longest <= 16, "a run of {longest} still cannot wrap");
+        assert!(shown.contains('\u{200b}'));
+    }
+
+    #[test]
+    fn a_link_is_the_address_without_the_trailing_period() {
+        assert_eq!(first_link("be right back"), "");
+        assert_eq!(
+            first_link("see https://store.steampowered.com/app/570."),
+            "https://store.steampowered.com/app/570"
+        );
+        assert_eq!(first_link("steam://run/730"), "steam://run/730");
+        assert_eq!(first_link("https://"), "");
     }
 
     #[test]

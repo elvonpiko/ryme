@@ -4,6 +4,7 @@ version = "0.1.38"
 edition = "2021"
 
 [dependencies]
+arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
 bytes = "1.12.1"
 magnum-opus = "0.3.2"
 rtrb = "0.4.1"

@@ -6,7 +6,7 @@ export struct Member { name: string, initial: string, tint: color, muted: bool, 
 export struct Seat { name: string, initial: string, tint: color, muted: bool, speaking: bool, id: int, quiet: bool, mine: bool, gain: float }
 export struct Band { seats: [Seat] }
 export struct Channel { name: string, members: [Member] }
-export struct Line { author: string, body: string, mine: bool }
+export struct Line { author: string, body: string, mine: bool, link: string }
 
 global Theme {
     // Charcoal shell. Lime is the only sharp color, and it is reserved for controls.
@@ -219,11 +219,14 @@ component Field inherits Rectangle {
         clip: true;
         background: transparent;
 
+        // The field stays one line wide. The text itself is as wide as what
+        // was typed, and this box clips it. shift keeps the caret in view,
+        // including when Right moves into letters that were past the edge.
         edit := TextInput {
-            property <length> computed-x: 0px;
-            x: min(0px, max(parent.width - self.width - self.text-cursor-width, self.computed-x));
+            property <length> shift: 0px;
+            x: self.shift;
             y: 0px;
-            width: parent.width;
+            width: max(parent.width, self.preferred-width);
             height: parent.height;
             vertical-alignment: center;
             text <=> root.value;
@@ -233,11 +236,19 @@ component Field inherits Rectangle {
             font-size: 14px;
             selection-background-color: Theme.signal;
             selection-foreground-color: Theme.bg;
+            function show-caret(cursor-x: length) {
+                if (cursor-x + self.shift < 2px) {
+                    self.shift = min(0px, 2px - cursor-x);
+                } else if (cursor-x + self.shift > parent.width - self.text-cursor-width - 2px) {
+                    self.shift = min(0px, parent.width - cursor-x - self.text-cursor-width - 2px);
+                }
+            }
             cursor-position-changed(cursor-position) => {
-                if (cursor-position.x + self.computed-x < 2px) {
-                    self.computed-x = -cursor-position.x + 2px;
-                } else if (cursor-position.x + self.computed-x > parent.width - 2px - self.text-cursor-width) {
-                    self.computed-x = parent.width - cursor-position.x - 2px - self.text-cursor-width;
+                self.show-caret(cursor-position.x);
+            }
+            changed text => {
+                if (self.preferred-width + self.shift < parent.width) {
+                    self.shift = min(0px, parent.width - self.preferred-width);
                 }
             }
             key-pressed(event) => {
@@ -444,6 +455,7 @@ export component MainWindow inherits Window {
     callback minimize();
     callback submit-join();
     callback send-chat(string);
+    callback copy-link(string);
     callback set-mute(bool);
     callback set-deafen(bool);
     callback leave-channel();
@@ -1101,22 +1113,41 @@ export component MainWindow inherits Window {
                         padding-right: 22px;
                         padding-top: 10px;
                         padding-bottom: 12px;
-                        spacing: 8px;
-                        for line in root.lines : HorizontalLayout {
-                            spacing: 10px;
-                            Text {
-                                text: line.author;
-                                width: 72px;
-                                overflow: elide;
-                                color: line.mine ? Theme.ink : Theme.muted;
-                                font-family: Theme.sans;
-                                font-size: 13px;
-                                font-weight: 500;
+                        spacing: 10px;
+                        // Name on its own line, then the words underneath, both
+                        // held to this column so a long line stays inside the card.
+                        for line in root.lines : VerticalLayout {
+                            spacing: 1px;
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Text {
+                                    text: line.author;
+                                    horizontal-stretch: 1;
+                                    overflow: elide;
+                                    wrap: no-wrap;
+                                    color: line.mine ? Theme.ink : Theme.muted;
+                                    font-family: Theme.sans;
+                                    font-size: 12px;
+                                    font-weight: 500;
+                                    vertical-alignment: center;
+                                }
+                                if line.link != "" : Text {
+                                    text: "Copy";
+                                    color: copy-hit.has-hover ? Theme.signal : Theme.muted;
+                                    font-family: Theme.sans;
+                                    font-size: 12px;
+                                    font-weight: 500;
+                                    vertical-alignment: center;
+                                    copy-hit := TouchArea {
+                                        clicked => { root.copy-link(line.link); }
+                                    }
+                                }
                             }
                             Text {
                                 text: line.body;
-                                horizontal-stretch: 1;
+                                width: 100%;
                                 wrap: word-wrap;
+                                overflow: clip;
                                 color: Theme.ink;
                                 font-family: Theme.sans;
                                 font-size: 14px;

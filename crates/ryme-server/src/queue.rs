@@ -135,11 +135,11 @@ pub fn limit_send_buffer(stream: &tokio::net::TcpStream) {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::io::AsRawSocket;
+        use std::os::windows::io::{AsRawSocket, RawSocket};
         #[link(name = "ws2_32")]
         unsafe extern "system" {
             fn setsockopt(
-                s: usize,
+                s: RawSocket,
                 level: i32,
                 optname: i32,
                 optval: *const i8,

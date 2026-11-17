@@ -463,6 +463,9 @@ export component MainWindow inherits Window {
     in-out property <bool> joining: false;
     in-out property <bool> reconnecting: false;
     in-out property <bool> tcp: false;
+    in-out property <bool> ping-on: false;
+    in-out property <bool> ping-hot: false;
+    in-out property <string> ping-text: "";
     in-out property <string> toast: "";
     in-out property <bool> toast-danger: true;
     in-out property <bool> confirming: false;
@@ -1140,6 +1143,21 @@ export component MainWindow inherits Window {
                                 alignment: space-between;
                                 Text { text: "Name"; color: Theme.ink; font-family: Theme.sans; font-size: 14px; font-weight: 500; vertical-alignment: center; }
                                 Text { text: root.display-name; color: Theme.muted; font-family: Theme.sans; font-size: 14px; vertical-alignment: center; }
+                            }
+                        }
+                        if root.ping-on : Rectangle {
+                            height: 34px;
+                            HorizontalLayout {
+                                alignment: space-between;
+                                Text { text: "Ping"; color: Theme.ink; font-family: Theme.sans; font-size: 14px; font-weight: 500; vertical-alignment: center; }
+                                Text {
+                                    text: root.ping-text;
+                                    color: root.ping-hot ? Theme.danger : Theme.signal;
+                                    font-family: Theme.sans;
+                                    font-size: 13px;
+                                    font-weight: 500;
+                                    vertical-alignment: center;
+                                }
                             }
                         }
                         Rectangle {

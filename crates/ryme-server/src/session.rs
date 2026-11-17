@@ -317,6 +317,11 @@ fn drain_frames(
         match decode_client_frame(buf)? {
             Some((msg, n)) => {
                 buf.drain(..n);
+                if let ClientMsg::Ping { token } = msg {
+                    // A full control queue drops the echo. It does not close the call.
+                    let _ = pipes.control.try_send(ServerMsg::Pong { token });
+                    continue;
+                }
                 if !pace.allow(false) {
                     return Ok(false);
                 }

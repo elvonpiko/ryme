@@ -100,6 +100,12 @@ impl Hub {
             ClientMsg::Chat { text } => self.chat(user, text),
             ClientMsg::Mute { muted } => self.mute(user, muted),
             ClientMsg::Deafen { deafened } => self.deafen(user, deafened),
+            ClientMsg::Ping { .. } => Step {
+                user_id: user,
+                replace: None,
+                to_self: Vec::new(),
+                to_others: Vec::new(),
+            },
         }
     }
 

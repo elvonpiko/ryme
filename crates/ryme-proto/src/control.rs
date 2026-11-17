@@ -39,6 +39,10 @@ pub enum ClientMsg {
     Deafen {
         deafened: bool,
     },
+    /// A token the server echoes. It is not a voice packet.
+    Ping {
+        token: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +77,10 @@ pub enum ServerMsg {
     Muted {
         user_id: u32,
         muted: bool,
+    },
+    /// The token from `Ping`, unchanged.
+    Pong {
+        token: u64,
     },
 }
 

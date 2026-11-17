@@ -70,6 +70,8 @@ pub struct Live {
     pub resume: [u8; 32],
     /// The QUIC handshake did not finish, so this session is TLS on TCP.
     pub tcp: bool,
+    /// Latest round trip in milliseconds. `None` until the first sample.
+    pub delay: tokio::sync::watch::Receiver<Option<u32>>,
 }
 
 /// Voice packets cross here so the audio thread never waits on the socket.
@@ -270,6 +272,7 @@ async fn finish_quic(
     let (event_tx, events) = unbounded_channel();
     let (voice_out_tx, voice_out_rx) = tokio::sync::mpsc::channel(32);
     let (voice_in_tx, voice_in_rx) = std::sync::mpsc::sync_channel(64);
+    let (delay_tx, delay) = tokio::sync::watch::channel(None);
     tokio::spawn(run(
         endpoint,
         conn,
@@ -280,6 +283,7 @@ async fn finish_quic(
         event_tx,
         voice_out_rx,
         voice_in_tx,
+        delay_tx,
     ));
 
     Ok(Live {
@@ -295,6 +299,7 @@ async fn finish_quic(
         },
         resume,
         tcp: false,
+        delay,
     })
 }
 
@@ -345,12 +350,17 @@ async fn finish_tcp(
     let (voice_in_tx, voice_in_rx) = std::sync::mpsc::sync_channel(64);
     let (dead_tx, dead_rx) = tokio::sync::watch::channel(false);
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let clock = std::time::Instant::now();
+    let (pending_tx, pending_rx) = tokio::sync::watch::channel(None::<u64>);
+    let (delay_tx, delay) = tokio::sync::watch::channel(None);
     tokio::spawn(write_tcp_out(
         write,
         voice_out_rx,
         cmd_rx,
         dead_tx.clone(),
         stop_tx,
+        clock,
+        pending_tx,
     ));
     tokio::spawn(read_tcp_in(
         read,
@@ -359,6 +369,9 @@ async fn finish_tcp(
         voice_in_tx,
         dead_tx,
         stop_rx,
+        clock,
+        pending_rx,
+        delay_tx,
     ));
     tokio::spawn(watch_tcp(dead_rx, event_tx));
 
@@ -375,6 +388,7 @@ async fn finish_tcp(
         },
         resume,
         tcp: true,
+        delay,
     })
 }
 
@@ -483,9 +497,13 @@ async fn write_tcp_out<W>(
     mut cmd_rx: UnboundedReceiver<Cmd>,
     dead: tokio::sync::watch::Sender<bool>,
     stop: tokio::sync::watch::Sender<bool>,
+    clock: std::time::Instant,
+    pending: tokio::sync::watch::Sender<Option<u64>>,
 ) where
     W: AsyncWrite + Unpin,
 {
+    let mut pulse = tokio::time::interval(Duration::from_secs(1));
+    pulse.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             biased;
@@ -498,6 +516,16 @@ async fn write_tcp_out<W>(
                 }
                 let Some(msg) = cmd_msg(cmd) else { continue };
                 let Ok(frame) = encode_client(&msg) else { break };
+                if !write_one(&mut write, TCP_CONTROL, &frame).await {
+                    break;
+                }
+            }
+            _ = pulse.tick() => {
+                let token = clock.elapsed().as_micros() as u64;
+                let _ = pending.send(Some(token));
+                let Ok(frame) = encode_client(&ClientMsg::Ping { token }) else {
+                    break;
+                };
                 if !write_one(&mut write, TCP_CONTROL, &frame).await {
                     break;
                 }
@@ -535,6 +563,9 @@ async fn read_tcp_in<R>(
     voice_in: std::sync::mpsc::SyncSender<Vec<u8>>,
     dead: tokio::sync::watch::Sender<bool>,
     mut stop: tokio::sync::watch::Receiver<bool>,
+    clock: std::time::Instant,
+    pending: tokio::sync::watch::Receiver<Option<u64>>,
+    delay: tokio::sync::watch::Sender<Option<u32>>,
 ) where
     R: AsyncRead + Unpin,
 {
@@ -559,7 +590,7 @@ async fn read_tcp_in<R>(
             break;
         }
         acc.extend_from_slice(&tmp[..n]);
-        if !drain_tcp_in(&mut acc, &events, &voice_in) {
+        if !drain_tcp_in(&mut acc, &events, &voice_in, clock, &pending, &delay) {
             break;
         }
     }
@@ -572,6 +603,9 @@ fn drain_tcp_in(
     acc: &mut Vec<u8>,
     events: &UnboundedSender<Event>,
     voice_in: &std::sync::mpsc::SyncSender<Vec<u8>>,
+    clock: std::time::Instant,
+    pending: &tokio::sync::watch::Receiver<Option<u64>>,
+    delay: &tokio::sync::watch::Sender<Option<u32>>,
 ) -> bool {
     loop {
         match decode_tagged(acc) {
@@ -586,7 +620,10 @@ fn drain_tcp_in(
                     return false;
                 }
                 let mut body = owned;
-                if !drain(&mut body, events) || !body.is_empty() {
+                if !drain(&mut body, events, |token| {
+                    note_pong(clock, pending, delay, token);
+                }) || !body.is_empty()
+                {
                     return false;
                 }
             }
@@ -689,12 +726,19 @@ async fn run(
     events: UnboundedSender<Event>,
     mut voice_out: tokio::sync::mpsc::Receiver<Vec<u8>>,
     voice_in: std::sync::mpsc::SyncSender<Vec<u8>>,
+    delay: tokio::sync::watch::Sender<Option<u32>>,
 ) {
     let mut tmp = [0u8; 2048];
     let mut intentional = false;
     let mut voice_open = true;
+    let mut pulse = tokio::time::interval(Duration::from_secs(1));
+    pulse.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            _ = pulse.tick() => {
+                let ms = u32::try_from(conn.rtt().as_millis()).unwrap_or(u32::MAX);
+                let _ = delay.send(Some(ms.min(9_999)));
+            }
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 if !handle_cmd(&mut send, cmd, &mut intentional).await {
@@ -705,7 +749,7 @@ async fn run(
                 match read {
                     Ok(Some(n)) if n > 0 => {
                         buf.extend_from_slice(&tmp[..n]);
-                        if !drain(&mut buf, &events) {
+                        if !drain(&mut buf, &events, |_| {}) {
                             break;
                         }
                     }
@@ -755,7 +799,28 @@ async fn handle_cmd(send: &mut quinn::SendStream, cmd: Cmd, intentional: &mut bo
     write_msg(send, &msg).await.is_ok()
 }
 
-fn drain(buf: &mut Vec<u8>, events: &UnboundedSender<Event>) -> bool {
+fn note_pong(
+    clock: std::time::Instant,
+    pending: &tokio::sync::watch::Receiver<Option<u64>>,
+    delay: &tokio::sync::watch::Sender<Option<u32>>,
+    token: u64,
+) {
+    if pending.borrow().is_none_or(|sent| sent != token) {
+        return;
+    }
+    let now = clock.elapsed().as_micros() as u64;
+    if token > now {
+        return;
+    }
+    let ms = u32::try_from((now - token) / 1000).unwrap_or(u32::MAX);
+    let _ = delay.send(Some(ms.min(9_999)));
+}
+
+fn drain(
+    buf: &mut Vec<u8>,
+    events: &UnboundedSender<Event>,
+    mut on_pong: impl FnMut(u64),
+) -> bool {
     loop {
         match decode_server_frame(buf) {
             Ok(Some((msg, n))) => {
@@ -784,6 +849,10 @@ fn drain(buf: &mut Vec<u8>, events: &UnboundedSender<Event>) -> bool {
                     ServerMsg::Muted { user_id, muted } => Event::Muted { user_id, muted },
                     ServerMsg::Left => Event::Left,
                     ServerMsg::Reject { reason } => Event::Rejected { reason },
+                    ServerMsg::Pong { token } => {
+                        on_pong(token);
+                        continue;
+                    }
                     _ => continue,
                 };
                 if events.send(event).is_err() {
@@ -972,6 +1041,45 @@ mod tests {
         assert_eq!(voice.payload, vec![1, 2, 3, 4]);
         assert!(mara.voice.try_recv().is_none());
         assert!(!mara.tcp);
+    }
+
+    async fn next_delay(delay: &mut tokio::sync::watch::Receiver<Option<u32>>) -> u32 {
+        if let Some(ms) = *delay.borrow() {
+            return ms;
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                delay.changed().await.expect("delay watch");
+                if let Some(ms) = *delay.borrow_and_update() {
+                    return ms;
+                }
+            }
+        })
+        .await
+        .expect("delay sample")
+    }
+
+    #[tokio::test]
+    async fn quic_reports_its_own_round_trip() {
+        let (port, fingerprint, pass, _task) = up().await;
+        let mut live = connect(&invite(port, fingerprint, pass), "Mara", 1, [0; 32])
+            .await
+            .unwrap();
+        assert!(!live.tcp);
+        let ms = next_delay(&mut live.delay).await;
+        assert!(ms <= 9_999);
+    }
+
+    #[tokio::test]
+    async fn tcp_echoes_a_round_trip_without_voice() {
+        let (port, fingerprint, pass, _task) = up().await;
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let mut live = connect_tcp(addr, fingerprint, "Mara", 1, pass, [0; 32])
+            .await
+            .unwrap();
+        assert!(live.tcp);
+        let ms = next_delay(&mut live.delay).await;
+        assert!(ms <= 9_999);
     }
 
     #[tokio::test]

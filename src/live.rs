@@ -663,6 +663,7 @@ fn begin(
     let gen = bump(slot);
     ui.set_reconnecting(retry);
     ui.set_joining(true);
+    ui.set_ping_on(false);
     ui.set_toast("".into());
     let weak = ui.as_weak();
     let slot = slot.clone();
@@ -778,9 +779,23 @@ fn begin(
                     });
                 }
                 let mut events = live.events;
+                let mut delay = live.delay;
                 let mut speak_open = true;
                 loop {
                     tokio::select! {
+                        changed = delay.changed() => {
+                            if changed.is_err() {
+                                continue;
+                            }
+                            let Some(ms) = *delay.borrow_and_update() else {
+                                continue;
+                            };
+                            let tcp = slot.lock().unwrap().tcp;
+                            let weak = weak.clone();
+                            let _ = weak.upgrade_in_event_loop(move |ui| {
+                                show_ping(&ui, ms, tcp);
+                            });
+                        }
                         heard = speak_rx.recv(), if speak_open => {
                             match heard {
                                 Some((id, on)) => {
@@ -838,6 +853,7 @@ fn begin(
                                     ui.set_panel(0);
                                     ui.set_reconnecting(true);
                                     ui.set_joining(false);
+                                    ui.set_ping_on(false);
                                     ui.set_toast("".into());
                                 });
                                 pursue(&task_rt, &weak, &slot, &notices, 0, retry_gen);
@@ -1052,6 +1068,16 @@ fn send(slot: &Arc<Mutex<Slot>>, f: impl FnOnce(&Link)) {
     }
 }
 
+const PING_EASY: u32 = 80;
+
+fn show_ping(ui: &MainWindow, ms: u32, tcp: bool) {
+    let ms = ms.min(9_999);
+    let path = if tcp { "TCP" } else { "QUIC" };
+    ui.set_ping_text(format!("{ms} ms · {path}").into());
+    ui.set_ping_hot(ms > PING_EASY);
+    ui.set_ping_on(true);
+}
+
 fn show(weak: &Weak<MainWindow>, slot: &Arc<Mutex<Slot>>, gen: u64, room: &Room, entered: bool) {
     let room = room.clone();
     let slot = slot.clone();
@@ -1130,6 +1156,7 @@ fn clear(ui: &MainWindow) {
     ui.set_joining(false);
     ui.set_reconnecting(false);
     ui.set_tcp(false);
+    ui.set_ping_on(false);
     ui.set_joined(-1);
     ui.set_panel(0);
     ui.set_muted(false);

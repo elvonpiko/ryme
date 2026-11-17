@@ -210,6 +210,9 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+          # The image job also leaves a Docker cache artifact. It is not a zip,
+          # and downloading every artifact makes the release fail.
+          pattern: "{ryme,Ryme}-*"
       - name: checksums
         run: |
           cd dist

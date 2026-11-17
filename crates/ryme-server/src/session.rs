@@ -16,7 +16,9 @@ use tokio::sync::watch;
 use crate::hub::{Hub, Step};
 use crate::identity;
 
-const CONTROL_QUEUE: usize = 16;
+/// Room history is up to 200 lines, sent when someone joins. The queue has to
+/// hold that burst. A frame that does not fit is dropped; it does not end the call.
+const CONTROL_QUEUE: usize = 256;
 const TCP_VOICE_QUEUE: usize = 6;
 const MAX_CONNECTIONS: usize = 64;
 const CONTROL_PER_SECOND: u32 = 30;
@@ -287,8 +289,10 @@ pub async fn run(conn: quinn::Connection, world: Arc<Mutex<World>>) {
             datagram = conn.read_datagram() => {
                 match datagram {
                     Ok(packet) => {
+                        // A burst over the cap is discarded. Hanging up here is
+                        // what made a live microphone reconnect every few seconds.
                         if !pace.allow(true) {
-                            break;
+                            continue;
                         }
                         let Some(id) = user_id else { continue };
                         world.lock().expect("hub").voice(id, packet);
@@ -463,7 +467,7 @@ fn drain_tcp(
             }
             TCP_VOICE => {
                 if !pace.allow(true) {
-                    return false;
+                    continue;
                 }
                 let Some(id) = *user_id else { continue };
                 world.lock().expect("hub").voice(id, Bytes::from(frame.1));
@@ -534,9 +538,7 @@ where
 }
 
 fn offer_control(pipes: &Pipes, msg: ServerMsg) {
-    if pipes.control.try_send(msg).is_err() {
-        let _ = pipes.close.try_send(());
-    }
+    let _ = pipes.control.try_send(msg);
 }
 
 struct Pace {

@@ -1178,4 +1178,52 @@ mod tests {
         assert_ne!(second.me, first.me);
         assert_ne!(second.resume, first.resume);
     }
+
+    async fn voice_holds(mut live: Live, frames_per_sec: u64, secs: u64) -> Result<Live, Duration> {
+        let packet = ryme_proto::encode_voice(&ryme_proto::VoicePacket {
+            speaker: 0,
+            seq: 1,
+            timestamp: 480,
+            flags: 0,
+            payload: vec![1, 2, 3, 4],
+        })
+        .unwrap();
+        let start = std::time::Instant::now();
+        let gap = Duration::from_nanos(1_000_000_000 / frames_per_sec.max(1));
+        let stop = Duration::from_secs(secs);
+        while start.elapsed() < stop {
+            if let Ok(Event::Disconnected) = live.events.try_recv() {
+                return Err(start.elapsed());
+            }
+            live.voice.send(packet.clone());
+            tokio::time::sleep(gap).await;
+        }
+        if let Ok(Event::Disconnected) = live.events.try_recv() {
+            return Err(start.elapsed());
+        }
+        Ok(live)
+    }
+
+    #[tokio::test]
+    async fn tcp_voice_at_speaking_rate_stays_up() {
+        let (port, fingerprint, pass, _task) = up().await;
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let live = connect_tcp(addr, fingerprint, "Mara", 1, pass, [0; 32])
+            .await
+            .unwrap();
+        let live = match voice_holds(live, 100, 3).await {
+            Ok(live) => live,
+            Err(after) => panic!("tcp voice at 100/s dropped after {after:?}"),
+        };
+        let mut live = match voice_holds(live, 200, 3).await {
+            Ok(live) => live,
+            Err(after) => panic!("tcp voice at 200/s dropped after {after:?}"),
+        };
+        live.link.chat("still here");
+        let chat = tokio::time::timeout(Duration::from_secs(2), live.events.recv())
+            .await
+            .expect("chat after a fast voice stream")
+            .expect("session ended");
+        assert!(matches!(chat, Event::Chat { .. }), "got {chat:?}");
+    }
 }

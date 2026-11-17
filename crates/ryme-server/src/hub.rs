@@ -24,10 +24,18 @@ struct User {
     resume: [u8; 32],
 }
 
+struct Said {
+    card: u64,
+    name: String,
+    text: String,
+}
+
 pub struct Hub {
     next_id: u32,
     users: HashMap<u32, User>,
     channels: Vec<String>,
+    /// Lines for each channel. Kept while anyone is connected, then dropped.
+    chat: HashMap<String, Vec<Said>>,
     pass: [u8; 32],
     locked: bool,
     banned: std::collections::HashSet<u64>,
@@ -39,6 +47,7 @@ impl Hub {
             next_id: 1,
             users: HashMap::new(),
             channels: vec!["Lobby".to_string()],
+            chat: HashMap::new(),
             pass,
             locked: false,
             banned: std::collections::HashSet::new(),
@@ -134,6 +143,16 @@ impl Hub {
     }
 
     pub fn disconnect(&mut self, id: u32) -> Vec<(u32, ServerMsg)> {
+        let gone = self.drop_user(id);
+        if self.users.is_empty() {
+            self.chat.clear();
+        }
+        gone
+    }
+
+    /// Remove a session without forgetting chat. A resume hello uses this so
+    /// the replacement is inserted before the room can look empty.
+    fn drop_user(&mut self, id: u32) -> Vec<(u32, ServerMsg)> {
         let Some(user) = self.users.remove(&id) else {
             return Vec::new();
         };
@@ -188,7 +207,7 @@ impl Hub {
                 })
                 .map(|(id, _)| *id);
             if let Some(old) = old {
-                to_others.extend(self.disconnect(old));
+                to_others.extend(self.drop_user(old));
                 replace = Some(old);
             }
         }
@@ -272,15 +291,25 @@ impl Hub {
         }));
         let members = self.members(&channel);
         let rooms = self.channels.clone();
+        let mut to_self = vec![ServerMsg::Joined {
+            channel: channel.clone(),
+            members,
+            rooms,
+        }];
+        if let Some(log) = self.chat.get(&channel) {
+            for line in log {
+                to_self.push(ServerMsg::Past {
+                    name: line.name.clone(),
+                    text: line.text.clone(),
+                    mine: line.card == card,
+                });
+            }
+        }
         tracing::info!(user_id = id, %channel, "joined");
         Step {
             user_id: Some(id),
             replace: None,
-            to_self: vec![ServerMsg::Joined {
-                channel,
-                members,
-                rooms,
-            }],
+            to_self,
             to_others,
         }
     }
@@ -315,6 +344,22 @@ impl Hub {
         let Some(channel) = self.users.get(&id).and_then(|u| u.channel.clone()) else {
             return reject(Some(id), "not in a channel");
         };
+        let (name, card) = self
+            .users
+            .get(&id)
+            .map(|user| (user.name.clone(), user.card))
+            .unwrap_or_default();
+        let log = self.chat.entry(channel.clone()).or_default();
+        log.push(Said {
+            card,
+            name,
+            text: text.clone(),
+        });
+        const CHAT_KEEP: usize = 200;
+        if log.len() > CHAT_KEEP {
+            let extra = log.len() - CHAT_KEEP;
+            log.drain(..extra);
+        }
         let msg = ServerMsg::Chat { user_id: id, text };
         let mut to_others = Vec::new();
         let mut to_self = Vec::new();
@@ -907,6 +952,83 @@ mod tests {
     }
 
     #[test]
+    fn chat_returns_on_join_and_leaves_when_the_server_is_empty() {
+        let mut hub = Hub::new([7; 32]);
+        let mara = hello(&mut hub, "Mara");
+        let jonas = hello(&mut hub, "Jonas");
+        let _ = hub.handle(
+            Some(mara),
+            ClientMsg::Join {
+                channel: "Lobby".into(),
+            },
+        );
+        let _ = hub.handle(
+            Some(jonas),
+            ClientMsg::Join {
+                channel: "Lobby".into(),
+            },
+        );
+        let _ = hub.handle(Some(mara), ClientMsg::Chat { text: "brb".into() });
+        hub.disconnect(jonas);
+
+        let back = hello(&mut hub, "Jonas");
+        let joined = hub.handle(
+            Some(back),
+            ClientMsg::Join {
+                channel: "Lobby".into(),
+            },
+        );
+        assert!(joined.to_self.iter().any(|msg| matches!(
+            msg,
+            ServerMsg::Past {
+                name,
+                text,
+                mine: false,
+            } if name == "Mara" && text == "brb"
+        )));
+
+        let welcome = hub.handle(
+            None,
+            ClientMsg::Hello {
+                name: "Mara".into(),
+                card: card_of("Mara"),
+                pass: [7; 32],
+                resume: hub
+                    .users
+                    .get(&mara)
+                    .map(|user| user.resume)
+                    .unwrap(),
+            },
+        );
+        let ServerMsg::Welcome { user_id, .. } = welcome.to_self[0] else {
+            panic!("welcome");
+        };
+        let rejoined = hub.handle(
+            Some(user_id),
+            ClientMsg::Join {
+                channel: "Lobby".into(),
+            },
+        );
+        assert!(rejoined.to_self.iter().any(|msg| matches!(
+            msg,
+            ServerMsg::Past { mine: true, text, .. } if text == "brb"
+        )));
+
+        hub.disconnect(back);
+        hub.disconnect(user_id);
+        let later = hello(&mut hub, "Ned");
+        let empty = hub.handle(
+            Some(later),
+            ClientMsg::Join {
+                channel: "Lobby".into(),
+            },
+        );
+        assert!(empty
+            .to_self
+            .iter()
+            .all(|msg| !matches!(msg, ServerMsg::Past { .. })));
+    }
+
     fn a_lock_and_a_ban_refuse_new_people() {
         let mut hub = Hub::new([7; 32]);
         let first = hub.handle(

@@ -82,6 +82,12 @@ pub enum ServerMsg {
     Pong {
         token: u64,
     },
+    /// A line from the channel, sent when someone joins. `mine` is that person's own earlier line.
+    Past {
+        name: String,
+        text: String,
+        mine: bool,
+    },
 }
 
 pub fn clean_label(value: &str, max: usize) -> Result<String, ProtoError> {
@@ -144,6 +150,11 @@ pub fn normalize_server(msg: ServerMsg) -> Result<ServerMsg, ProtoError> {
         ServerMsg::Chat { user_id, text } => ServerMsg::Chat {
             user_id,
             text: clean_label(&text, MAX_CHAT)?,
+        },
+        ServerMsg::Past { name, text, mine } => ServerMsg::Past {
+            name: clean_label(&name, MAX_NAME)?,
+            text: clean_label(&text, MAX_CHAT)?,
+            mine,
         },
         other => other,
     })

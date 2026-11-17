@@ -37,6 +37,12 @@ pub enum Event {
         user_id: u32,
         text: String,
     },
+    /// A line already in the channel when this client arrived.
+    Past {
+        name: String,
+        text: String,
+        mine: bool,
+    },
     Muted {
         user_id: u32,
         muted: bool,
@@ -846,6 +852,7 @@ fn drain(
                     },
                     ServerMsg::PeerLeft { user_id } => Event::PeerLeft { user_id },
                     ServerMsg::Chat { user_id, text } => Event::Chat { user_id, text },
+                    ServerMsg::Past { name, text, mine } => Event::Past { name, text, mine },
                     ServerMsg::Muted { user_id, muted } => Event::Muted { user_id, muted },
                     ServerMsg::Left => Event::Left,
                     ServerMsg::Reject { reason } => Event::Rejected { reason },

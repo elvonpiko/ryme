@@ -60,6 +60,7 @@ impl Room {
                 self.channel = channel;
                 self.members = members;
                 self.in_channel = true;
+                self.lines.clear();
                 if !rooms.is_empty() {
                     self.rooms = rooms;
                 }
@@ -94,11 +95,18 @@ impl Room {
                         .unwrap_or_else(|| "Someone".to_string())
                 };
                 self.lines.push((author, text, mine));
-                const CHAT_KEEP: usize = 200;
-                if self.lines.len() > CHAT_KEEP {
-                    let extra = self.lines.len() - CHAT_KEEP;
-                    self.lines.drain(..extra);
-                }
+                self.keep_lines();
+            }
+            Event::Past { name, text, mine } => {
+                let author = if mine {
+                    "You".to_string()
+                } else if name.is_empty() {
+                    "Someone".to_string()
+                } else {
+                    name
+                };
+                self.lines.push((author, text, mine));
+                self.keep_lines();
             }
             Event::Muted { user_id, muted } => {
                 if let Some(peer) = self.members.iter_mut().find(|peer| peer.user_id == user_id) {
@@ -111,6 +119,14 @@ impl Room {
                 self.speaking.clear();
             }
             Event::Rejected { .. } | Event::Disconnected => {}
+        }
+    }
+
+    fn keep_lines(&mut self) {
+        const CHAT_KEEP: usize = 200;
+        if self.lines.len() > CHAT_KEEP {
+            let extra = self.lines.len() - CHAT_KEEP;
+            self.lines.drain(..extra);
         }
     }
 }
@@ -770,7 +786,7 @@ fn begin(
                         me.muted = true;
                     }
                 }
-                show(&weak, &slot, gen, &room, true);
+                show(&weak, &slot, gen, &room, true, false);
                 let (speak_tx, mut speak_rx) = tokio::sync::mpsc::unbounded_channel();
                 let (input, output) = {
                     let guard = slot.lock().unwrap();
@@ -908,6 +924,7 @@ fn begin(
                             }
                             let joined = matches!(event, Event::Joined { .. });
                             let left = matches!(event, Event::Left);
+                            let fresh = matches!(&event, Event::Chat { user_id, .. } if *user_id != room.me);
                             room.apply(event);
                             if joined {
                                 let switches = {
@@ -940,7 +957,7 @@ fn begin(
                             if left {
                                 room.speaking.clear();
                             }
-                            show(&weak, &slot, gen, &room, false);
+                            show(&weak, &slot, gen, &room, false, fresh);
                         }
                     }
                 }
@@ -1213,7 +1230,14 @@ fn show_ping(ui: &MainWindow, ms: u32, tcp: bool) {
     ui.set_ping_on(true);
 }
 
-fn show(weak: &Weak<MainWindow>, slot: &Arc<Mutex<Slot>>, gen: u64, room: &Room, entered: bool) {
+fn show(
+    weak: &Weak<MainWindow>,
+    slot: &Arc<Mutex<Slot>>,
+    gen: u64,
+    room: &Room,
+    entered: bool,
+    fresh: bool,
+) {
     let room = room.clone();
     let slot = slot.clone();
     let _ = weak.upgrade_in_event_loop(move |ui| {
@@ -1239,6 +1263,10 @@ fn show(weak: &Weak<MainWindow>, slot: &Arc<Mutex<Slot>>, gen: u64, room: &Room,
         ui.set_reconnecting(false);
         if entered {
             ui.set_toast("".into());
+            ui.set_chat_dot(false);
+        }
+        if fresh && ui.get_panel() != 2 {
+            ui.set_chat_dot(true);
         }
         ui.set_inside(true);
         ui.set_joined(place(&room));
@@ -1287,6 +1315,7 @@ fn hearing(roster: &HashMap<u32, u64>, levels: &HashMap<u64, Level>) -> HashMap<
 }
 
 fn clear(ui: &MainWindow) {
+    ui.set_chat_dot(false);
     ui.set_inside(false);
     ui.set_joining(false);
     ui.set_reconnecting(false);
@@ -1498,6 +1527,34 @@ mod tests {
         assert_eq!(room.lines.len(), 200);
         assert_eq!(room.lines[0].1, "50");
         assert_eq!(room.lines.last().unwrap().1, "249");
+    }
+
+    #[test]
+    fn joining_a_channel_replaces_the_thread_with_its_history() {
+        let mut room = Room::new(1, "Lobby".into(), Vec::new(), vec!["Lobby".into()]);
+        room.apply(Event::Chat {
+            user_id: 2,
+            text: "gone".into(),
+        });
+        room.apply(Event::Joined {
+            channel: "Lobby".into(),
+            members: Vec::new(),
+            rooms: vec!["Lobby".into()],
+        });
+        assert!(room.lines.is_empty());
+        room.apply(Event::Past {
+            name: "Mara".into(),
+            text: "brb".into(),
+            mine: false,
+        });
+        room.apply(Event::Past {
+            name: "Mara".into(),
+            text: "back".into(),
+            mine: true,
+        });
+        assert_eq!(room.lines.len(), 2);
+        assert_eq!(room.lines[0].0, "Mara");
+        assert_eq!(room.lines[1].0, "You");
     }
 
     #[test]

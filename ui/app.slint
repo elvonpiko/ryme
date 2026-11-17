@@ -282,6 +282,7 @@ component Pill inherits Rectangle {
     in property <bool> active;
     in property <color> hue: Theme.signal;
     in property <bool> busy: false;
+    in property <bool> pip: false;
     // A short word stays 88px. A sentence ("Check for update") needs the wider capsule.
     in property <bool> wide: false;
     callback clicked;
@@ -407,6 +408,15 @@ component Pill inherits Rectangle {
         }
     }
 
+    if root.pip : Rectangle {
+        x: parent.width - 12px;
+        y: 4px;
+        width: 7px;
+        height: 7px;
+        border-radius: 4px;
+        background: Theme.signal;
+    }
+
     ta := TouchArea {
         width: 100%;
         height: 100%;
@@ -504,12 +514,16 @@ export component MainWindow inherits Window {
         }
     }
     changed panel => {
+        if (root.panel == 2) {
+            root.chat-dot = false;
+        }
         if (root.inside && root.panel != 2) {
             keys.focus();
         }
     }
     in-out property <[Channel]> channels: [];
     in-out property <[Line]> lines: [];
+    in-out property <bool> chat-dot: false;
 
     // "Up to date." is a confirmation, not a setting. It leaves so the page
     // settles back to the rows and the two buttons.
@@ -885,7 +899,7 @@ export component MainWindow inherits Window {
             alignment: start;
             Pill { glyph: "mic"; active: root.muted; clicked => { root.muted = !root.muted; root.set-mute(root.muted); } }
             Pill { glyph: "speaker"; active: root.deafened; clicked => { root.deafened = !root.deafened; root.set-deafen(root.deafened); } }
-            Pill { glyph: "chat"; clicked => { root.panel = 2; } }
+            Pill { glyph: "chat"; pip: root.chat-dot; clicked => { root.panel = 2; } }
             Pill { label: "Leave"; hue: Theme.danger; clicked => { root.leave-channel(); } }
         }
     }
@@ -1061,27 +1075,30 @@ export component MainWindow inherits Window {
                 }
             }
 
-            // The body is the card under the header. The field is anchored to
-            // that box, so an empty thread cannot pack the field up under the title.
-            if root.panel == 2 : Rectangle {
-                height: root.height - 57px;
+            // The list takes the space above the field, so a full thread
+            // scrolls inside that box and the last line stays above the field.
+            if root.panel == 2 : VerticalLayout {
+                vertical-stretch: 1;
                 chat-view := Flickable {
-                    width: parent.width;
-                    height: parent.height - max(composer.preferred-height, 64px);
+                    vertical-stretch: 1;
                     content-width: self.width;
                     content-height: chat-lines.preferred-height;
+                    property <bool> stick: true;
                     property <length> span: chat-lines.preferred-height;
                     changed span => {
-                        if (self.height > 0px) {
+                        if (self.stick && self.height > 0px) {
                             self.content-y = min(0px, self.height - self.span);
                         }
+                    }
+                    changed content-y => {
+                        self.stick = self.content-y <= min(0px, self.height - self.content-height) + 8px;
                     }
                     chat-lines := VerticalLayout {
                         width: parent.width;
                         padding-left: 22px;
                         padding-right: 22px;
                         padding-top: 10px;
-                        padding-bottom: 8px;
+                        padding-bottom: 12px;
                         spacing: 8px;
                         for line in root.lines : HorizontalLayout {
                             spacing: 10px;
@@ -1105,9 +1122,8 @@ export component MainWindow inherits Window {
                         }
                     }
                 }
-                composer := VerticalLayout {
-                    y: parent.height - max(self.preferred-height, 64px);
-                    width: parent.width;
+                VerticalLayout {
+                    vertical-stretch: 0;
                     padding-left: 22px;
                     padding-right: 22px;
                     padding-top: 12px;

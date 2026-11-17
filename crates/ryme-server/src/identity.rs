@@ -142,13 +142,7 @@ pub fn fingerprint_of(cert_der: &[u8]) -> [u8; 32] {
 }
 
 pub fn invite_url(host: &str, port: u16, fingerprint: &[u8; 32], pass: &[u8; 32]) -> String {
-    let host = host.trim_matches(|c| c == '[' || c == ']');
-    let fragment = format!("{}.{}", hex_encode(fingerprint), hex_encode(pass));
-    if host.contains(':') {
-        format!("ryme://[{host}]:{port}/#{fragment}")
-    } else {
-        format!("ryme://{host}:{port}/#{fragment}")
-    }
+    ryme_proto::format_invite(host, port, fingerprint, pass)
 }
 
 /// Admission token and the host's local control key. The certificate stays
@@ -228,16 +222,6 @@ pub fn same(left: &[u8], right: &[u8]) -> bool {
         diff |= a ^ b;
     }
     diff == 0
-}
-
-pub fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
 }
 
 #[derive(Debug)]

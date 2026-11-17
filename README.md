@@ -43,7 +43,7 @@ The short start is the image [ghcr.io/elvonpiko/ryme-server](https://github.com/
 curl -fsSL https://ryme.chat/install | bash
 ```
 
-`RYME_PUBLIC` is the one host friends use: the public IP, or a domain that points at it. The server listens on UDP and TCP 1542 and prints `ryme://that-host:1542/#…`. The client tries QUIC first. If that handshake is still unfinished after a moment, it also tries TLS on the same TCP port, and voice on that path is dropped when the socket stalls. The setup, the firewall, and a home router are on [ryme.chat](https://ryme.chat/docs/docker).
+`RYME_PUBLIC` is the one host friends use: the public IP, or a domain that points at it. The server listens on UDP and TCP 1542 and prints `https://ryme.chat/#that-host/…`. The client tries QUIC first. If that handshake is still unfinished after a moment, it also tries TLS on the same TCP port, and voice on that path is dropped when the socket stalls. The setup, the firewall, and a home router are on [ryme.chat](https://ryme.chat/docs/docker).
 
 ## Clients
 

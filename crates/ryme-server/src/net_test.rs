@@ -52,7 +52,9 @@ async fn two_clients_share_voice_until_one_mutes() {
     let port = server.port();
     let fingerprint = server.fingerprint();
     let pass = server.pass();
-    assert!(server.invite("127.0.0.1").contains(&format!(":{port}/#")));
+    let invite = server.invite("127.0.0.1");
+    assert!(invite.starts_with(&format!("https://ryme.chat/#127.0.0.1:{port}/")));
+    assert_eq!(ryme_proto::parse_invite(&invite).unwrap().port, port);
     tokio::spawn(async move {
         server.serve().await;
     });

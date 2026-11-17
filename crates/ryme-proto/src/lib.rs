@@ -18,7 +18,7 @@ pub use control::{ClientMsg, Member, ServerMsg, MAX_CHANNEL, MAX_CHAT, MAX_NAME}
 pub use frame::{
     decode_client_frame, decode_server_frame, encode_client, encode_server, MAX_FRAME,
 };
-pub use invite::{parse_invite, Invite};
+pub use invite::{format_invite, parse_invite, Invite, DEFAULT_PORT};
 pub use tcp::{decode_tagged, encode_tagged, TCP_CONTROL, TCP_MAX, TCP_VOICE};
 pub use voice::{
     decode_voice, encode_voice, stamp_speaker, VoicePacket, MAX_VOICE_PAYLOAD, VOICE_ENCRYPTED,

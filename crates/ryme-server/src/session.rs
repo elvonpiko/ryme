@@ -22,7 +22,9 @@ const MAX_CONNECTIONS: usize = 64;
 const CONTROL_PER_SECOND: u32 = 30;
 const VOICE_PER_SECOND: u32 = 120;
 const ADMIT_WAIT: Duration = Duration::from_secs(5);
-const WRITE_WAIT: Duration = Duration::from_secs(2);
+// A slow TCP write must not be cancelled. Two seconds was cutting a voice
+// frame in half on a laggy link and the session then dropped and reconnected.
+const WRITE_WAIT: Duration = Duration::from_secs(15);
 
 static OPEN: AtomicUsize = AtomicUsize::new(0);
 
@@ -502,7 +504,9 @@ async fn write_tcp<W>(
             }
             packet = voice_rx.recv() => {
                 let Some(packet) = packet else { break };
-                if !write_tagged(&mut write, TCP_VOICE, &packet).await {
+                // Voice waits for the socket. Cancelling it would split a frame,
+                // and a full queue already drops what the peer cannot take.
+                if write_frame(&mut write, TCP_VOICE, &packet).await.is_err() {
                     let _ = fail.send(true);
                     break;
                 }
@@ -511,18 +515,21 @@ async fn write_tcp<W>(
     }
 }
 
+async fn write_frame<W>(write: &mut W, tag: u8, payload: &[u8]) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let frame = encode_tagged(tag, payload)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "frame"))?;
+    write.write_all(&frame).await?;
+    write.flush().await
+}
+
 async fn write_tagged<W>(write: &mut W, tag: u8, payload: &[u8]) -> bool
 where
     W: AsyncWrite + Unpin,
 {
-    let Ok(frame) = encode_tagged(tag, payload) else {
-        return false;
-    };
-    let wrote = tokio::time::timeout(WRITE_WAIT, async {
-        write.write_all(&frame).await?;
-        write.flush().await
-    })
-    .await;
+    let wrote = tokio::time::timeout(WRITE_WAIT, write_frame(write, tag, payload)).await;
     matches!(wrote, Ok(Ok(())))
 }
 

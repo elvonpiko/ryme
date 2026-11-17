@@ -1029,6 +1029,7 @@ mod tests {
             .all(|msg| !matches!(msg, ServerMsg::Past { .. })));
     }
 
+    #[test]
     fn a_lock_and_a_ban_refuse_new_people() {
         let mut hub = Hub::new([7; 32]);
         let first = hub.handle(

@@ -836,6 +836,7 @@ fn begin(
                 let mut events = live.events;
                 let mut delay = live.delay;
                 let mut speak_open = true;
+                let born = std::time::Instant::now();
                 loop {
                     tokio::select! {
                         changed = delay.changed() => {
@@ -901,9 +902,19 @@ fn begin(
                                     break;
                                 };
                                 drop(ear);
+                                let young = born.elapsed() < QUICK_DROP;
                                 let weak = weak.clone();
                                 let slot = slot.clone();
                                 let notices = notices.clone();
+                                let Some(next) = next_try(attempt, young) else {
+                                    let rt = task_rt.clone();
+                                    let _ = weak.upgrade_in_event_loop(move |ui| {
+                                        clear(&ui);
+                                        listen_local(&slot);
+                                        note(&ui, &rt, &notices, "The call dropped.");
+                                    });
+                                    break;
+                                };
                                 let _ = weak.upgrade_in_event_loop(move |ui| {
                                     ui.set_panel(0);
                                     ui.set_reconnecting(true);
@@ -911,7 +922,7 @@ fn begin(
                                     ui.set_ping_on(false);
                                     ui.set_toast("".into());
                                 });
-                                pursue(&task_rt, &weak, &slot, &notices, 0, retry_gen);
+                                pursue(&task_rt, &weak, &slot, &notices, next, retry_gen);
                                 break;
                             }
                             if let Event::Rejected { reason } = &event {
@@ -1464,12 +1475,20 @@ fn explain(err: LinkError) -> String {
 const ATTEMPTS: u32 = 3;
 const QUIET_WAIT: Duration = Duration::from_secs(1);
 const AGAIN_WAIT: Duration = Duration::from_secs(4);
+const QUICK_DROP: Duration = Duration::from_secs(8);
 
 fn pace(attempt: u32) -> Option<Duration> {
     if attempt >= ATTEMPTS {
         return None;
     }
     Some(if attempt == 0 { QUIET_WAIT } else { AGAIN_WAIT })
+}
+
+/// A call that dies immediately uses up one of the three tries. A call that
+/// lasted comes back once, from the start of that count.
+fn next_try(attempt: u32, young: bool) -> Option<u32> {
+    let next = if young { attempt.saturating_add(1) } else { 0 };
+    pace(next).map(|_| next)
 }
 
 fn pursue(
@@ -1501,7 +1520,8 @@ fn pursue(
 #[cfg(test)]
 mod tests {
     use super::{
-        arrival, explain, pace, place_label, Arrival, Room, AGAIN_WAIT, ATTEMPTS, QUIET_WAIT,
+        arrival, explain, next_try, pace, place_label, Arrival, Room, AGAIN_WAIT, ATTEMPTS,
+        QUIET_WAIT,
     };
     use ryme_proto::Invite;
     use ryme_server::{Event, LinkError};
@@ -1513,6 +1533,10 @@ mod tests {
         assert_eq!(pace(ATTEMPTS - 1), Some(AGAIN_WAIT));
         assert_eq!(pace(ATTEMPTS), None);
         assert!(QUIET_WAIT < AGAIN_WAIT);
+        assert_eq!(next_try(0, true), Some(1));
+        assert_eq!(next_try(1, true), Some(2));
+        assert_eq!(next_try(2, true), None);
+        assert_eq!(next_try(2, false), Some(0));
     }
 
     #[test]

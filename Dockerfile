@@ -21,5 +21,6 @@ RUN chmod 0755 /usr/local/bin/ryme-server /usr/local/bin/ryme-entrypoint
 ENV RYME_DATA=/var/lib/ryme \
     RYME_BIND=0.0.0.0:1542
 EXPOSE 1542/udp
+EXPOSE 1542/tcp
 VOLUME ["/var/lib/ryme"]
 ENTRYPOINT ["/usr/local/bin/ryme-entrypoint"]

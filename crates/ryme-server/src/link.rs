@@ -1,10 +1,14 @@
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
-use ryme_proto::{decode_server_frame, encode_client, parse_invite, ClientMsg, Member, ServerMsg};
+use ryme_proto::{
+    decode_server_frame, decode_tagged, encode_client, encode_tagged, parse_invite, ClientMsg,
+    Member, ServerMsg, TCP_CONTROL, TCP_VOICE,
+};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use crate::identity::client_config;
+use crate::identity::{client_config, tls_client_config};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Peer {
@@ -64,6 +68,8 @@ pub struct Live {
     pub voice: VoicePipe,
     /// Secret for the next hello, so a reconnect replaces this session.
     pub resume: [u8; 32],
+    /// The QUIC handshake did not finish, so this session is TLS on TCP.
+    pub tcp: bool,
 }
 
 /// Voice packets cross here so the audio thread never waits on the socket.
@@ -129,6 +135,14 @@ pub enum LinkError {
     Rejected(String),
 }
 
+const TCP_AFTER: Duration = Duration::from_millis(300);
+const TCP_VOICE_QUEUE: usize = 6;
+
+enum Opened {
+    Quic(quinn::Endpoint, quinn::Connection),
+    Tcp(tokio_rustls::client::TlsStream<tokio::net::TcpStream>),
+}
+
 pub async fn connect(
     invite: &str,
     name: &str,
@@ -138,18 +152,84 @@ pub async fn connect(
     let parsed = parse_invite(invite).map_err(|_| LinkError::Invite)?;
     let addrs = addresses(&parsed.host, parsed.port)?;
     let mut last = LinkError::Unreachable;
-    let mut opened = None;
     for addr in addrs {
-        match dial(addr, parsed.fingerprint).await {
-            Ok(opened_conn) => {
-                opened = Some(opened_conn);
-                break;
+        match open(addr, parsed.fingerprint).await {
+            Ok(Opened::Quic(endpoint, conn)) => {
+                return finish_quic(endpoint, conn, name, card, parsed.pass, resume).await;
+            }
+            Ok(Opened::Tcp(stream)) => {
+                return finish_tcp(stream, name, card, parsed.pass, resume).await;
             }
             Err(LinkError::Pin) => return Err(LinkError::Pin),
             Err(err) => last = err,
         }
     }
-    let (endpoint, conn) = opened.ok_or(last)?;
+    Err(last)
+}
+
+/// TLS on TCP, without trying QUIC. The integration test calls this.
+#[cfg(test)]
+pub(crate) async fn connect_tcp(
+    addr: SocketAddr,
+    fingerprint: [u8; 32],
+    name: &str,
+    card: u64,
+    pass: [u8; 32],
+    resume: [u8; 32],
+) -> Result<Live, LinkError> {
+    let stream = dial_tcp(addr, fingerprint).await?;
+    finish_tcp(stream, name, card, pass, resume).await
+}
+
+async fn open(addr: SocketAddr, fingerprint: [u8; 32]) -> Result<Opened, LinkError> {
+    let mut quic = tokio::spawn(dial(addr, fingerprint));
+    let mut tcp = tokio::spawn(async move {
+        tokio::time::sleep(TCP_AFTER).await;
+        dial_tcp(addr, fingerprint).await
+    });
+    tokio::select! {
+        q = &mut quic => match q {
+            Ok(Ok((endpoint, conn))) => {
+                tcp.abort();
+                Ok(Opened::Quic(endpoint, conn))
+            }
+            Ok(Err(LinkError::Pin)) => {
+                tcp.abort();
+                Err(LinkError::Pin)
+            }
+            Ok(Err(err)) => match tcp.await {
+                Ok(Ok(stream)) => Ok(Opened::Tcp(stream)),
+                Ok(Err(LinkError::Pin)) => Err(LinkError::Pin),
+                _ => Err(err),
+            },
+            Err(_) => Err(LinkError::Unreachable),
+        },
+        t = &mut tcp => match t {
+            Ok(Ok(stream)) => {
+                quic.abort();
+                Ok(Opened::Tcp(stream))
+            }
+            Ok(Err(LinkError::Pin)) => {
+                quic.abort();
+                Err(LinkError::Pin)
+            }
+            _ => match quic.await {
+                Ok(Ok((endpoint, conn))) => Ok(Opened::Quic(endpoint, conn)),
+                Ok(Err(err)) => Err(err),
+                Err(_) => Err(LinkError::Unreachable),
+            },
+        },
+    }
+}
+
+async fn finish_quic(
+    endpoint: quinn::Endpoint,
+    conn: quinn::Connection,
+    name: &str,
+    card: u64,
+    pass: [u8; 32],
+    resume: [u8; 32],
+) -> Result<Live, LinkError> {
     let (mut send, mut recv) = conn.open_bi().await.map_err(|_| LinkError::Unreachable)?;
 
     write_msg(
@@ -157,7 +237,7 @@ pub async fn connect(
         &ClientMsg::Hello {
             name: name.to_string(),
             card,
-            pass: parsed.pass,
+            pass,
             resume,
         },
     )
@@ -214,6 +294,87 @@ pub async fn connect(
             outgoing: voice_out_tx,
         },
         resume,
+        tcp: false,
+    })
+}
+
+async fn finish_tcp(
+    stream: tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+    name: &str,
+    card: u64,
+    pass: [u8; 32],
+    resume: [u8; 32],
+) -> Result<Live, LinkError> {
+    let (mut read, mut write) = tokio::io::split(stream);
+    let mut acc = Vec::new();
+    write_control(
+        &mut write,
+        &ClientMsg::Hello {
+            name: name.to_string(),
+            card,
+            pass,
+            resume,
+        },
+    )
+    .await?;
+    let (me, resume) = match read_control(&mut read, &mut acc).await? {
+        ServerMsg::Welcome { user_id, resume } => (user_id, resume),
+        ServerMsg::Reject { reason } => return Err(LinkError::Rejected(reason)),
+        _ => return Err(LinkError::Unreachable),
+    };
+    write_control(
+        &mut write,
+        &ClientMsg::Join {
+            channel: "Lobby".into(),
+        },
+    )
+    .await?;
+    let (channel, members, rooms) = match read_control(&mut read, &mut acc).await? {
+        ServerMsg::Joined {
+            channel,
+            members,
+            rooms,
+        } => (channel, peers(members), rooms),
+        ServerMsg::Reject { reason } => return Err(LinkError::Rejected(reason)),
+        _ => return Err(LinkError::Unreachable),
+    };
+
+    let (cmd_tx, cmd_rx) = unbounded_channel();
+    let (event_tx, events) = unbounded_channel();
+    let (voice_out_tx, voice_out_rx) = tokio::sync::mpsc::channel(TCP_VOICE_QUEUE);
+    let (voice_in_tx, voice_in_rx) = std::sync::mpsc::sync_channel(64);
+    let (dead_tx, dead_rx) = tokio::sync::watch::channel(false);
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(write_tcp_out(
+        write,
+        voice_out_rx,
+        cmd_rx,
+        dead_tx.clone(),
+        stop_tx,
+    ));
+    tokio::spawn(read_tcp_in(
+        read,
+        acc,
+        event_tx.clone(),
+        voice_in_tx,
+        dead_tx,
+        stop_rx,
+    ));
+    tokio::spawn(watch_tcp(dead_rx, event_tx));
+
+    Ok(Live {
+        me,
+        channel,
+        members,
+        rooms,
+        link: Link { cmd: cmd_tx },
+        events,
+        voice: VoicePipe {
+            incoming: voice_in_rx,
+            outgoing: voice_out_tx,
+        },
+        resume,
+        tcp: true,
     })
 }
 
@@ -233,6 +394,215 @@ async fn dial(
         .map_err(|_| LinkError::Timeout)?
         .map_err(classify)?;
     Ok((endpoint, conn))
+}
+
+async fn dial_tcp(
+    addr: SocketAddr,
+    fingerprint: [u8; 32],
+) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, LinkError> {
+    let stream = tokio::time::timeout(Duration::from_secs(4), tokio::net::TcpStream::connect(addr))
+        .await
+        .map_err(|_| LinkError::Timeout)?
+        .map_err(|_| LinkError::Unreachable)?;
+    stream
+        .set_nodelay(true)
+        .map_err(|_| LinkError::Unreachable)?;
+    let config = tls_client_config(fingerprint).map_err(|_| LinkError::Unreachable)?;
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+    let name = rustls::pki_types::ServerName::try_from("ryme").map_err(|_| LinkError::Unreachable)?;
+    tokio::time::timeout(Duration::from_secs(4), connector.connect(name, stream))
+        .await
+        .map_err(|_| LinkError::Timeout)?
+        .map_err(classify)
+}
+
+async fn write_control<W>(write: &mut W, msg: &ClientMsg) -> Result<(), LinkError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let frame = encode_client(msg).map_err(|_| LinkError::Unreachable)?;
+    if write_one(write, TCP_CONTROL, &frame).await {
+        Ok(())
+    } else {
+        Err(LinkError::Unreachable)
+    }
+}
+
+async fn write_one<W>(write: &mut W, tag: u8, payload: &[u8]) -> bool
+where
+    W: AsyncWrite + Unpin,
+{
+    let Ok(frame) = encode_tagged(tag, payload) else {
+        return false;
+    };
+    write.write_all(&frame).await.is_ok() && write.flush().await.is_ok()
+}
+
+async fn read_control<R>(read: &mut R, acc: &mut Vec<u8>) -> Result<ServerMsg, LinkError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut tmp = [0u8; 2048];
+    loop {
+        if let Some(msg) = take_control(acc)? {
+            return Ok(msg);
+        }
+        let n = tokio::time::timeout(Duration::from_secs(4), read.read(&mut tmp))
+            .await
+            .map_err(|_| LinkError::Timeout)?
+            .map_err(|_| LinkError::Unreachable)?;
+        if n == 0 {
+            return Err(LinkError::Unreachable);
+        }
+        acc.extend_from_slice(&tmp[..n]);
+    }
+}
+
+fn take_control(acc: &mut Vec<u8>) -> Result<Option<ServerMsg>, LinkError> {
+    loop {
+        match decode_tagged(acc).map_err(|_| LinkError::Unreachable)? {
+            Some((tag, payload, n)) => {
+                let owned = payload.to_vec();
+                acc.drain(..n);
+                if tag != TCP_CONTROL {
+                    continue;
+                }
+                match decode_server_frame(&owned).map_err(|_| LinkError::Unreachable)? {
+                    Some((msg, used)) if used == owned.len() => return Ok(Some(msg)),
+                    _ => return Err(LinkError::Unreachable),
+                }
+            }
+            None => return Ok(None),
+        }
+    }
+}
+
+async fn write_tcp_out<W>(
+    mut write: W,
+    mut voice_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    mut cmd_rx: UnboundedReceiver<Cmd>,
+    dead: tokio::sync::watch::Sender<bool>,
+    stop: tokio::sync::watch::Sender<bool>,
+) where
+    W: AsyncWrite + Unpin,
+{
+    loop {
+        tokio::select! {
+            biased;
+            cmd = cmd_rx.recv() => {
+                let Some(cmd) = cmd else { break };
+                if matches!(cmd, Cmd::Logout) {
+                    let _ = stop.send(true);
+                    let _ = write.shutdown().await;
+                    return;
+                }
+                let Some(msg) = cmd_msg(cmd) else { continue };
+                let Ok(frame) = encode_client(&msg) else { break };
+                if !write_one(&mut write, TCP_CONTROL, &frame).await {
+                    break;
+                }
+            }
+            packet = voice_rx.recv() => {
+                match packet {
+                    Some(packet) => {
+                        if !write_one(&mut write, TCP_VOICE, &packet).await {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    let _ = dead.send(true);
+}
+
+fn cmd_msg(cmd: Cmd) -> Option<ClientMsg> {
+    Some(match cmd {
+        Cmd::Chat(text) => ClientMsg::Chat { text },
+        Cmd::Mute(muted) => ClientMsg::Mute { muted },
+        Cmd::Deafen(deafened) => ClientMsg::Deafen { deafened },
+        Cmd::Join(channel) => ClientMsg::Join { channel },
+        Cmd::Leave => ClientMsg::Leave,
+        Cmd::Logout => return None,
+    })
+}
+
+async fn read_tcp_in<R>(
+    mut read: R,
+    mut acc: Vec<u8>,
+    events: UnboundedSender<Event>,
+    voice_in: std::sync::mpsc::SyncSender<Vec<u8>>,
+    dead: tokio::sync::watch::Sender<bool>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) where
+    R: AsyncRead + Unpin,
+{
+    let mut tmp = [0u8; 2048];
+    loop {
+        if *stop.borrow() {
+            return;
+        }
+        let read = tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    return;
+                }
+                continue;
+            }
+            n = read.read(&mut tmp) => n,
+        };
+        let Ok(n) = read else {
+            break;
+        };
+        if n == 0 {
+            break;
+        }
+        acc.extend_from_slice(&tmp[..n]);
+        if !drain_tcp_in(&mut acc, &events, &voice_in) {
+            break;
+        }
+    }
+    if !*stop.borrow() {
+        let _ = dead.send(true);
+    }
+}
+
+fn drain_tcp_in(
+    acc: &mut Vec<u8>,
+    events: &UnboundedSender<Event>,
+    voice_in: &std::sync::mpsc::SyncSender<Vec<u8>>,
+) -> bool {
+    loop {
+        match decode_tagged(acc) {
+            Ok(Some((tag, payload, n))) => {
+                let owned = payload.to_vec();
+                acc.drain(..n);
+                if tag == TCP_VOICE {
+                    let _ = voice_in.try_send(owned);
+                    continue;
+                }
+                if tag != TCP_CONTROL {
+                    return false;
+                }
+                let mut body = owned;
+                if !drain(&mut body, events) || !body.is_empty() {
+                    return false;
+                }
+            }
+            Ok(None) => return true,
+            Err(_) => return false,
+        }
+    }
+}
+
+async fn watch_tcp(
+    mut dead: tokio::sync::watch::Receiver<bool>,
+    events: UnboundedSender<Event>,
+) {
+    if dead.changed().await.is_ok() && *dead.borrow() {
+        let _ = events.send(Event::Disconnected);
+    }
 }
 
 fn classify(err: impl std::fmt::Display) -> LinkError {
@@ -601,6 +971,61 @@ mod tests {
         assert_eq!(voice.seq, 7);
         assert_eq!(voice.payload, vec![1, 2, 3, 4]);
         assert!(mara.voice.try_recv().is_none());
+        assert!(!mara.tcp);
+    }
+
+    #[tokio::test]
+    async fn tcp_carries_voice_to_and_from_quic() {
+        let (port, fingerprint, pass, _task) = up().await;
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let tcp = connect_tcp(addr, fingerprint, "Ear", 2, pass, [0; 32])
+            .await
+            .unwrap();
+        assert!(tcp.tcp);
+        let url = invite(port, fingerprint, pass);
+        let quic = connect(&url, "Mouth", 1, [0; 32]).await.unwrap();
+        assert!(!quic.tcp);
+
+        let from_quic = ryme_proto::encode_voice(&ryme_proto::VoicePacket {
+            speaker: 0,
+            seq: 3,
+            timestamp: 3 * 480,
+            flags: 0,
+            payload: vec![9, 9],
+        })
+        .unwrap();
+        quic.voice.send(from_quic);
+        let heard = wait_voice(&tcp).await;
+        let heard = ryme_proto::decode_voice(&heard).unwrap();
+        assert_eq!(heard.speaker, quic.me);
+        assert_eq!(heard.payload, vec![9, 9]);
+
+        let from_tcp = ryme_proto::encode_voice(&ryme_proto::VoicePacket {
+            speaker: 0,
+            seq: 4,
+            timestamp: 4 * 480,
+            flags: 0,
+            payload: vec![8, 8],
+        })
+        .unwrap();
+        tcp.voice.send(from_tcp);
+        let heard = wait_voice(&quic).await;
+        let heard = ryme_proto::decode_voice(&heard).unwrap();
+        assert_eq!(heard.speaker, tcp.me);
+        assert_eq!(heard.payload, vec![8, 8]);
+    }
+
+    async fn wait_voice(live: &Live) -> Vec<u8> {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(bytes) = live.voice.try_recv() {
+                return bytes;
+            }
+            if start.elapsed() > Duration::from_secs(2) {
+                panic!("voice did not arrive");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[test]

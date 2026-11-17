@@ -301,14 +301,18 @@ impl ServerCertVerifier for FingerprintVerifier {
     }
 }
 
-pub fn client_config(fingerprint: [u8; 32]) -> Result<quinn::ClientConfig, ServerError> {
+pub fn tls_client_config(fingerprint: [u8; 32]) -> Result<rustls::ClientConfig, ServerError> {
     let provider = rustls::crypto::ring::default_provider();
-    let crypto = rustls::ClientConfig::builder_with_provider(provider.into())
+    Ok(rustls::ClientConfig::builder_with_provider(provider.into())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|err| ServerError::Message(err.to_string()))?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(FingerprintVerifier::new(fingerprint)))
-        .with_no_client_auth();
+        .with_no_client_auth())
+}
+
+pub fn client_config(fingerprint: [u8; 32]) -> Result<quinn::ClientConfig, ServerError> {
+    let crypto = tls_client_config(fingerprint)?;
     let quic = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
         .map_err(|err| ServerError::Message(err.to_string()))?;
     let mut client = quinn::ClientConfig::new(Arc::new(quic));

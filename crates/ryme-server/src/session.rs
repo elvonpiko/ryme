@@ -6,8 +6,10 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use ryme_proto::{
-    decode_client_frame, encode_server, stamp_speaker, ClientMsg, ProtoError, ServerMsg,
+    decode_client_frame, decode_tagged, encode_server, encode_tagged, stamp_speaker, ClientMsg,
+    ProtoError, ServerMsg, TCP_CONTROL, TCP_VOICE,
 };
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::watch;
 
@@ -15,6 +17,7 @@ use crate::hub::{Hub, Step};
 use crate::identity;
 
 const CONTROL_QUEUE: usize = 16;
+const TCP_VOICE_QUEUE: usize = 6;
 const MAX_CONNECTIONS: usize = 64;
 const CONTROL_PER_SECOND: u32 = 30;
 const VOICE_PER_SECOND: u32 = 120;
@@ -55,9 +58,17 @@ impl VoiceTx {
 }
 
 #[derive(Clone)]
+enum VoiceOut {
+    /// QUIC replaces a datagram the writer has not sent.
+    Latest(VoiceTx),
+    /// TCP drops a new frame when six are already waiting.
+    Bounded(Sender<Bytes>),
+}
+
+#[derive(Clone)]
 struct Pipes {
     control: Sender<ServerMsg>,
-    voice: VoiceTx,
+    voice: VoiceOut,
     close: Sender<()>,
 }
 
@@ -239,7 +250,7 @@ pub async fn run(conn: quinn::Connection, world: Arc<Mutex<World>>) {
     let (close_tx, mut close_rx) = tokio::sync::mpsc::channel(1);
     let pipes = Pipes {
         control: control_tx,
-        voice: voice_tx,
+        voice: VoiceOut::Latest(voice_tx),
         close: close_tx,
     };
     let writer = tokio::spawn(write_out(send, conn.clone(), control_rx, voice_rx, fail_tx));
@@ -357,8 +368,157 @@ async fn write_out(
     }
 }
 
-fn offer_voice(tx: &VoiceTx, packet: Bytes) {
-    tx.offer(packet);
+fn offer_voice(voice: &VoiceOut, packet: Bytes) {
+    match voice {
+        VoiceOut::Latest(tx) => tx.offer(packet),
+        VoiceOut::Bounded(tx) => {
+            let _ = tx.try_send(packet);
+        }
+    }
+}
+
+pub(crate) async fn run_tcp<S>(peer: SocketAddr, stream: S, world: Arc<Mutex<World>>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    tracing::info!(%peer, transport = "tcp", "connected");
+    let (fail_tx, mut fail_rx) = watch::channel(false);
+    let (mut read, write) = tokio::io::split(stream);
+    let (control_tx, control_rx) = tokio::sync::mpsc::channel(CONTROL_QUEUE);
+    let (voice_tx, voice_rx) = tokio::sync::mpsc::channel(TCP_VOICE_QUEUE);
+    let (close_tx, mut close_rx) = tokio::sync::mpsc::channel(1);
+    let pipes = Pipes {
+        control: control_tx,
+        voice: VoiceOut::Bounded(voice_tx),
+        close: close_tx,
+    };
+    let writer = tokio::spawn(write_tcp(write, control_rx, voice_rx, fail_tx));
+
+    let admitted = tokio::time::Instant::now() + ADMIT_WAIT;
+    let mut user_id = None;
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 2048];
+    let mut pace = Pace::new();
+    loop {
+        if user_id.is_none() && tokio::time::Instant::now() >= admitted {
+            break;
+        }
+        tokio::select! {
+            _ = fail_rx.changed() => break,
+            _ = close_rx.recv() => break,
+            _ = tokio::time::sleep_until(admitted), if user_id.is_none() => break,
+            read = read_some(&mut read, &mut tmp) => {
+                match read {
+                    Ok(n) if n > 0 => {
+                        buf.extend_from_slice(&tmp[..n]);
+                        if !drain_tcp(&mut buf, &world, &mut user_id, &pipes, &mut pace) {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+
+    if let Some(id) = user_id {
+        world.lock().expect("hub").disconnect(id);
+    }
+    drop(pipes);
+    writer.abort();
+    tracing::info!(%peer, transport = "tcp", "disconnected");
+}
+
+fn drain_tcp(
+    buf: &mut Vec<u8>,
+    world: &Arc<Mutex<World>>,
+    user_id: &mut Option<u32>,
+    pipes: &Pipes,
+    pace: &mut Pace,
+) -> bool {
+    loop {
+        let frame = match decode_tagged(buf) {
+            Ok(Some((tag, payload, n))) => {
+                let owned = payload.to_vec();
+                buf.drain(..n);
+                (tag, owned)
+            }
+            Ok(None) => return true,
+            Err(_) => return false,
+        };
+        match frame.0 {
+            TCP_CONTROL => {
+                let mut body = frame.1;
+                match drain_frames(&mut body, world, user_id, pipes, pace) {
+                    Ok(true) if body.is_empty() => {}
+                    _ => return false,
+                }
+            }
+            TCP_VOICE => {
+                if !pace.allow(true) {
+                    return false;
+                }
+                let Some(id) = *user_id else { continue };
+                world.lock().expect("hub").voice(id, Bytes::from(frame.1));
+            }
+            _ => return false,
+        }
+    }
+}
+
+async fn read_some<R>(read: &mut R, tmp: &mut [u8]) -> std::io::Result<usize>
+where
+    R: AsyncRead + Unpin,
+{
+    read.read(tmp).await
+}
+
+async fn write_tcp<W>(
+    mut write: W,
+    mut control_rx: Receiver<ServerMsg>,
+    mut voice_rx: Receiver<Bytes>,
+    fail: watch::Sender<bool>,
+) where
+    W: AsyncWrite + Unpin,
+{
+    loop {
+        tokio::select! {
+            biased;
+            msg = control_rx.recv() => {
+                let Some(msg) = msg else { break };
+                let Ok(frame) = encode_server(&msg) else {
+                    let _ = fail.send(true);
+                    break;
+                };
+                if !write_tagged(&mut write, TCP_CONTROL, &frame).await {
+                    let _ = fail.send(true);
+                    break;
+                }
+            }
+            packet = voice_rx.recv() => {
+                let Some(packet) = packet else { break };
+                if !write_tagged(&mut write, TCP_VOICE, &packet).await {
+                    let _ = fail.send(true);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn write_tagged<W>(write: &mut W, tag: u8, payload: &[u8]) -> bool
+where
+    W: AsyncWrite + Unpin,
+{
+    let Ok(frame) = encode_tagged(tag, payload) else {
+        return false;
+    };
+    let wrote = tokio::time::timeout(WRITE_WAIT, async {
+        write.write_all(&frame).await?;
+        write.flush().await
+    })
+    .await;
+    matches!(wrote, Ok(Ok(())))
 }
 
 fn offer_control(pipes: &Pipes, msg: ServerMsg) {
@@ -493,8 +653,9 @@ mod tests {
     #[tokio::test]
     async fn a_congested_voice_queue_keeps_the_newest_packet() {
         let (tx, mut rx) = VoiceTx::pair();
-        offer_voice(&tx, Bytes::from_static(b"stale"));
-        offer_voice(&tx, Bytes::from_static(b"fresh"));
+        let out = VoiceOut::Latest(tx);
+        offer_voice(&out, Bytes::from_static(b"stale"));
+        offer_voice(&out, Bytes::from_static(b"fresh"));
         rx.changed().await.unwrap();
         let note = rx.borrow().clone().unwrap();
         assert_eq!(note.seq, 2);

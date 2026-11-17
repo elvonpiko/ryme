@@ -129,6 +129,7 @@ struct Slot {
     muted: bool,
     deaf: bool,
     resume_secret: [u8; 32],
+    tcp: bool,
     server: [u8; 32],
     roster: HashMap<u32, u64>,
     levels: HashMap<u64, Level>,
@@ -180,6 +181,7 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
         muted: ui.get_muted(),
         deaf: ui.get_deafened(),
         resume_secret: [0; 32],
+        tcp: false,
         server: [0; 32],
         roster: HashMap::new(),
         levels: HashMap::new(),
@@ -686,6 +688,7 @@ fn begin(
                         return;
                     }
                     guard.link = Some(live.link.clone());
+                    guard.tcp = live.tcp;
                     guard.resume_secret = live.resume;
                     let resume = std::mem::take(&mut guard.resume_channel);
                     guard.channel = if resume.is_empty() {
@@ -1053,7 +1056,7 @@ fn show(weak: &Weak<MainWindow>, slot: &Arc<Mutex<Slot>>, gen: u64, room: &Room,
     let room = room.clone();
     let slot = slot.clone();
     let _ = weak.upgrade_in_event_loop(move |ui| {
-        let levels = {
+        let (levels, tcp) = {
             let mut guard = slot.lock().unwrap();
             if guard.generation != gen {
                 return;
@@ -1063,12 +1066,14 @@ fn show(weak: &Weak<MainWindow>, slot: &Arc<Mutex<Slot>>, gen: u64, room: &Room,
                 .iter()
                 .map(|peer| (peer.user_id, peer.card))
                 .collect();
+            let tcp = guard.tcp;
             let mixes = hearing(&guard.roster, &guard.levels);
             if let Some(ear) = guard.ear.as_ref() {
                 ear.set_levels(mixes);
             }
-            guard.levels.clone()
+            (guard.levels.clone(), tcp)
         };
+        ui.set_tcp(tcp);
         ui.set_joining(false);
         ui.set_reconnecting(false);
         if entered {
@@ -1124,6 +1129,7 @@ fn clear(ui: &MainWindow) {
     ui.set_inside(false);
     ui.set_joining(false);
     ui.set_reconnecting(false);
+    ui.set_tcp(false);
     ui.set_joined(-1);
     ui.set_panel(0);
     ui.set_muted(false);
@@ -1255,7 +1261,7 @@ fn explain(err: LinkError) -> String {
     match err {
         LinkError::Invite => "That invite is not a ryme link.".into(),
         LinkError::Unreachable => "Could not reach that server.".into(),
-        LinkError::Timeout => "The server did not answer. Check that UDP can get through.".into(),
+        LinkError::Timeout => "The server did not answer. Check that UDP or TCP can get through.".into(),
         LinkError::Pin => "This invite does not match that server. Ask for a new link.".into(),
         LinkError::Address => "That address did not resolve.".into(),
         LinkError::Rejected(reason) => reason,

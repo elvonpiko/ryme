@@ -14,6 +14,7 @@ services:
       RYME_PUBLIC: ${RYME_PUBLIC:-}
     ports:
       - "1542:1542/udp"
+      - "1542:1542/tcp"
     volumes:
       - ryme-data:/var/lib/ryme
     tmpfs:

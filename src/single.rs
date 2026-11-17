@@ -26,12 +26,7 @@ pub fn show_now() {
             ui.window().set_minimized(false);
             let _ = ui.window().show();
             if let Some(url) = crate::local::take_staged_invite() {
-                if ui.get_inside() {
-                    ui.set_toast("Already in a room.".into());
-                    ui.set_toast_danger(false);
-                } else {
-                    ui.set_invite(url.into());
-                }
+                ui.invoke_open_invite(url.into());
             }
         }
     });

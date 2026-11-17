@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ryme_proto::parse_invite;
+use ryme_proto::{parse_invite, Invite, DEFAULT_PORT};
 use ryme_server::{connect, Event, Link, LinkError, Peer};
 
 use crate::ear::{Ear, Mix};
@@ -139,6 +139,8 @@ enum Ask {
     None,
     Logout,
     Update,
+    /// Leave the live server and open this invite.
+    Switch(String),
 }
 
 pub struct Shutdown {
@@ -334,6 +336,20 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
         }
     });
 
+    ui.on_open_invite({
+        let weak = ui.as_weak();
+        let ask = ask.clone();
+        let slot = slot.clone();
+        let rt = rt.clone();
+        let notices = notices.clone();
+        move |url| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            open_invite(&ui, &slot, &rt, &notices, &ask, &url);
+        }
+    });
+
     ui.on_logout({
         let weak = ui.as_weak();
         let ask = ask.clone();
@@ -466,6 +482,29 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
                     });
                     bump(&slot);
                     clear(&ui);
+                    listen_local(&slot);
+                }
+                Ask::Switch(url) => {
+                    ui.set_invite(url.clone().into());
+                    let (denoise, muted, deaf, ptt) = {
+                        let mut guard = slot.lock().unwrap();
+                        guard.resume_channel.clear();
+                        guard.resume_secret = [0; 32];
+                        (guard.denoise, guard.muted, guard.deaf, guard.ptt)
+                    };
+                    local::store(&Saved {
+                        name: ui.get_display_name().to_string(),
+                        invite: url,
+                        channel: String::new(),
+                        resume: false,
+                        denoise,
+                        muted,
+                        deaf,
+                        ptt,
+                        ticket: [0; 32],
+                    });
+                    clear(&ui);
+                    begin(&ui, &slot, &rt, &notices, false, 0);
                     listen_local(&slot);
                 }
                 Ask::Update => {
@@ -942,6 +981,102 @@ fn begin(
     });
 }
 
+/// What a second invite should do. A link names a server, not a room.
+enum Arrival {
+    /// This is the server already on the call. Bring the window forward.
+    Stay,
+    /// A different server, and the call is live. Ask before leaving.
+    Ask,
+    /// Not in a call. Put the link in the field.
+    Fill,
+    /// The text is not an invite.
+    Reject,
+}
+
+fn arrival(inside: bool, same: bool, ok: bool) -> Arrival {
+    if !ok {
+        return Arrival::Reject;
+    }
+    if inside && same {
+        Arrival::Stay
+    } else if inside {
+        Arrival::Ask
+    } else {
+        Arrival::Fill
+    }
+}
+
+fn place_label(invite: &Invite) -> String {
+    let host = if invite.host.contains(':') {
+        format!("[{}]", invite.host)
+    } else {
+        invite.host.clone()
+    };
+    if invite.port == DEFAULT_PORT {
+        host
+    } else {
+        format!("{host}:{}", invite.port)
+    }
+}
+
+fn open_invite(
+    ui: &MainWindow,
+    slot: &Arc<Mutex<Slot>>,
+    rt: &tokio::runtime::Handle,
+    notices: &Arc<AtomicU64>,
+    ask: &Mutex<Ask>,
+    url: &str,
+) {
+    let url = url.trim();
+    let Ok(parsed) = parse_invite(url) else {
+        note(ui, rt, notices, "That link is not an invite.");
+        return;
+    };
+    let session = ui.get_inside() || ui.get_joining();
+    let same = session && {
+        let guard = slot.lock().unwrap();
+        guard.server != [0; 32] && guard.server == parsed.fingerprint
+    };
+    match arrival(ui.get_inside(), same, true) {
+        Arrival::Reject => note(ui, rt, notices, "That link is not an invite."),
+        Arrival::Stay => {
+            let mut pending = ask.lock().unwrap();
+            if matches!(*pending, Ask::Switch(_)) {
+                *pending = Ask::None;
+                drop(pending);
+                ui.set_confirming(false);
+            }
+        }
+        Arrival::Ask => {
+            let place = place_label(&parsed);
+            *ask.lock().unwrap() = Ask::Switch(url.to_string());
+            ui.set_toast("".into());
+            ui.set_confirm_danger(true);
+            pose(
+                ui,
+                "Switch server",
+                &format!("Leave this call and join {place}?"),
+                "Switch",
+            );
+        }
+        Arrival::Fill => {
+            if ui.get_joining() && same {
+                return;
+            }
+            ui.set_toast("".into());
+            ui.set_invite(url.into());
+            ui.set_panel(0);
+            if ui.get_joining() {
+                let mut guard = slot.lock().unwrap();
+                guard.resume_channel.clear();
+                guard.resume_secret = [0; 32];
+                drop(guard);
+                begin(ui, slot, rt, notices, false, 0);
+            }
+        }
+    }
+}
+
 fn offer(ui: &MainWindow, ask: &Mutex<Ask>, title: &str) {
     let in_call = ui.get_inside() && ui.get_joined() >= 0;
     let body = if in_call {
@@ -1336,7 +1471,10 @@ fn pursue(
 
 #[cfg(test)]
 mod tests {
-    use super::{explain, pace, Room, AGAIN_WAIT, ATTEMPTS, QUIET_WAIT};
+    use super::{
+        arrival, explain, pace, place_label, Arrival, Room, AGAIN_WAIT, ATTEMPTS, QUIET_WAIT,
+    };
+    use ryme_proto::Invite;
     use ryme_server::{Event, LinkError};
 
     #[test]
@@ -1360,6 +1498,32 @@ mod tests {
         assert_eq!(room.lines.len(), 200);
         assert_eq!(room.lines[0].1, "50");
         assert_eq!(room.lines.last().unwrap().1, "249");
+    }
+
+    #[test]
+    fn a_second_link_stays_asks_or_fills() {
+        assert!(matches!(arrival(true, true, true), Arrival::Stay));
+        assert!(matches!(arrival(true, false, true), Arrival::Ask));
+        assert!(matches!(arrival(false, false, true), Arrival::Fill));
+        assert!(matches!(arrival(false, true, true), Arrival::Fill));
+        assert!(matches!(arrival(true, true, false), Arrival::Reject));
+    }
+
+    #[test]
+    fn a_switch_names_the_other_server() {
+        let invite = Invite {
+            host: "fra.ryme.chat".into(),
+            port: ryme_proto::DEFAULT_PORT,
+            fingerprint: [0; 32],
+            pass: [0; 32],
+        };
+        assert_eq!(place_label(&invite), "fra.ryme.chat");
+        let other = Invite {
+            host: "2001:db8::1".into(),
+            port: 443,
+            ..invite
+        };
+        assert_eq!(place_label(&other), "[2001:db8::1]:443");
     }
 
     #[test]

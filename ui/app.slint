@@ -446,6 +446,7 @@ export component MainWindow inherits Window {
     callback hush(bool);
     callback confirm-yes();
     callback confirm-no();
+    callback open-invite(string);
     callback check-update();
     callback cycle-input();
     callback cycle-output();
@@ -1400,7 +1401,7 @@ export component MainWindow inherits Window {
                     font-weight: 500;
                 }
                 Field {
-                    placeholder: "ryme://host:port/#…";
+                    placeholder: "https://ryme.chat/#…";
                     value <=> root.invite;
                 }
             }

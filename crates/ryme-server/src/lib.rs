@@ -1,6 +1,6 @@
 /// The published release. The crate version stays 0.1.0; the client compares
 /// this tag with GitHub.
-pub const RELEASE: &str = "0.1.42";
+pub const RELEASE: &str = "0.1.43";
 
 mod hub;
 mod identity;

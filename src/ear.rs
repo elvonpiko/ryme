@@ -1548,7 +1548,7 @@ fn build_output(
     let supported = device.default_output_config().ok()?;
     let chosen = prefer_output(&device, supported)?;
     let channels = chosen.channels() as usize;
-    let rate = chosen.sample_rate().0;
+    let rate = chosen.sample_rate();
     let format = chosen.sample_format();
     let short = stream_config(&chosen);
     let stream = open_output(
@@ -1654,7 +1654,7 @@ fn pick_device(name: &str, input: bool) -> Option<cpal::Device> {
 fn stream_config(supported: &cpal::SupportedStreamConfig) -> cpal::StreamConfig {
     let buffer_size = match supported.buffer_size() {
         cpal::SupportedBufferSize::Range { min, max } => {
-            let want = (supported.sample_rate().0 / 100).clamp(*min, *max);
+            let want = (supported.sample_rate() / 100).clamp(*min, *max);
             cpal::BufferSize::Fixed(want)
         }
         cpal::SupportedBufferSize::Unknown => cpal::BufferSize::Default,
@@ -1729,7 +1729,7 @@ fn prefer_output(
     fallback: cpal::SupportedStreamConfig,
 ) -> Option<cpal::SupportedStreamConfig> {
     use cpal::traits::DeviceTrait;
-    if let Ok(ranges) = device.supported_output_configs() {
+    if let Ok(mut ranges) = device.supported_output_configs() {
         let rate = fallback.sample_rate();
         let channels = fallback.channels();
         if playback_converts(host_format(fallback.sample_format())) {

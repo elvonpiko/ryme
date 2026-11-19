@@ -51,6 +51,11 @@ pub fn stamp_speaker(buf: &mut [u8], speaker: u32) -> Result<(), ProtoError> {
     Ok(())
 }
 
+/// Header-only check. Fan-out uses this so it does not copy the Opus payload.
+pub fn voice_ok(buf: &[u8]) -> bool {
+    check_header(buf).is_ok()
+}
+
 fn check_header(buf: &[u8]) -> Result<(), ProtoError> {
     if buf.len() < VOICE_HEADER {
         return Err(ProtoError::Truncated);

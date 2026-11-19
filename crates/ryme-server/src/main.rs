@@ -49,7 +49,14 @@ async fn main() -> anyhow::Result<()> {
         server.allow(&name);
     }
     let (host, port) = published(addr);
-    tracing::info!(%addr, %host, port, path = %data.display(), "listening on udp and tcp");
+    tracing::info!(
+        %addr,
+        %host,
+        port,
+        path = %data.display(),
+        release = ryme_server::RELEASE,
+        "listening on udp and tcp"
+    );
     println!("{}", server.invite_on(&host, port));
     server.serve().await;
     Ok(())

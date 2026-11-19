@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,12 +15,13 @@ use tokio::sync::watch;
 
 use crate::hub::{Hub, Step};
 use crate::identity;
-use crate::queue::{self, NewestReceiver, NewestSender};
+use crate::queue::{self, FairReceiver, FairSender};
 
 /// Room history is up to 200 lines, sent when someone joins. The queue has to
 /// hold that burst. A frame that does not fit is dropped; it does not end the call.
 const CONTROL_QUEUE: usize = 256;
-const TCP_VOICE_QUEUE: usize = 6;
+const VOICE_PER_SPEAKER: usize = 8;
+const VOICE_PER_LISTENER: usize = 32;
 const MAX_CONNECTIONS: usize = 64;
 const CONTROL_PER_SECOND: u32 = 30;
 // A TCP read can deliver a backlog in one go. The outbound queue keeps the
@@ -34,48 +35,9 @@ const WRITE_WAIT: Duration = Duration::from_secs(15);
 static OPEN: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone)]
-struct VoiceNote {
-    seq: u64,
-    packet: Bytes,
-}
-
-#[derive(Clone)]
-struct VoiceTx {
-    next: Arc<AtomicU64>,
-    tx: watch::Sender<Option<VoiceNote>>,
-}
-
-impl VoiceTx {
-    fn pair() -> (Self, watch::Receiver<Option<VoiceNote>>) {
-        let (tx, rx) = watch::channel(None);
-        (
-            Self {
-                next: Arc::new(AtomicU64::new(0)),
-                tx,
-            },
-            rx,
-        )
-    }
-
-    /// Replace any voice packet the writer has not sent yet.
-    fn offer(&self, packet: Bytes) {
-        let seq = self.next.fetch_add(1, Ordering::Relaxed) + 1;
-        let _ = self.tx.send(Some(VoiceNote { seq, packet }));
-    }
-}
-
-#[derive(Clone)]
-enum VoiceOut {
-    /// QUIC replaces a datagram the writer has not sent.
-    Latest(VoiceTx),
-    /// TCP keeps six frames and drops the oldest when a newer one arrives.
-    Bounded(NewestSender<Bytes>),
-}
-
-#[derive(Clone)]
 struct Pipes {
     control: Sender<ServerMsg>,
-    voice: VoiceOut,
+    voice: FairSender<Bytes>,
     close: Sender<()>,
 }
 
@@ -133,18 +95,23 @@ impl World {
         step.user_id
     }
 
-    fn voice(&mut self, from: u32, packet: Bytes) {
+    /// Stamp the speaker and clone each listener's queue. The caller offers
+    /// outside the world lock, so one slow queue does not stall the room.
+    fn route_voice(&mut self, from: u32, packet: Bytes) -> Vec<(FairSender<Bytes>, Bytes)> {
         let mut packet = packet.to_vec();
         if stamp_speaker(&mut packet, from).is_err() {
-            return;
+            return Vec::new();
         }
         let targets = self.hub.voice_targets(from, &packet);
         let packet = Bytes::from(packet);
-        for id in targets {
-            if let Some(pipes) = self.pipes.get(&id) {
-                offer_voice(&pipes.voice, packet.clone());
-            }
-        }
+        targets
+            .into_iter()
+            .filter_map(|id| {
+                self.pipes
+                    .get(&id)
+                    .map(|pipes| (pipes.voice.clone(), packet.clone()))
+            })
+            .collect()
     }
 
     fn allow(&mut self, name: &str) {
@@ -253,14 +220,16 @@ pub async fn run(conn: quinn::Connection, world: Arc<Mutex<World>>) {
     };
 
     let (control_tx, control_rx) = tokio::sync::mpsc::channel(CONTROL_QUEUE);
-    let (voice_tx, voice_rx) = VoiceTx::pair();
+    let (voice_tx, voice_rx) =
+        queue::fair(VOICE_PER_SPEAKER, VOICE_PER_LISTENER, queue::VOICE_MAX_AGE);
     let (close_tx, mut close_rx) = tokio::sync::mpsc::channel(1);
     let pipes = Pipes {
         control: control_tx,
-        voice: VoiceOut::Latest(voice_tx),
+        voice: voice_tx,
         close: close_tx,
     };
-    let writer = tokio::spawn(write_out(send, conn.clone(), control_rx, voice_rx, fail_tx));
+    let control_task = tokio::spawn(write_control(send, control_rx, fail_tx.clone()));
+    let voice_task = tokio::spawn(write_datagrams(conn.clone(), voice_rx, fail_tx));
 
     let mut user_id = None;
     let mut buf = Vec::new();
@@ -298,7 +267,7 @@ pub async fn run(conn: quinn::Connection, world: Arc<Mutex<World>>) {
                             continue;
                         }
                         let Some(id) = user_id else { continue };
-                        world.lock().expect("hub").voice(id, packet);
+                        deliver_voice(&world, id, packet);
                     }
                     Err(_) => break,
                 }
@@ -310,7 +279,8 @@ pub async fn run(conn: quinn::Connection, world: Arc<Mutex<World>>) {
         world.lock().expect("hub").disconnect(id);
     }
     drop(pipes);
-    writer.abort();
+    control_task.abort();
+    voice_task.abort();
     conn.close(quinn::VarInt::from_u32(0), b"bye");
     tracing::info!(%peer, "disconnected");
 }
@@ -352,49 +322,65 @@ fn drain_frames(
     }
 }
 
-async fn write_out(
+async fn write_control(
     mut send: quinn::SendStream,
-    conn: quinn::Connection,
     mut control_rx: Receiver<ServerMsg>,
-    mut voice_rx: watch::Receiver<Option<VoiceNote>>,
     fail: watch::Sender<bool>,
 ) {
     loop {
-        tokio::select! {
-            biased;
-            changed = voice_rx.changed() => {
-                if changed.is_err() {
-                    break;
-                }
-                let packet = voice_rx.borrow_and_update().as_ref().map(|note| note.packet.clone());
-                let Some(packet) = packet else { continue };
-                if conn.send_datagram(packet).is_err() {
-                    let _ = fail.send(true);
-                    break;
-                }
-            }
-            msg = control_rx.recv() => {
-                let Some(msg) = msg else { break };
-                let Ok(frame) = encode_server(&msg) else {
-                    let _ = fail.send(true);
-                    break;
-                };
-                let wrote = tokio::time::timeout(WRITE_WAIT, send.write_all(&frame)).await;
-                let ok = matches!(wrote, Ok(Ok(())));
-                if !ok {
-                    let _ = fail.send(true);
-                    break;
-                }
+        let Some(msg) = control_rx.recv().await else {
+            break;
+        };
+        let Ok(frame) = encode_server(&msg) else {
+            let _ = fail.send(true);
+            break;
+        };
+        let wrote = tokio::time::timeout(WRITE_WAIT, send.write_all(&frame)).await;
+        if !matches!(wrote, Ok(Ok(()))) {
+            let _ = fail.send(true);
+            break;
+        }
+    }
+}
+
+async fn write_datagrams(
+    conn: quinn::Connection,
+    mut voice_rx: FairReceiver<Bytes>,
+    fail: watch::Sender<bool>,
+) {
+    loop {
+        let Some((_speaker, packet)) = voice_rx.recv().await else {
+            break;
+        };
+        if conn.send_datagram(packet).is_err() {
+            // A full datagram buffer drops this packet. Closing here would
+            // end the call. A dead connection is the case that stops the writer.
+            if conn.close_reason().is_some() {
+                let _ = fail.send(true);
+                break;
             }
         }
     }
 }
 
-fn offer_voice(voice: &VoiceOut, packet: Bytes) {
-    match voice {
-        VoiceOut::Latest(tx) => tx.offer(packet),
-        VoiceOut::Bounded(tx) => tx.offer(packet),
+fn deliver_voice(world: &Arc<Mutex<World>>, from: u32, packet: Bytes) {
+    let routed = {
+        let mut world = world.lock().expect("hub");
+        world.route_voice(from, packet)
+    };
+    for (voice, packet) in routed {
+        offer_voice(&voice, packet);
     }
+}
+
+fn offer_voice(voice: &FairSender<Bytes>, packet: Bytes) {
+    let Some(speaker) = packet.get(1..5) else {
+        return;
+    };
+    let Ok(speaker) = speaker.try_into() else {
+        return;
+    };
+    voice.offer(u32::from_le_bytes(speaker), packet);
 }
 
 pub(crate) async fn run_tcp<S>(peer: SocketAddr, stream: S, world: Arc<Mutex<World>>)
@@ -405,11 +391,12 @@ where
     let (fail_tx, mut fail_rx) = watch::channel(false);
     let (mut read, write) = tokio::io::split(stream);
     let (control_tx, control_rx) = tokio::sync::mpsc::channel(CONTROL_QUEUE);
-    let (voice_tx, voice_rx) = queue::newest(TCP_VOICE_QUEUE);
+    let (voice_tx, voice_rx) =
+        queue::fair(VOICE_PER_SPEAKER, VOICE_PER_LISTENER, queue::VOICE_MAX_AGE);
     let (close_tx, mut close_rx) = tokio::sync::mpsc::channel(1);
     let pipes = Pipes {
         control: control_tx,
-        voice: VoiceOut::Bounded(voice_tx),
+        voice: voice_tx,
         close: close_tx,
     };
     let writer = tokio::spawn(write_tcp(write, control_rx, voice_rx, fail_tx));
@@ -479,7 +466,7 @@ fn drain_tcp(
                     continue;
                 }
                 let Some(id) = *user_id else { continue };
-                world.lock().expect("hub").voice(id, Bytes::from(frame.1));
+                deliver_voice(world, id, Bytes::from(frame.1));
             }
             _ => return false,
         }
@@ -496,7 +483,7 @@ where
 async fn write_tcp<W>(
     mut write: W,
     mut control_rx: Receiver<ServerMsg>,
-    mut voice_rx: NewestReceiver<Bytes>,
+    mut voice_rx: FairReceiver<Bytes>,
     fail: watch::Sender<bool>,
 ) where
     W: AsyncWrite + Unpin,
@@ -516,10 +503,21 @@ async fn write_tcp<W>(
                 }
             }
             packet = voice_rx.recv() => {
-                let Some(packet) = packet else { break };
-                // Voice waits for the socket. Cancelling it would split a frame,
-                // and a full queue already drops what the peer cannot take.
-                if write_frame(&mut write, TCP_VOICE, &packet).await.is_err() {
+                let Some((_speaker, packet)) = packet else { break };
+                // The queue already dropped frames that waited too long.
+                // A write that does not finish is a stuck writer. Closing is
+                // the only safe step: another frame on a partial tag would
+                // corrupt the byte stream.
+                let started = tokio::time::Instant::now();
+                let wrote = tokio::time::timeout(WRITE_WAIT, write_frame(&mut write, TCP_VOICE, &packet)).await;
+                if started.elapsed() > Duration::from_millis(200) {
+                    tracing::info!(
+                        ms = started.elapsed().as_millis() as u64,
+                        "voice write"
+                    );
+                }
+                if !matches!(wrote, Ok(Ok(()))) {
+                    tracing::info!("voice writer stalled, closing the connection");
                     let _ = fail.send(true);
                     break;
                 }
@@ -674,15 +672,21 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn a_congested_voice_queue_keeps_the_newest_packet() {
-        let (tx, mut rx) = VoiceTx::pair();
-        let out = VoiceOut::Latest(tx);
-        offer_voice(&out, Bytes::from_static(b"stale"));
-        offer_voice(&out, Bytes::from_static(b"fresh"));
-        rx.changed().await.unwrap();
-        let note = rx.borrow().clone().unwrap();
-        assert_eq!(note.seq, 2);
-        assert_eq!(note.packet.as_ref(), b"fresh");
+    async fn two_speakers_both_wait_for_one_listener() {
+        let (tx, mut rx) = queue::fair(4, 16, queue::VOICE_MAX_AGE);
+        offer_voice(&tx, Bytes::from(speaker_packet(1, b"a")));
+        offer_voice(&tx, Bytes::from(speaker_packet(2, b"b")));
+        let (first, _) = rx.recv().await.unwrap();
+        let (second, _) = rx.recv().await.unwrap();
+        assert_eq!([first, second], [1, 2]);
+    }
+
+    fn speaker_packet(speaker: u32, payload: &[u8]) -> Vec<u8> {
+        let mut packet = vec![1];
+        packet.extend_from_slice(&speaker.to_le_bytes());
+        packet.extend_from_slice(&[0; 9]);
+        packet.extend_from_slice(payload);
+        packet
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ryme_proto::{
     decode_server_frame, decode_tagged, encode_client, encode_tagged, parse_invite, ClientMsg,
@@ -89,7 +89,7 @@ pub struct VoicePipe {
 /// Frames the audio thread has not played yet. A full inbox drops the oldest.
 struct Inbox {
     cap: usize,
-    items: std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>,
+    items: std::sync::Mutex<std::collections::VecDeque<(Instant, Vec<u8>)>>,
 }
 
 impl Inbox {
@@ -102,14 +102,28 @@ impl Inbox {
 
     fn push(&self, packet: Vec<u8>) {
         let mut items = self.items.lock().unwrap();
+        let now = Instant::now();
+        while items
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) > crate::queue::VOICE_MAX_AGE)
+        {
+            items.pop_front();
+        }
         while items.len() >= self.cap {
             items.pop_front();
         }
-        items.push_back(packet);
+        items.push_back((now, packet));
     }
 
     fn pop(&self) -> Option<Vec<u8>> {
-        self.items.lock().unwrap().pop_front()
+        let mut items = self.items.lock().unwrap();
+        let now = Instant::now();
+        while let Some((at, packet)) = items.pop_front() {
+            if now.duration_since(at) <= crate::queue::VOICE_MAX_AGE {
+                return Some(packet);
+            }
+        }
+        None
     }
 }
 
@@ -206,6 +220,69 @@ pub enum LinkError {
 
 const TCP_AFTER: Duration = Duration::from_millis(300);
 const TCP_VOICE_QUEUE: usize = 6;
+const WRITE_WAIT: Duration = Duration::from_secs(15);
+
+/// One transport handshake, run on its own. A cancelled race is not a result.
+#[derive(Debug)]
+pub struct HandshakeReport {
+    pub transport: &'static str,
+    pub address: SocketAddr,
+    pub outcome: &'static str,
+    pub millis: u128,
+}
+
+pub async fn probe_invite(invite: &str) -> Result<Vec<HandshakeReport>, LinkError> {
+    let parsed = parse_invite(invite).map_err(|_| LinkError::Invite)?;
+    let addrs = addresses(&parsed.host, parsed.port)?;
+    let mut reports = Vec::new();
+    for addr in addrs {
+        let started = Instant::now();
+        let quic = dial(addr, parsed.fingerprint).await;
+        reports.push(HandshakeReport {
+            transport: "quic",
+            address: addr,
+            outcome: match &quic {
+                Ok(_) => "ok",
+                Err(err) => outcome(err),
+            },
+            millis: started.elapsed().as_millis(),
+        });
+        if let Ok((endpoint, conn)) = quic {
+            conn.close(quinn::VarInt::from_u32(0), b"probe");
+            endpoint.close(quinn::VarInt::from_u32(0), b"probe");
+        }
+        let started = Instant::now();
+        let tcp = dial_tcp(addr, parsed.fingerprint).await;
+        reports.push(HandshakeReport {
+            transport: "tcp",
+            address: addr,
+            outcome: match &tcp {
+                Ok(_) => "ok",
+                Err(err) => outcome(err),
+            },
+            millis: started.elapsed().as_millis(),
+        });
+        drop(tcp);
+    }
+    Ok(reports)
+}
+
+fn outcome(err: &LinkError) -> &'static str {
+    match err {
+        LinkError::Timeout => "timeout",
+        LinkError::Pin => "pin",
+        LinkError::Address => "address",
+        LinkError::Invite => "invite",
+        LinkError::Rejected(_) => "rejected",
+        LinkError::Unreachable => "unreachable",
+    }
+}
+
+fn diag(addr: SocketAddr, transport: &str, result: &str, millis: u128) {
+    if std::env::var_os("RYME_DIAG").is_some() {
+        eprintln!("ryme: {transport} {addr} {result} {millis}ms");
+    }
+}
 
 enum Opened {
     Quic(quinn::Endpoint, quinn::Connection),
@@ -251,7 +328,9 @@ pub(crate) async fn connect_tcp(
 }
 
 async fn open(addr: SocketAddr, fingerprint: [u8; 32]) -> Result<Opened, LinkError> {
+    let quic_started = Instant::now();
     let mut quic = tokio::spawn(dial(addr, fingerprint));
+    let tcp_started = Instant::now();
     let mut tcp = tokio::spawn(async move {
         tokio::time::sleep(TCP_AFTER).await;
         dial_tcp(addr, fingerprint).await
@@ -260,29 +339,59 @@ async fn open(addr: SocketAddr, fingerprint: [u8; 32]) -> Result<Opened, LinkErr
         q = &mut quic => match q {
             Ok(Ok((endpoint, conn))) => {
                 tcp.abort();
+                diag(addr, "quic", "ok", quic_started.elapsed().as_millis());
+                diag(addr, "tcp", "cancelled", tcp_started.elapsed().as_millis());
                 Ok(Opened::Quic(endpoint, conn))
             }
             Ok(Err(LinkError::Pin)) => {
                 tcp.abort();
+                diag(addr, "quic", "pin", quic_started.elapsed().as_millis());
                 Err(LinkError::Pin)
             }
-            Ok(Err(err)) => match tcp.await {
-                Ok(Ok(stream)) => Ok(Opened::Tcp(stream)),
-                Ok(Err(LinkError::Pin)) => Err(LinkError::Pin),
-                _ => Err(err),
-            },
+            Ok(Err(err)) => {
+                diag(addr, "quic", outcome(&err), quic_started.elapsed().as_millis());
+                match tcp.await {
+                    Ok(Ok(stream)) => {
+                        diag(addr, "tcp", "ok", tcp_started.elapsed().as_millis());
+                        Ok(Opened::Tcp(stream))
+                    }
+                    Ok(Err(LinkError::Pin)) => Err(LinkError::Pin),
+                    Ok(Err(tcp_err)) => {
+                        diag(addr, "tcp", outcome(&tcp_err), tcp_started.elapsed().as_millis());
+                        Err(err)
+                    }
+                    Err(_) => Err(err),
+                }
+            }
             Err(_) => Err(LinkError::Unreachable),
         },
         t = &mut tcp => match t {
             Ok(Ok(stream)) => {
                 quic.abort();
+                diag(addr, "tcp", "ok", tcp_started.elapsed().as_millis());
+                diag(addr, "quic", "cancelled", quic_started.elapsed().as_millis());
                 Ok(Opened::Tcp(stream))
             }
             Ok(Err(LinkError::Pin)) => {
                 quic.abort();
+                diag(addr, "tcp", "pin", tcp_started.elapsed().as_millis());
                 Err(LinkError::Pin)
             }
-            _ => match quic.await {
+            Ok(Err(tcp_err)) => {
+                diag(addr, "tcp", outcome(&tcp_err), tcp_started.elapsed().as_millis());
+                match quic.await {
+                    Ok(Ok((endpoint, conn))) => {
+                        diag(addr, "quic", "ok", quic_started.elapsed().as_millis());
+                        Ok(Opened::Quic(endpoint, conn))
+                    }
+                    Ok(Err(err)) => {
+                        diag(addr, "quic", outcome(&err), quic_started.elapsed().as_millis());
+                        Err(err)
+                    }
+                    Err(_) => Err(LinkError::Unreachable),
+                }
+            }
+            Err(_) => match quic.await {
                 Ok(Ok((endpoint, conn))) => Ok(Opened::Quic(endpoint, conn)),
                 Ok(Err(err)) => Err(err),
                 Err(_) => Err(LinkError::Unreachable),
@@ -521,6 +630,16 @@ where
     write.write_all(&frame).await.is_ok() && write.flush().await.is_ok()
 }
 
+async fn write_limited<W>(write: &mut W, tag: u8, payload: &[u8]) -> bool
+where
+    W: AsyncWrite + Unpin,
+{
+    matches!(
+        tokio::time::timeout(WRITE_WAIT, write_one(write, tag, payload)).await,
+        Ok(true)
+    )
+}
+
 async fn read_control<R>(read: &mut R, acc: &mut Vec<u8>) -> Result<ServerMsg, LinkError>
 where
     R: AsyncRead + Unpin,
@@ -585,7 +704,7 @@ async fn write_tcp_out<W>(
                 }
                 let Some(msg) = cmd_msg(cmd) else { continue };
                 let Ok(frame) = encode_client(&msg) else { break };
-                if !write_one(&mut write, TCP_CONTROL, &frame).await {
+                if !write_limited(&mut write, TCP_CONTROL, &frame).await {
                     break;
                 }
             }
@@ -595,14 +714,17 @@ async fn write_tcp_out<W>(
                 let Ok(frame) = encode_client(&ClientMsg::Ping { token }) else {
                     break;
                 };
-                if !write_one(&mut write, TCP_CONTROL, &frame).await {
+                if !write_limited(&mut write, TCP_CONTROL, &frame).await {
                     break;
                 }
             }
-            packet = voice_rx.recv() => {
+            packet = voice_rx.recv_within(crate::queue::VOICE_MAX_AGE) => {
                 match packet {
                     Some(packet) => {
-                        if !write_one(&mut write, TCP_VOICE, &packet).await {
+                        // A timed-out write may already have put bytes on the
+                        // stream. The connection closes instead of sending
+                        // another frame after that.
+                        if !write_limited(&mut write, TCP_VOICE, &packet).await {
                             break;
                         }
                     }

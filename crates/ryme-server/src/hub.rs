@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use ryme_proto::{decode_voice, ClientMsg, Member, ServerMsg};
+use ryme_proto::{voice_ok, ClientMsg, Member, ServerMsg};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
@@ -120,7 +120,7 @@ impl Hub {
 
     /// Who else should receive this datagram. Invalid, muted, or idle packets go nowhere.
     pub fn voice_targets(&self, from: u32, packet: &[u8]) -> Vec<u32> {
-        if decode_voice(packet).is_err() {
+        if !voice_ok(packet) {
             return Vec::new();
         }
         let Some(user) = self.users.get(&from) else {

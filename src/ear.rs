@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use magnum_opus::{Application, Bitrate, Channels, Decoder, Encoder};
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -348,7 +348,7 @@ pub fn open(
         }
     });
     let opened = ready_rx
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(Duration::from_secs(3))
         .unwrap_or(Opened {
             mic: false,
             speakers: false,
@@ -410,7 +410,9 @@ fn run(
 ) {
     let cap_rates = Arc::new(AtomicU32::new(0));
     let play_rates = Arc::new(AtomicU32::new(0));
-    let (cap_rate, mut cap_rx, mic, cap_thread) = start_capture(
+    let play_need = Arc::new(AtomicU32::new(0));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let capture = spawn_capture(
         stop.clone(),
         input,
         reset_in,
@@ -418,14 +420,19 @@ fn run(
         fail_in,
         cap_rates.clone(),
     );
-    let (play_rate, mut play_tx, speakers_on, play_thread) = start_playback(
+    let playback = spawn_playback(
         stop.clone(),
         output,
         reset_out,
         applied_out,
         fail_out,
         play_rates.clone(),
+        play_need.clone(),
     );
+    let (cap_rate, cap_rx, mic, cap_thread) = wait_device(capture, deadline);
+    let (play_rate, play_tx, speakers_on, play_thread) = wait_device(playback, deadline);
+    let mut cap_rx = Some(cap_rx);
+    let mut play_tx = Some(play_tx);
     let _ = ready.send(Opened {
         mic,
         speakers: speakers_on,
@@ -451,6 +458,7 @@ fn run(
     let mut seen_play = play_rate;
     let mut frame_device = (play_rate / 100).max(1) as usize;
     let mut tone_phase = 0.0f32;
+    let mut drift = 0usize;
 
     while !stop.load(Ordering::Relaxed) {
         if follow_rate(&cap_rates, &mut seen_cap) {
@@ -481,7 +489,8 @@ fn run(
             tell(&speaking, &mut shown, me, false);
         }
         if encoder.is_some() {
-            pull_capture(&mut cap_rx, &mut cap_pace, &mut cap_48);
+            let skipped = pull_capture(&mut cap_rx, &mut cap_pace, &mut cap_48, seen_cap);
+            seq = seq.wrapping_add(skipped_frames(skipped, seen_cap, RATE));
             while cap_48.len() >= FRAME {
                 let mut frame = [0f32; FRAME];
                 frame.copy_from_slice(&cap_48[..FRAME]);
@@ -504,10 +513,14 @@ fn run(
             }
         }
         if play_tx.is_some() {
+            let observed = play_need.load(Ordering::Relaxed);
+            let target = stage_target(frame_device, observed);
             let filled = RING - play_tx.as_ref().map(|tx| tx.slots()).unwrap_or(RING);
-            if filled + pending_play.len() < frame_device * 2 {
+            let mut ready = filled + pending_play.len();
+            let mut made = 0;
+            while ready < target && made < 12 {
                 let mut mix = [0f32; FRAME];
-                let heard = {
+                let _heard = {
                     let levels = levels.lock().unwrap().clone();
                     mix_frame(&mut speakers, &mut mix, &speaking, &mut shown, &levels)
                 };
@@ -519,11 +532,24 @@ fn run(
                     let _ = tone_left.fetch_sub(1, Ordering::Relaxed);
                     add_tone(&mut mix, &mut tone_phase);
                 }
-                if heard || testing {
-                    play_pace.convert(&mix, &mut pending_play);
-                }
+                let before = pending_play.len();
+                play_pace.convert(&mix, &mut pending_play);
+                ready += pending_play.len() - before;
+                made += 1;
             }
             if let Some(tx) = play_tx.as_mut() {
+                if drift.saturating_add(made) >= 100 {
+                    let fill = RING - tx.slots();
+                    drift_nudge(
+                        fill,
+                        frame_device,
+                        frame_device.saturating_mul(4),
+                        &mut pending_play,
+                    );
+                    drift = 0;
+                } else {
+                    drift = drift.saturating_add(made);
+                }
                 let written = {
                     let (done, _) = tx.push_partial_slice(&pending_play);
                     done.len()
@@ -533,12 +559,8 @@ fn run(
         }
         thread::sleep(Duration::from_millis(2));
     }
-    if let Some(thread) = cap_thread {
-        let _ = thread.join();
-    }
-    if let Some(thread) = play_thread {
-        let _ = thread.join();
-    }
+    let _ = cap_thread.join();
+    let _ = play_thread.join();
 }
 
 struct Mouth {
@@ -569,7 +591,7 @@ fn ingest(speakers: &mut HashMap<u32, Mouth>, packet: Vec<u8>, tcp: bool) {
             })
         }
     };
-    mouth.jitter.push(voice.seq, voice.payload);
+    mouth.jitter.push(voice.seq, voice.timestamp, voice.payload);
 }
 
 fn mix_frame(
@@ -632,9 +654,14 @@ fn add(mix: &mut [f32], pcm: &[f32]) {
     }
 }
 
+/// Unity through ordinary levels. Peaks bend toward full scale and keep a little headroom.
 fn soft(sample: f32) -> f32 {
-    let sample = sample * 0.8;
-    sample / (1.0 + sample.abs())
+    let level = sample.abs();
+    if level <= 0.85 {
+        return sample;
+    }
+    let extra = level - 0.85;
+    sample.signum() * (0.85 + extra / (1.0 + extra * 8.0) * 0.12)
 }
 
 struct Tone {
@@ -696,8 +723,7 @@ fn shape_frame(frame: &mut [f32], soften: bool, tone: &mut Tone) {
         }
     }
     for sample in frame.iter_mut() {
-        let x = *sample * MIC_GAIN;
-        *sample = x / (1.0 + x.abs());
+        *sample = soft(*sample * MIC_GAIN);
     }
 }
 
@@ -851,7 +877,8 @@ fn preview_loop(
 ) {
     let cap_rates = Arc::new(AtomicU32::new(0));
     let play_rates = Arc::new(AtomicU32::new(0));
-    let (cap_rate, mut cap_rx, _, cap_thread) = start_capture(
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let capture = spawn_capture(
         stop.clone(),
         input,
         reset_in,
@@ -859,14 +886,19 @@ fn preview_loop(
         fail_in,
         cap_rates.clone(),
     );
-    let (play_rate, mut play_tx, _, play_thread) = start_playback(
+    let playback = spawn_playback(
         stop.clone(),
         output,
         reset_out,
         applied_out,
         fail_out,
         play_rates.clone(),
+        Arc::new(AtomicU32::new(0)),
     );
+    let (cap_rate, cap_rx, _, cap_thread) = wait_device(capture, deadline);
+    let (play_rate, play_tx, _, play_thread) = wait_device(playback, deadline);
+    let mut cap_rx = Some(cap_rx);
+    let mut play_tx = Some(play_tx);
     let mut cap_pace = Pace::new(cap_rate, RATE);
     let mut play_pace = Pace::new(RATE, play_rate);
     let mut seen_cap = cap_rate;
@@ -886,7 +918,7 @@ fn preview_loop(
             play_pace = Pace::new(RATE, seen_play);
             pending.clear();
         }
-        pull_capture(&mut cap_rx, &mut cap_pace, &mut cap_48);
+        pull_capture(&mut cap_rx, &mut cap_pace, &mut cap_48, seen_cap);
         while cap_48.len() >= FRAME {
             let mut frame = [0f32; FRAME];
             frame.copy_from_slice(&cap_48[..FRAME]);
@@ -908,53 +940,66 @@ fn preview_loop(
         }
         thread::sleep(Duration::from_millis(2));
     }
-    if let Some(thread) = cap_thread {
-        let _ = thread.join();
-    }
-    if let Some(thread) = play_thread {
-        let _ = thread.join();
+    let _ = cap_thread.join();
+    let _ = play_thread.join();
+}
+
+struct DeviceStart<T> {
+    end: T,
+    ready: std::sync::mpsc::Receiver<(bool, u32)>,
+    thread: JoinHandle<()>,
+}
+
+fn wait_device<T>(started: DeviceStart<T>, deadline: Instant) -> (u32, T, bool, JoinHandle<()>) {
+    let left = deadline.saturating_duration_since(Instant::now());
+    match started.ready.recv_timeout(left) {
+        Ok((true, rate)) => (rate, started.end, true, started.thread),
+        _ => (RATE, started.end, false, started.thread),
     }
 }
 
-fn start_capture(
+fn spawn_capture(
     stop: Arc<AtomicBool>,
     name: Arc<Mutex<String>>,
     reset: Arc<AtomicBool>,
     applied: Arc<Mutex<String>>,
     failed: Arc<AtomicBool>,
     rate_out: Arc<AtomicU32>,
-) -> (u32, Option<Consumer<f32>>, bool, Option<JoinHandle<()>>) {
+) -> DeviceStart<Consumer<f32>> {
     let (producer, consumer) = RingBuffer::<f32>::new(RING);
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let (ready_tx, ready) = std::sync::mpsc::sync_channel(1);
     let thread = thread::spawn(move || {
         capture_thread(
             stop, producer, ready_tx, name, reset, applied, failed, rate_out,
         )
     });
-    match ready_rx.recv_timeout(Duration::from_secs(2)) {
-        Ok((true, rate)) => (rate, Some(consumer), true, Some(thread)),
-        _ => (RATE, None, false, Some(thread)),
+    DeviceStart {
+        end: consumer,
+        ready,
+        thread,
     }
 }
 
-fn start_playback(
+fn spawn_playback(
     stop: Arc<AtomicBool>,
     name: Arc<Mutex<String>>,
     reset: Arc<AtomicBool>,
     applied: Arc<Mutex<String>>,
     failed: Arc<AtomicBool>,
     rate_out: Arc<AtomicU32>,
-) -> (u32, Option<Producer<f32>>, bool, Option<JoinHandle<()>>) {
+    play_need: Arc<AtomicU32>,
+) -> DeviceStart<Producer<f32>> {
     let (producer, consumer) = RingBuffer::<f32>::new(RING);
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let (ready_tx, ready) = std::sync::mpsc::sync_channel(1);
     let thread = thread::spawn(move || {
         playback_thread(
-            stop, consumer, ready_tx, name, reset, applied, failed, rate_out,
+            stop, consumer, ready_tx, name, reset, applied, failed, rate_out, play_need,
         )
     });
-    match ready_rx.recv_timeout(Duration::from_secs(2)) {
-        Ok((true, rate)) => (rate, Some(producer), true, Some(thread)),
-        _ => (RATE, None, false, Some(thread)),
+    DeviceStart {
+        end: producer,
+        ready,
+        thread,
     }
 }
 
@@ -1042,24 +1087,27 @@ fn playback_thread(
     applied: Arc<Mutex<String>>,
     failed: Arc<AtomicBool>,
     rate_out: Arc<AtomicU32>,
+    play_need: Arc<AtomicU32>,
 ) {
     let mut pcm: Option<alsa::Pcm> = None;
     let mut opened_name = String::new();
     let mut announced = false;
     let mut channels = 1usize;
-    let mut buf = vec![0i16; FRAME];
+    let mut pending: Option<PcmBlock> = None;
     while !stop.load(Ordering::Relaxed) {
         let switching = reset.swap(false, Ordering::Relaxed);
         let chosen = name.lock().unwrap().clone();
         if pcm.is_none() || (switching && chosen != opened_name) {
+            pending = None;
             match alsa::open(false, &chosen) {
                 Some(fresh) => {
                     if let Some(old) = pcm.take() {
                         unsafe { alsa::snd_pcm_close(old.pcm) };
                     }
                     channels = fresh.channels as usize;
-                    buf.resize(FRAME * channels, 0);
                     let rate = fresh.rate;
+                    play_need.store(fresh.period, Ordering::Relaxed);
+                    discard_consumer(&mut consumer);
                     pcm = Some(fresh);
                     opened_name = chosen.clone();
                     *applied.lock().unwrap() = chosen;
@@ -1086,35 +1134,60 @@ fn playback_thread(
         let Some(handle) = pcm.as_ref().map(|opened| opened.pcm) else {
             continue;
         };
-        for frame in 0..FRAME {
-            let sample = consumer.pop().unwrap_or(0.0);
-            let sample = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
-            for channel in 0..channels {
-                buf[frame * channels + channel] = sample;
-            }
+        if pending.is_none() {
+            pending = Some(take_playback(&mut consumer, channels));
         }
-        let mut sent = 0usize;
-        while sent < FRAME && !stop.load(Ordering::Relaxed) {
+        let wrote = {
+            let Some(block) = pending.as_mut() else {
+                continue;
+            };
             let wrote = unsafe {
                 alsa::snd_pcm_writei(
                     handle,
-                    buf[sent * channels..].as_ptr().cast(),
-                    (FRAME - sent) as std::ffi::c_ulong,
+                    block.rest().as_ptr().cast(),
+                    (block.frames - block.sent) as std::ffi::c_ulong,
                 )
             };
-            if wrote <= 0 {
-                if !alsa::again(wrote)
-                    && unsafe { alsa::snd_pcm_recover(handle, wrote as i32, 1) } < 0
-                {
+            (wrote, note_write(block, classify_pcm(wrote)))
+        };
+        match wrote.1 {
+            PcmStep::Done => pending = None,
+            PcmStep::Pending => {
+                let wait = unsafe { alsa::snd_pcm_wait(handle, 20) };
+                if wait < 0 {
+                    match classify_pcm(wait as i64) {
+                        PcmWrite::Underrun => {
+                            if unsafe { alsa::snd_pcm_recover(handle, wait, 1) } < 0 {
+                                if let Some(old) = pcm.take() {
+                                    unsafe { alsa::snd_pcm_close(old.pcm) };
+                                }
+                                pending = None;
+                            }
+                        }
+                        PcmWrite::Removed => {
+                            if let Some(old) = pcm.take() {
+                                unsafe { alsa::snd_pcm_close(old.pcm) };
+                            }
+                            pending = None;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            PcmStep::Recover => {
+                if unsafe { alsa::snd_pcm_recover(handle, wrote.0 as i32, 1) } < 0 {
                     if let Some(old) = pcm.take() {
                         unsafe { alsa::snd_pcm_close(old.pcm) };
                     }
+                    pending = None;
                 }
-                thread::sleep(Duration::from_millis(2));
-                break;
             }
-            let wrote = (wrote as usize).min(FRAME - sent);
-            sent += wrote;
+            PcmStep::Close => {
+                if let Some(old) = pcm.take() {
+                    unsafe { alsa::snd_pcm_close(old.pcm) };
+                }
+                pending = None;
+            }
         }
     }
     if let Some(old) = pcm {
@@ -1140,6 +1213,7 @@ mod alsa {
         pub fn snd_pcm_recover(pcm: *mut c_void, err: c_int, silent: c_int) -> c_int;
         pub fn snd_pcm_readi(pcm: *mut c_void, buffer: *mut c_void, size: c_ulong) -> c_long;
         pub fn snd_pcm_writei(pcm: *mut c_void, buffer: *const c_void, size: c_ulong) -> c_long;
+        pub fn snd_pcm_wait(pcm: *mut c_void, timeout: c_int) -> c_int;
         fn snd_pcm_hw_params_malloc(ptr: *mut *mut c_void) -> c_int;
         fn snd_pcm_hw_params_free(ptr: *mut c_void);
         fn snd_pcm_hw_params_any(pcm: *mut c_void, params: *mut c_void) -> c_int;
@@ -1181,12 +1255,18 @@ mod alsa {
             rate: *mut u32,
             dir: *mut c_int,
         ) -> c_int;
+        fn snd_pcm_hw_params_get_period_size(
+            params: *const c_void,
+            val: *mut c_ulong,
+            dir: *mut c_int,
+        ) -> c_int;
     }
 
     pub struct Pcm {
         pub pcm: *mut c_void,
         pub rate: u32,
         pub channels: u32,
+        pub period: u32,
     }
 
     pub fn open(capture: bool, device: &str) -> Option<Pcm> {
@@ -1232,6 +1312,8 @@ mod alsa {
                 && snd_pcm_nonblock(pcm, 1) >= 0
         };
         let _ = unsafe { snd_pcm_hw_params_get_rate(params, &mut rate, &mut dir) };
+        let mut period_got = period;
+        let _ = unsafe { snd_pcm_hw_params_get_period_size(params, &mut period_got, &mut dir) };
         unsafe { snd_pcm_hw_params_free(params) };
         if !ok {
             unsafe { snd_pcm_close(pcm) };
@@ -1241,6 +1323,7 @@ mod alsa {
             pcm,
             rate,
             channels,
+            period: period_got.max(1) as u32,
         })
     }
 
@@ -1349,8 +1432,9 @@ fn playback_thread(
     applied: Arc<Mutex<String>>,
     failed: Arc<AtomicBool>,
     rate_out: Arc<AtomicU32>,
+    play_need: Arc<AtomicU32>,
 ) {
-    let shared = Arc::new(Mutex::new(consumer));
+    let shared = Arc::new(Mutex::new(Some(consumer)));
     let mut announced = false;
     let mut current: Option<HeldOutput> = None;
     while !stop.load(Ordering::Relaxed) {
@@ -1359,8 +1443,12 @@ fn playback_thread(
         let rebuild = current.is_none()
             || (switching && current.as_ref().is_some_and(|held| held.name != chosen));
         if rebuild {
+            current = None;
+            if let Some(rx) = shared.lock().unwrap().as_mut() {
+                discard_consumer(rx);
+            }
             let broken = Arc::new(AtomicBool::new(false));
-            match build_output(&chosen, shared.clone(), broken.clone()) {
+            match build_output(&chosen, shared.clone(), broken.clone(), play_need.clone()) {
                 Some((stream, rate)) => {
                     current = Some(HeldOutput {
                         _stream: stream,
@@ -1434,32 +1522,96 @@ fn build_input(
 }
 
 #[cfg(not(target_os = "linux"))]
+struct GiveBack {
+    consumer: Option<Consumer<f32>>,
+    slot: Arc<Mutex<Option<Consumer<f32>>>>,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Drop for GiveBack {
+    fn drop(&mut self) {
+        if let Some(consumer) = self.consumer.take() {
+            *self.slot.lock().unwrap() = Some(consumer);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
 fn build_output(
     name: &str,
-    shared: Arc<Mutex<Consumer<f32>>>,
+    shared: Arc<Mutex<Option<Consumer<f32>>>>,
     broken: Arc<AtomicBool>,
+    play_need: Arc<AtomicU32>,
 ) -> Option<(cpal::Stream, u32)> {
     use cpal::traits::{DeviceTrait, StreamTrait};
     let device = pick_device(name, false)?;
     let supported = device.default_output_config().ok()?;
-    let chosen = prefer_f32(&device, supported, false);
+    let chosen = prefer_output(&device, supported)?;
     let channels = chosen.channels() as usize;
-    let rate = chosen.sample_rate();
-    let stream = device
+    let rate = chosen.sample_rate().0;
+    let format = chosen.sample_format();
+    let short = stream_config(&chosen);
+    let stream = open_output(
+        &device,
+        short,
+        format,
+        channels,
+        shared.clone(),
+        broken.clone(),
+        play_need.clone(),
+    )
+    .or_else(|| {
+        open_output(
+            &device,
+            cpal::StreamConfig {
+                channels: chosen.channels(),
+                sample_rate: chosen.sample_rate(),
+                buffer_size: cpal::BufferSize::Default,
+            },
+            format,
+            channels,
+            shared,
+            broken,
+            play_need,
+        )
+    })?;
+    stream.play().ok()?;
+    Some((stream, rate))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_output(
+    device: &cpal::Device,
+    config: cpal::StreamConfig,
+    format: cpal::SampleFormat,
+    channels: usize,
+    shared: Arc<Mutex<Option<Consumer<f32>>>>,
+    broken: Arc<AtomicBool>,
+    play_need: Arc<AtomicU32>,
+) -> Option<cpal::Stream> {
+    use cpal::traits::DeviceTrait;
+    let consumer = shared.lock().unwrap().take()?;
+    let mut held = GiveBack {
+        consumer: Some(consumer),
+        slot: shared,
+    };
+    device
         .build_output_stream_raw(
-            stream_config(&chosen),
-            chosen.sample_format(),
+            config,
+            format,
             move |data, _| {
-                if let Ok(mut consumer) = shared.lock() {
-                    fill_captured(data, channels, &mut consumer);
+                let frames = data.len() / channels.max(1);
+                if frames > 0 {
+                    play_need.store(frames as u32, Ordering::Relaxed);
+                }
+                if let Some(consumer) = held.consumer.as_mut() {
+                    fill_captured(data, channels, consumer);
                 }
             },
             move |_| broken.store(true, Ordering::Relaxed),
             None,
         )
-        .ok()?;
-    stream.play().ok()?;
-    Some((stream, rate))
+        .ok()
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1500,10 +1652,17 @@ fn pick_device(name: &str, input: bool) -> Option<cpal::Device> {
 
 #[cfg(not(target_os = "linux"))]
 fn stream_config(supported: &cpal::SupportedStreamConfig) -> cpal::StreamConfig {
+    let buffer_size = match supported.buffer_size() {
+        cpal::SupportedBufferSize::Range { min, max } => {
+            let want = (supported.sample_rate().0 / 100).clamp(*min, *max);
+            cpal::BufferSize::Fixed(want)
+        }
+        cpal::SupportedBufferSize::Unknown => cpal::BufferSize::Default,
+    };
     cpal::StreamConfig {
         channels: supported.channels(),
         sample_rate: supported.sample_rate(),
-        buffer_size: cpal::BufferSize::Default,
+        buffer_size,
     }
 }
 
@@ -1547,6 +1706,45 @@ fn choose_f32(
         })
         .map(|range| range.with_sample_rate(rate))
         .unwrap_or(fallback)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn host_format(format: cpal::SampleFormat) -> PcmFormat {
+    use cpal::SampleFormat::*;
+    match format {
+        F32 => PcmFormat::F32,
+        F64 => PcmFormat::F64,
+        I16 => PcmFormat::I16,
+        I24 => PcmFormat::I24,
+        I32 => PcmFormat::I32,
+        U8 => PcmFormat::U8,
+        U16 => PcmFormat::U16,
+        _ => PcmFormat::Other,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn prefer_output(
+    device: &cpal::Device,
+    fallback: cpal::SupportedStreamConfig,
+) -> Option<cpal::SupportedStreamConfig> {
+    use cpal::traits::DeviceTrait;
+    if let Ok(ranges) = device.supported_output_configs() {
+        let rate = fallback.sample_rate();
+        let channels = fallback.channels();
+        if playback_converts(host_format(fallback.sample_format())) {
+            return Some(fallback);
+        }
+        return ranges
+            .find(|range| {
+                playback_converts(host_format(range.sample_format()))
+                    && range.channels() == channels
+                    && range.min_sample_rate() <= rate
+                    && range.max_sample_rate() >= rate
+            })
+            .map(|range| range.with_sample_rate(rate));
+    }
+    playback_converts(host_format(fallback.sample_format())).then_some(fallback)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1649,6 +1847,20 @@ fn fill_captured(data: &mut cpal::Data, channels: usize, consumer: &mut Consumer
                 });
             }
         }
+        U8 => {
+            if let Some(samples) = data.as_slice_mut::<u8>() {
+                fill_mapped(samples, channels, consumer, |sample| {
+                    (sample.clamp(-1.0, 1.0) * 127.0 + 128.0) as u8
+                });
+            }
+        }
+        U16 => {
+            if let Some(samples) = data.as_slice_mut::<u16>() {
+                fill_mapped(samples, channels, consumer, |sample| {
+                    (sample.clamp(-1.0, 1.0) * 32767.0 + 32768.0) as u16
+                });
+            }
+        }
         _ => {}
     }
 }
@@ -1737,6 +1949,139 @@ fn fill_i16(samples: &mut [i16], channels: usize, consumer: &mut Consumer<f32>) 
     }
 }
 
+struct PcmBlock {
+    samples: Vec<i16>,
+    channels: usize,
+    frames: usize,
+    sent: usize,
+}
+
+impl PcmBlock {
+    fn new(samples: Vec<i16>, channels: usize, frames: usize) -> Self {
+        Self {
+            samples,
+            channels: channels.max(1),
+            frames,
+            sent: 0,
+        }
+    }
+
+    fn done(&self) -> bool {
+        self.sent >= self.frames
+    }
+
+    fn rest(&self) -> &[i16] {
+        let start = self.sent.saturating_mul(self.channels);
+        &self.samples[start.min(self.samples.len())..]
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PcmWrite {
+    Wrote(usize),
+    Again,
+    Underrun,
+    Removed,
+}
+
+enum PcmStep {
+    Pending,
+    Done,
+    Recover,
+    Close,
+}
+
+/// Advance the unsent offset. A short write or EAGAIN keeps the rest of the block.
+fn note_write(block: &mut PcmBlock, result: PcmWrite) -> PcmStep {
+    match result {
+        PcmWrite::Wrote(0) | PcmWrite::Again => PcmStep::Pending,
+        PcmWrite::Wrote(n) => {
+            block.sent = (block.sent + n).min(block.frames);
+            if block.done() {
+                PcmStep::Done
+            } else {
+                PcmStep::Pending
+            }
+        }
+        PcmWrite::Underrun => PcmStep::Recover,
+        PcmWrite::Removed => PcmStep::Close,
+    }
+}
+
+fn classify_pcm(wrote: i64) -> PcmWrite {
+    if wrote > 0 {
+        PcmWrite::Wrote(wrote as usize)
+    } else if matches!(wrote, 0 | -4 | -11) {
+        PcmWrite::Again
+    } else if wrote == -32 {
+        PcmWrite::Underrun
+    } else {
+        PcmWrite::Removed
+    }
+}
+
+/// Samples to stage: the callback's demand, plus one frame of margin.
+fn stage_target(frame: usize, observed: u32) -> usize {
+    let frame = frame.max(1);
+    if observed == 0 {
+        frame * 2
+    } else {
+        observed as usize + frame
+    }
+}
+
+/// Device samples to discard so capture keeps about 40 ms of the newest audio.
+fn capture_skip(available: usize, rate: u32) -> usize {
+    let keep = (rate as usize / 25).max(FRAME);
+    available.saturating_sub(keep)
+}
+
+fn skipped_frames(skipped: usize, from: u32, to: u32) -> u32 {
+    let at_out = (skipped as u64).saturating_mul(u64::from(to)) / u64::from(from.max(1));
+    (at_out / FRAME as u64) as u32
+}
+
+/// Drop one sample when the device is behind, or repeat one when it is ahead.
+fn drift_nudge(fill: usize, low: usize, high: usize, pending: &mut Vec<f32>) {
+    if pending.is_empty() {
+        return;
+    }
+    if fill > high {
+        pending.remove(0);
+    } else if fill < low {
+        let sample = pending[0];
+        pending.insert(0, sample);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+enum PcmFormat {
+    F32,
+    F64,
+    I16,
+    I24,
+    I32,
+    U8,
+    U16,
+    Other,
+}
+
+fn playback_converts(format: PcmFormat) -> bool {
+    !matches!(format, PcmFormat::Other)
+}
+
+fn pick_format(fallback: PcmFormat, available: &[PcmFormat]) -> Option<PcmFormat> {
+    if playback_converts(fallback) {
+        Some(fallback)
+    } else {
+        available
+            .iter()
+            .copied()
+            .find(|format| playback_converts(*format))
+    }
+}
+
 fn follow_rate(slot: &AtomicU32, seen: &mut u32) -> bool {
     let rate = slot.load(Ordering::Relaxed);
     if rate == 0 || rate == *seen {
@@ -1747,6 +2092,10 @@ fn follow_rate(slot: &AtomicU32, seen: &mut u32) -> bool {
 }
 
 fn discard(rx: &mut Consumer<f32>) {
+    discard_consumer(rx);
+}
+
+fn discard_consumer(rx: &mut Consumer<f32>) {
     let mut scratch = [0f32; 1024];
     loop {
         let n = rx.pop_partial_slice(&mut scratch).0.len();
@@ -1754,6 +2103,19 @@ fn discard(rx: &mut Consumer<f32>) {
             break;
         }
     }
+}
+
+fn take_playback(consumer: &mut Consumer<f32>, channels: usize) -> PcmBlock {
+    let channels = channels.max(1);
+    let mut samples = Vec::with_capacity(FRAME * channels);
+    for _ in 0..FRAME {
+        let sample = consumer.pop().unwrap_or(0.0);
+        let sample = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
+        for _ in 0..channels {
+            samples.push(sample);
+        }
+    }
+    PcmBlock::new(samples, channels, FRAME)
 }
 
 /// A failed switch puts the requested name back, so the open device and the
@@ -1765,11 +2127,32 @@ fn keep_opened(name: &Mutex<String>, failed: &str, opened: &str) {
     }
 }
 
-fn pull_capture(rx: &mut Option<Consumer<f32>>, pace: &mut Pace, into: &mut Vec<f32>) {
+fn pull_capture(
+    rx: &mut Option<Consumer<f32>>,
+    pace: &mut Pace,
+    into: &mut Vec<f32>,
+    rate: u32,
+) -> usize {
     let Some(rx) = rx else {
-        return;
+        return 0;
     };
+    let skip = capture_skip(rx.slots(), rate);
+    let mut skipped = 0usize;
     let mut scratch = [0f32; 1024];
+    while skipped < skip {
+        let n = {
+            let (got, _) = rx.pop_partial_slice(&mut scratch);
+            got.len()
+        };
+        if n == 0 {
+            break;
+        }
+        let take = n.min(skip - skipped);
+        skipped += take;
+        if take < n {
+            pace.convert(&scratch[take..n], into);
+        }
+    }
     loop {
         let n = {
             let (got, _) = rx.pop_partial_slice(&mut scratch);
@@ -1780,6 +2163,7 @@ fn pull_capture(rx: &mut Option<Consumer<f32>>, pace: &mut Pace, into: &mut Vec<
         }
         pace.convert(&scratch[..n], into);
     }
+    skipped
 }
 
 fn push_i16(producer: &mut Producer<f32>, samples: &[i16], channels: usize) {
@@ -2275,6 +2659,67 @@ fn mac_hid(letter: char) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_partial_write_and_two_eagains_still_deliver_the_block() {
+        let frames: Vec<i16> = (0..480).map(|n| n as i16).collect();
+        let mut block = PcmBlock::new(frames.clone(), 1, 480);
+        let script = [
+            PcmWrite::Wrote(120),
+            PcmWrite::Again,
+            PcmWrite::Again,
+            PcmWrite::Wrote(360),
+        ];
+        let mut delivered = Vec::new();
+        for step in script {
+            if let PcmWrite::Wrote(n) = step {
+                let n = n.min(block.frames - block.sent);
+                delivered.extend_from_slice(&block.rest()[..n]);
+            }
+            if matches!(note_write(&mut block, step), PcmStep::Done) {
+                break;
+            }
+        }
+        assert!(block.done());
+        assert_eq!(delivered, frames);
+    }
+
+    #[test]
+    fn staging_covers_the_callback_and_capture_keeps_recent_audio() {
+        assert_eq!(stage_target(480, 0), 960);
+        assert_eq!(stage_target(480, 2048), 2048 + 480);
+        assert_eq!(capture_skip(16_384, 48_000), 16_384 - (48_000 / 25));
+        assert_eq!(skipped_frames(4800, 48_000, 48_000), 10);
+        assert_eq!(skipped_frames(9600, 96_000, 48_000), 10);
+    }
+
+    #[test]
+    fn drift_drops_when_full_and_repeats_when_empty() {
+        let mut pending = vec![1.0, 2.0];
+        drift_nudge(100, 10, 40, &mut pending);
+        assert_eq!(pending, vec![2.0]);
+        let mut pending = vec![3.0];
+        drift_nudge(0, 10, 40, &mut pending);
+        assert_eq!(pending, vec![3.0, 3.0]);
+    }
+
+    #[test]
+    fn ordinary_levels_stay_near_unity_and_peaks_stay_under_full_scale() {
+        assert!((soft(0.2) - 0.2).abs() < 0.0001);
+        let peak = soft(2.0);
+        assert!(peak < 1.0);
+        assert!(peak > 0.85);
+    }
+
+    #[test]
+    fn an_unsupported_playback_format_is_not_treated_as_open() {
+        assert!(playback_converts(PcmFormat::U16));
+        assert_eq!(
+            pick_format(PcmFormat::Other, &[PcmFormat::U16, PcmFormat::F32]),
+            Some(PcmFormat::U16)
+        );
+        assert_eq!(pick_format(PcmFormat::Other, &[PcmFormat::Other]), None);
+    }
 
     #[test]
     fn pcm_lines_split_microphones_from_speakers() {

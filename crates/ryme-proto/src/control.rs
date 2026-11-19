@@ -45,6 +45,11 @@ pub enum ClientMsg {
     Ping {
         token: u64,
     },
+    /// Ask whether this connection can carry a voice datagram, without taking a seat.
+    Probe {
+        pass: [u8; 32],
+        nonce: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +94,10 @@ pub enum ServerMsg {
         name: String,
         text: String,
         mine: bool,
+    },
+    /// The nonce from `Probe`, unchanged. The datagram echo is separate.
+    ProbeAck {
+        nonce: u64,
     },
 }
 

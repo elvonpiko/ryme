@@ -206,6 +206,9 @@ impl Link {
         if let Cmd::Join(channel) = &cmd {
             *self.channel.lock().unwrap() = channel.clone();
         }
+        if matches!(cmd, Cmd::Leave) {
+            self.channel.lock().unwrap().clear();
+        }
         if matches!(cmd, Cmd::Logout) {
             let _ = self.stop.send(true);
         }
@@ -1011,8 +1014,15 @@ async fn move_to_quic(
         }
     };
     let ticket = *link.resume.lock().unwrap();
-    // Set before hello. The server drops the TCP seat as it accepts this one,
-    // and that close must not end the call.
+    // Hello replaces the TCP seat. Do it only after a voice datagram has
+    // echoed, so a failed check leaves the working call alone.
+    if prove_media(&conn, &mut send, &mut recv, pass)
+        .await
+        .is_err()
+    {
+        drop_quic(&endpoint, &conn);
+        return Err(LinkError::Unreachable);
+    }
     link.quiet.store(true, Ordering::SeqCst);
     if write_msg(
         &mut send,
@@ -1045,27 +1055,9 @@ async fn move_to_quic(
         }
     };
     let channel = link.channel.lock().unwrap().clone();
-    let joined = write_msg(&mut send, &ClientMsg::Join { channel })
-        .await
-        .is_ok();
-    let joined = joined
-        && matches!(
-            read_msg(&mut recv, &mut buf).await,
-            Ok(ServerMsg::Joined { .. })
-        );
-    let token = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_micros() as u64)
-        .unwrap_or(1);
-    let proved = joined
-        && write_msg(&mut send, &ClientMsg::Ping { token })
-            .await
-            .is_ok()
-        && wait_pong(&mut recv, &mut buf, &link.events, token).await;
-    if !proved {
-        drop_quic(&endpoint, &conn);
-        let _ = link.events.send(Event::Disconnected);
-        return Err(LinkError::Timeout);
+    if !channel.is_empty() {
+        let _ = write_msg(&mut send, &ClientMsg::Join { channel }).await;
+        let _ = read_msg(&mut recv, &mut buf).await;
     }
     let (voice_tx, voice_rx) = tokio::sync::mpsc::channel(32);
     let (cmd_tx, cmd_rx) = unbounded_channel();
@@ -1091,52 +1083,36 @@ async fn move_to_quic(
     Ok(())
 }
 
-async fn wait_pong(
+async fn prove_media(
+    conn: &quinn::Connection,
+    send: &mut quinn::SendStream,
     recv: &mut quinn::RecvStream,
-    buf: &mut Vec<u8>,
-    events: &UnboundedSender<Event>,
-    token: u64,
-) -> bool {
+    pass: [u8; 32],
+) -> Result<(), LinkError> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos() as u64)
+        .unwrap_or(1);
+    write_msg(send, &ClientMsg::Probe { pass, nonce }).await?;
+    let mut buf = Vec::new();
+    match read_msg(recv, &mut buf).await? {
+        ServerMsg::ProbeAck { nonce: got } if got == nonce => {}
+        _ => return Err(LinkError::Unreachable),
+    }
+    let packet = ryme_proto::encode_probe(nonce);
+    conn.send_datagram(bytes::Bytes::from(packet))
+        .map_err(|_| LinkError::Unreachable)?;
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         let left = deadline.saturating_duration_since(Instant::now());
-        let Ok(Ok(msg)) = tokio::time::timeout(left, read_msg(recv, buf)).await else {
-            return false;
+        let Ok(Ok(got)) = tokio::time::timeout(left, conn.read_datagram()).await else {
+            return Err(LinkError::Timeout);
         };
-        match msg {
-            ServerMsg::Pong { token: got } if got == token => return true,
-            ServerMsg::Past { .. } | ServerMsg::Joined { .. } | ServerMsg::Welcome { .. } => {}
-            ServerMsg::Pong { .. } => {}
-            other => {
-                if let Some(event) = control_event(other) {
-                    if events.send(event).is_err() {
-                        return false;
-                    }
-                }
-            }
+        if ryme_proto::decode_probe(&got) == Some(nonce) {
+            return Ok(());
         }
     }
-    false
-}
-
-fn control_event(msg: ServerMsg) -> Option<Event> {
-    Some(match msg {
-        ServerMsg::PeerJoined {
-            user_id,
-            name,
-            card,
-        } => Event::PeerJoined {
-            user_id,
-            name,
-            card,
-        },
-        ServerMsg::PeerLeft { user_id } => Event::PeerLeft { user_id },
-        ServerMsg::Chat { user_id, text } => Event::Chat { user_id, text },
-        ServerMsg::Muted { user_id, muted } => Event::Muted { user_id, muted },
-        ServerMsg::Left => Event::Left,
-        ServerMsg::Reject { reason } => Event::Rejected { reason },
-        _ => return None,
-    })
+    Err(LinkError::Timeout)
 }
 
 fn classify(err: impl std::fmt::Display) -> LinkError {
@@ -1732,6 +1708,97 @@ mod tests {
         .expect("chat");
         assert_eq!(chat.0, moved.0);
         assert_eq!(chat.1, "still here");
+    }
+
+    #[tokio::test]
+    async fn leaving_on_tcp_is_not_undone_when_quic_connects() {
+        let (port, fingerprint, pass, _task) = up().await;
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let mut live = connect_tcp(addr, fingerprint, "Mara", 7, pass, [0; 32])
+            .await
+            .unwrap();
+        live.link.leave();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(live.events.recv().await, Some(Event::Left)) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("left");
+        let link = live.link.clone();
+        tokio::spawn(pursue_quic(
+            addr,
+            fingerprint,
+            "Mara".into(),
+            7,
+            pass,
+            None,
+            link,
+        ));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match live.events.recv().await {
+                    Some(Event::Moved { .. }) => break,
+                    Some(Event::Joined { .. }) => panic!("promotion put the caller back in a room"),
+                    Some(Event::Disconnected) => panic!("the call dropped"),
+                    Some(_) => {}
+                    None => panic!("events closed"),
+                }
+            }
+        })
+        .await
+        .expect("move");
+        let url = invite(port, fingerprint, pass);
+        let other = connect(&url, "Jonas", 8, [0; 32]).await.unwrap();
+        let packet = ryme_proto::encode_voice(&ryme_proto::VoicePacket {
+            speaker: 0,
+            seq: 1,
+            timestamp: 480,
+            flags: 0,
+            payload: vec![4, 4],
+        })
+        .unwrap();
+        other.voice.send(packet);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(live.voice.try_recv().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_quic_attempt_leaves_the_tcp_call_up() {
+        let (port, fingerprint, pass, _task) = up().await;
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let mut live = connect_tcp(addr, fingerprint, "Mara", 9, pass, [0; 32])
+            .await
+            .unwrap();
+        let link = live.link.clone();
+        tokio::spawn(pursue_quic(
+            SocketAddr::from(([127, 0, 0, 1], 1)),
+            fingerprint,
+            "Mara".into(),
+            9,
+            pass,
+            None,
+            link,
+        ));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(!matches!(live.events.try_recv(), Ok(Event::Disconnected)));
+        let url = invite(port, fingerprint, pass);
+        let mut other = connect(&url, "Jonas", 10, [0; 32]).await.unwrap();
+        live.link.chat("still here");
+        let chat = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match other.events.recv().await {
+                    Some(Event::Chat { text, .. }) => break text,
+                    Some(_) => {}
+                    None => panic!("events closed"),
+                }
+            }
+        })
+        .await
+        .expect("chat");
+        assert_eq!(chat, "still here");
     }
 
     #[tokio::test]

@@ -261,6 +261,10 @@ pub async fn run(conn: quinn::Connection, world: Arc<Mutex<World>>) {
             datagram = conn.read_datagram() => {
                 match datagram {
                     Ok(packet) => {
+                        if user_id.is_none() && ryme_proto::decode_probe(&packet).is_some() {
+                            let _ = conn.send_datagram(packet);
+                            continue;
+                        }
                         // A burst over the cap is discarded. Hanging up here is
                         // what made a live microphone reconnect every few seconds.
                         if !pace.allow(true) {
@@ -307,6 +311,20 @@ fn drain_frames(
                 if let ClientMsg::Ping { token } = msg {
                     // A full control queue drops the echo. It does not close the call.
                     let _ = pipes.control.try_send(ServerMsg::Pong { token });
+                    continue;
+                }
+                if let ClientMsg::Probe { pass, nonce } = msg {
+                    // A probe must not take the seat. The live call stays up
+                    // until a datagram echo has proved this path.
+                    let ack = world.lock().expect("hub").hub.admits(&pass);
+                    let reply = if ack {
+                        ServerMsg::ProbeAck { nonce }
+                    } else {
+                        ServerMsg::Reject {
+                            reason: "invite was retired".into(),
+                        }
+                    };
+                    let _ = pipes.control.try_send(reply);
                     continue;
                 }
                 if !pace.allow(false) {

@@ -109,13 +109,17 @@ impl Hub {
             ClientMsg::Chat { text } => self.chat(user, text),
             ClientMsg::Mute { muted } => self.mute(user, muted),
             ClientMsg::Deafen { deafened } => self.deafen(user, deafened),
-            ClientMsg::Ping { .. } => Step {
+            ClientMsg::Ping { .. } | ClientMsg::Probe { .. } => Step {
                 user_id: user,
                 replace: None,
                 to_self: Vec::new(),
                 to_others: Vec::new(),
             },
         }
+    }
+
+    pub fn admits(&self, pass: &[u8; 32]) -> bool {
+        crate::identity::same(pass, &self.pass)
     }
 
     /// Who else should receive this datagram. Invalid, muted, or idle packets go nowhere.

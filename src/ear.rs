@@ -630,7 +630,13 @@ fn mix_frame(
         };
         let mut pcm = [0f32; FRAME];
         match mouth.jitter.pull() {
-            Play::Wait => {}
+            Play::Wait => {
+                mouth.losses = mouth.losses.saturating_add(1);
+                tell(speaking, shown, id, false);
+                if mouth.losses > 30 {
+                    gone.push(id);
+                }
+            }
             Play::Packet(packet) => {
                 mouth.losses = 0;
                 if mouth.decoder.decode_float(&packet, &mut pcm, false).is_ok() {
@@ -671,6 +677,18 @@ fn mix_frame(
 fn add(mix: &mut [f32], pcm: &[f32]) {
     for (slot, sample) in mix.iter_mut().zip(pcm) {
         *slot += sample;
+    }
+}
+
+/// Quiet speech stays within 6 dB of an open gate. The old square curve
+/// settled near −18 dB on a soft syllable and ate the consonant.
+fn soften_target(rms: f32, floor: f32) -> f32 {
+    let thresh = (floor * 2.8).max(0.0015);
+    if rms < thresh {
+        let ratio = (rms / thresh).clamp(0.0, 1.0);
+        0.50 + 0.50 * ratio
+    } else {
+        1.0
     }
 }
 
@@ -726,14 +744,7 @@ fn shape_frame(frame: &mut [f32], soften: bool, tone: &mut Tone) {
         } else if rms < tone.floor * 2.0 {
             tone.floor = tone.floor * 0.99 + rms * 0.01;
         }
-        let thresh = (tone.floor * 2.8).max(0.0015);
-        let target = if rms < thresh {
-            let ratio = (rms / thresh).clamp(0.0, 1.0);
-            (ratio * ratio).max(0.015)
-        } else {
-            1.0
-        };
-        tone.gate += (target - tone.gate) * 0.45;
+        tone.gate += (soften_target(rms, tone.floor) - tone.gate) * 0.45;
     } else {
         tone.gate += (1.0 - tone.gate) * 0.45;
     }
@@ -2679,6 +2690,13 @@ fn mac_hid(letter: char) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn soften_keeps_a_quiet_syllable_audible() {
+        let gain = soften_target(0.008, 0.008);
+        assert!(gain >= 0.5, "gain {gain}");
+        assert_eq!(soften_target(0.025, 0.008), 1.0);
+    }
 
     #[test]
     fn a_partial_write_and_two_eagains_still_deliver_the_block() {

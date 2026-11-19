@@ -30,6 +30,24 @@ pub fn encode_voice(packet: &VoicePacket) -> Result<Vec<u8>, ProtoError> {
     Ok(out)
 }
 
+/// A path probe. It is not Opus and must not be decoded or forwarded.
+pub const PROBE_MAGIC: &[u8] = b"RYMEPRB1";
+
+pub fn encode_probe(nonce: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(PROBE_MAGIC.len() + 8);
+    out.extend_from_slice(PROBE_MAGIC);
+    out.extend_from_slice(&nonce.to_le_bytes());
+    out
+}
+
+pub fn decode_probe(buf: &[u8]) -> Option<u64> {
+    if buf.len() != PROBE_MAGIC.len() + 8 || !buf.starts_with(PROBE_MAGIC) {
+        return None;
+    }
+    let bytes: [u8; 8] = buf[PROBE_MAGIC.len()..].try_into().ok()?;
+    Some(u64::from_le_bytes(bytes))
+}
+
 pub fn decode_voice(buf: &[u8]) -> Result<VoicePacket, ProtoError> {
     check_header(buf)?;
     let speaker = u32::from_le_bytes(buf[1..5].try_into().unwrap());

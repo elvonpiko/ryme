@@ -52,6 +52,8 @@ pub struct Ear {
     fail_out: Arc<AtomicBool>,
     peak: Arc<AtomicU32>,
     tone_left: Arc<AtomicU32>,
+    me: Arc<AtomicU32>,
+    tcp: Arc<AtomicBool>,
     pub mic: bool,
     pub speakers: bool,
     thread: Option<JoinHandle<()>>,
@@ -101,6 +103,16 @@ impl Ear {
     pub fn set_vkey(&self, down: bool) {
         self.vkey.store(down, Ordering::Relaxed);
         WINDOW_KEY.store(down, Ordering::Relaxed);
+    }
+
+    /// The seat changed when the call moved from TCP onto QUIC.
+    pub fn set_me(&self, me: u32) {
+        self.me.store(me, Ordering::Relaxed);
+    }
+
+    /// New speakers take the cushion for the path the call is on now.
+    pub fn set_tcp(&self, tcp: bool) {
+        self.tcp.store(tcp, Ordering::Relaxed);
     }
 
     pub fn set_levels(&self, levels: HashMap<u32, Mix>) {
@@ -299,6 +311,8 @@ pub fn open(
     let fail_out = Arc::new(AtomicBool::new(false));
     let peak = Arc::new(AtomicU32::new(0));
     let tone_left = Arc::new(AtomicU32::new(0));
+    let me_id = Arc::new(AtomicU32::new(me));
+    let tcp_path = Arc::new(AtomicBool::new(tcp));
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     let thread = thread::spawn({
         let stop = stop.clone();
@@ -319,10 +333,12 @@ pub fn open(
         let fail_out = fail_out.clone();
         let peak = peak.clone();
         let tone_left = tone_left.clone();
+        let me_id = me_id.clone();
+        let tcp_path = tcp_path.clone();
         move || {
             run(
                 pipe,
-                me,
+                me_id,
                 speaking,
                 stop,
                 muted,
@@ -342,7 +358,7 @@ pub fn open(
                 fail_out,
                 peak,
                 tone_left,
-                tcp,
+                tcp_path,
                 ready_tx,
             )
         }
@@ -372,6 +388,8 @@ pub fn open(
         fail_out,
         peak,
         tone_left,
+        me: me_id,
+        tcp: tcp_path,
         mic: opened.mic,
         speakers: opened.speakers,
         thread: Some(thread),
@@ -385,7 +403,7 @@ struct Opened {
 
 fn run(
     pipe: VoicePipe,
-    me: u32,
+    me: Arc<AtomicU32>,
     speaking: UnboundedSender<(u32, bool)>,
     stop: Arc<AtomicBool>,
     muted: Arc<AtomicBool>,
@@ -405,7 +423,7 @@ fn run(
     fail_out: Arc<AtomicBool>,
     peak: Arc<AtomicU32>,
     tone_left: Arc<AtomicU32>,
-    tcp: bool,
+    tcp: Arc<AtomicBool>,
     ready: std::sync::mpsc::SyncSender<Opened>,
 ) {
     let cap_rates = Arc::new(AtomicU32::new(0));
@@ -474,8 +492,10 @@ fn run(
             frame_device = (seen_play / 100).max(1) as usize;
         }
         while let Some(packet) = pipe.try_recv() {
-            ingest(&mut speakers, packet, tcp);
+            // QUIC datagrams and TCP voice frames are the same packet.
+            ingest(&mut speakers, packet, tcp.load(Ordering::Relaxed));
         }
+        let who = me.load(Ordering::Relaxed);
         let keyed = if ptt.load(Ordering::Relaxed) {
             vkey.load(Ordering::Relaxed) || key_held()
         } else {
@@ -486,7 +506,7 @@ fn run(
             muted.load(Ordering::Relaxed),
             keyed,
         ) {
-            tell(&speaking, &mut shown, me, false);
+            tell(&speaking, &mut shown, who, false);
         }
         if encoder.is_some() {
             let skipped = pull_capture(&mut cap_rx, &mut cap_pace, &mut cap_48, seen_cap);
@@ -503,7 +523,7 @@ fn run(
                     keyed,
                 );
                 let talking = sending && mine.tick(&frame);
-                tell(&speaking, &mut shown, me, talking);
+                tell(&speaking, &mut shown, who, talking);
                 if sending {
                     if let Some(encoder) = encoder.as_mut() {
                         send_frame(encoder, &pipe, seq, &frame);

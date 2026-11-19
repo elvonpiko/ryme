@@ -119,6 +119,13 @@ impl Room {
                 self.speaking.clear();
             }
             Event::Rejected { .. } | Event::Disconnected => {}
+            Event::Moved { user_id, .. } => {
+                if let Some(peer) = self.members.iter_mut().find(|peer| peer.user_id == self.me) {
+                    peer.user_id = user_id;
+                }
+                self.speaking.remove(&self.me);
+                self.me = user_id;
+            }
         }
     }
 
@@ -1087,7 +1094,29 @@ fn begin(
                                     note(&ui, &rt, &notices, &reason);
                                 });
                             }
+                            if let Event::Moved { user_id, resume } = &event {
+                                let mut guard = slot.lock().unwrap();
+                                guard.tcp = false;
+                                guard.resume_secret = *resume;
+                                if let Some(ear) = guard.ear.as_ref() {
+                                    ear.set_me(*user_id);
+                                    ear.set_tcp(false);
+                                }
+                                let link = guard.link.clone();
+                                let muted = guard.muted;
+                                let deaf = guard.deaf;
+                                drop(guard);
+                                if let Some(link) = link {
+                                    if muted {
+                                        link.mute(true);
+                                    }
+                                    if deaf {
+                                        link.deafen(true);
+                                    }
+                                }
+                            }
                             let joined = matches!(event, Event::Joined { .. });
+                            let moved = matches!(event, Event::Moved { .. });
                             let left = matches!(event, Event::Left);
                             let fresh = matches!(&event, Event::Chat { user_id, .. } if *user_id != room.me);
                             room.apply(event);
@@ -1113,6 +1142,23 @@ fn begin(
                                     switches.1,
                                     switches.2,
                                     switches.3,
+                                    ticket,
+                                );
+                            }
+                            if moved {
+                                let (channel, denoise, muted, deaf, ptt, ticket) = {
+                                    let guard = slot.lock().unwrap();
+                                    (
+                                        guard.channel.clone(),
+                                        guard.denoise,
+                                        guard.muted,
+                                        guard.deaf,
+                                        guard.ptt,
+                                        guard.resume_secret,
+                                    )
+                                };
+                                remember(
+                                    &name, &invite, &channel, true, denoise, muted, deaf, ptt,
                                     ticket,
                                 );
                             }

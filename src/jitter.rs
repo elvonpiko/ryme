@@ -2,14 +2,15 @@
 //!
 //! Each packet carries the sender's sample timestamp. Playback is a local
 //! clock: one pull is one 10 ms frame, and a missing frame is concealed when
-//! that frame is due. A later packet does not move the play head, so a frame
-//! that arrives before the next callback can still be played. After several
-//! losses the buffer stops and fills again. A burst that is genuinely late is
-//! skipped on purpose. A long healthy stretch shortens the wait by one frame.
+//! that frame is due. A later packet does not move the play head. The same
+//! packet is played whether it arrived on QUIC or TCP. When packets sit late,
+//! the wait grows, up to a maximum. It shrinks again in a gap, not by skipping
+//! a frame in the middle of a sentence. A pile that arrives before playback
+//! starts keeps only the newest maximum, so the first word is not half a
+//! second behind.
 
 use std::collections::BTreeMap;
 
-const COMFORT: u32 = 100;
 const JUMP: i32 = 64;
 const FRAME_SAMPLES: u32 = 480;
 const REPRIME: u32 = 4;
@@ -32,6 +33,7 @@ pub struct Jitter {
     next: Option<u32>,
     play_ts: Option<u32>,
     started: bool,
+    start: usize,
     min_depth: usize,
     max_depth: usize,
     target: usize,
@@ -57,6 +59,7 @@ impl Jitter {
             next: None,
             play_ts: None,
             started: false,
+            start,
             min_depth,
             max_depth,
             target: start,
@@ -77,8 +80,19 @@ impl Jitter {
             self.note_talkspurt(seq, timestamp);
         }
         self.queued.insert(seq, Slot { timestamp, payload });
-        self.trim_burst();
-        self.prime();
+        self.note_lateness();
+        self.trim_oldest();
+    }
+
+    /// Packets waiting past the cushion are late. The wait grows to meet them.
+    fn note_lateness(&mut self) {
+        if !self.started {
+            return;
+        }
+        let depth = self.queued.len();
+        if depth > self.target {
+            self.target = depth.min(self.max_depth);
+        }
     }
 
     /// A pause, then speech whose timestamp jumped, is a new talkspurt.
@@ -101,35 +115,19 @@ impl Jitter {
             self.play_ts = None;
             self.underrun = 0;
             self.comfortable = 0;
+            self.target = self.start;
         }
     }
 
-    /// Keep a cushion of `target` plus one frame. Anything older is a stale
-    /// burst and the play head moves to what remains. One packet sitting
-    /// ahead of a missing frame never fills the cushion, so it stays put.
-    fn trim_burst(&mut self) {
-        let keep = self.target + 1;
-        if self.queued.len() <= keep {
-            return;
-        }
-        while self.queued.len() > keep {
+    /// Past the maximum wait, the oldest frames go. The play head stays, so a
+    /// burst is not jumped to its newest packet. Before playback starts, what
+    /// remains is the newest cushion.
+    fn trim_oldest(&mut self) {
+        while self.queued.len() > self.max_depth {
             let Some(oldest) = self.ring_oldest() else {
                 break;
             };
             self.queued.remove(&oldest);
-        }
-        let Some(oldest) = self.ring_oldest() else {
-            return;
-        };
-        let Some(next) = self.next else {
-            return;
-        };
-        if oldest.wrapping_sub(next) as i32 > 0 {
-            let timestamp = self.queued.get(&oldest).map(|slot| slot.timestamp);
-            self.next = Some(oldest);
-            self.play_ts = timestamp;
-            self.underrun = 0;
-            self.comfortable = 0;
         }
     }
 
@@ -176,7 +174,6 @@ impl Jitter {
                 return Play::Wait;
             }
         }
-        self.shrink_if_deep();
         let Some(next) = self.next else {
             return Play::Wait;
         };
@@ -186,6 +183,9 @@ impl Jitter {
             self.underrun = 0;
             Play::Packet(slot.payload)
         } else {
+            if self.queued.is_empty() && self.comfortable > 0 && self.target > self.min_depth {
+                self.target -= 1;
+            }
             self.comfortable = 0;
             self.underrun = self.underrun.saturating_add(1);
             if self.underrun >= REPRIME {
@@ -209,22 +209,6 @@ impl Jitter {
             self.next = Some(next.wrapping_add(1));
         }
         self.play_ts = Some(timestamp.wrapping_add(FRAME_SAMPLES));
-    }
-
-    fn shrink_if_deep(&mut self) {
-        if self.comfortable <= COMFORT || self.target <= self.min_depth {
-            return;
-        }
-        if self.queued.len() > self.min_depth {
-            if let Some(next) = self.next {
-                if self.queued.remove(&next).is_some() {
-                    let ts = self.play_ts.unwrap_or(0);
-                    self.advance_from(ts);
-                }
-            }
-        }
-        self.target -= 1;
-        self.comfortable = 0;
     }
 }
 
@@ -293,39 +277,39 @@ mod tests {
     }
 
     #[test]
-    fn a_deep_healthy_buffer_skips_a_frame() {
+    fn a_late_run_grows_the_wait_and_a_gap_shrinks_it() {
         let mut jitter = Jitter::new();
-        for seq in 1..=20 {
+        for seq in 1..=3 {
             push(&mut jitter, seq, seq as u8);
         }
-        let mut played = Vec::new();
-        let mut seq = 21u32;
-        for _ in 0..150 {
+        assert_eq!(jitter.pull(), Play::Packet(vec![1]));
+        assert_eq!(jitter.pull(), Play::Packet(vec![2]));
+        assert_eq!(jitter.pull(), Play::Packet(vec![3]));
+        for seq in 4..=12 {
             push(&mut jitter, seq, seq as u8);
-            seq = seq.wrapping_add(1);
-            if let Play::Packet(packet) = jitter.pull() {
-                played.push(packet[0]);
-            }
         }
-        let gaps = played
-            .windows(2)
-            .filter(|pair| pair[1] != pair[0].wrapping_add(1))
-            .count();
-        assert!(gaps >= 1, "played {played:?}");
+        assert_eq!(jitter.target, 8);
+        assert_eq!(jitter.pull(), Play::Loss);
+        for seq in 5..=12 {
+            assert_eq!(jitter.pull(), Play::Packet(vec![seq as u8]));
+        }
+        let grown = jitter.target;
+        assert_eq!(jitter.pull(), Play::Loss);
+        assert!(jitter.target < grown);
     }
 
     #[test]
-    fn a_burst_plays_from_the_newest_frames() {
+    fn a_burst_before_playback_keeps_the_newest_cushion() {
         let mut jitter = Jitter::new();
         for seq in 1..=50 {
             push(&mut jitter, seq, seq as u8);
         }
-        assert_eq!(jitter.pull(), Play::Packet(vec![47]));
-        assert_eq!(jitter.pull(), Play::Packet(vec![48]));
+        assert_eq!(jitter.pull(), Play::Packet(vec![43]));
+        assert_eq!(jitter.pull(), Play::Packet(vec![44]));
     }
 
     #[test]
-    fn tcp_waits_longer_and_still_drops_a_burst() {
+    fn a_burst_during_playback_stays_in_order() {
         let mut jitter = Jitter::tcp();
         for seq in 1..=4 {
             push(&mut jitter, seq, seq as u8);
@@ -336,7 +320,12 @@ mod tests {
         for seq in 6..=40 {
             push(&mut jitter, seq, seq as u8);
         }
-        assert_eq!(jitter.pull(), Play::Packet(vec![35]));
+        assert!(jitter.target > 5);
+        assert_eq!(jitter.pull(), Play::Loss);
+        assert_eq!(jitter.pull(), Play::Loss);
+        assert_eq!(jitter.pull(), Play::Loss);
+        assert_eq!(jitter.pull(), Play::Wait);
+        assert_eq!(jitter.pull(), Play::Packet(vec![21]));
     }
 
     #[test]

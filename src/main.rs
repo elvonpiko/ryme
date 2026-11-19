@@ -21,6 +21,14 @@ mod x11_frame;
 mod win_frame;
 
 fn main() -> Result<(), slint::PlatformError> {
+    if let Some(invite) = probe_arg() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio");
+        rt.block_on(run_probe(&invite));
+        return Ok(());
+    }
     if let Some(url) = std::env::args().find(|arg| arg.starts_with("ryme://")) {
         local::stage_invite(&url);
     }
@@ -75,6 +83,50 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     #[cfg(not(target_os = "linux"))]
     keep_in_tray(&ui, shutdown)
+}
+
+fn probe_arg() -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--probe" {
+            return args.next();
+        }
+        if let Some(invite) = arg.strip_prefix("--probe=") {
+            return Some(invite.to_string());
+        }
+    }
+    None
+}
+
+async fn run_probe(invite: &str) {
+    #[cfg(windows)]
+    show_probe_console();
+    println!("client {}", env!("CARGO_PKG_VERSION"));
+    match ryme_server::probe_invite(invite).await {
+        Ok(reports) => {
+            if reports.is_empty() {
+                println!("no address");
+                return;
+            }
+            for report in reports {
+                println!(
+                    "{} {} {} {}ms",
+                    report.transport, report.address, report.outcome, report.millis
+                );
+            }
+        }
+        Err(err) => println!("invite {err:?}"),
+    }
+}
+
+#[cfg(windows)]
+fn show_probe_console() {
+    use windows_sys::Win32::System::Console::{AllocConsole, AttachConsole, ATTACH_PARENT_PROCESS};
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            AllocConsole();
+        }
+    }
 }
 
 fn keep_in_tray(ui: &MainWindow, shutdown: live::Shutdown) -> Result<(), slint::PlatformError> {

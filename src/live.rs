@@ -139,6 +139,8 @@ struct Slot {
     output: String,
     generation: u64,
     channel: String,
+    /// A join that has not been confirmed. The mic stays on the confirmed room.
+    pending_channel: Option<String>,
     resume_channel: String,
     ptt: bool,
     denoise: bool,
@@ -193,6 +195,7 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
         output: audio.output,
         generation: 0,
         channel: String::new(),
+        pending_channel: None,
         resume_channel: String::new(),
         ptt: ui.get_ptt(),
         denoise: ui.get_denoise(),
@@ -372,7 +375,7 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
         move |name| {
             {
                 let mut guard = slot.lock().unwrap();
-                guard.channel = name.to_string();
+                guard.pending_channel = Some(name.to_string());
                 if let Some(ear) = guard.ear.as_ref() {
                     ear.set_live(false);
                 }
@@ -963,8 +966,21 @@ fn begin(
                 let mut delay = live.delay;
                 let mut speak_open = true;
                 let born = std::time::Instant::now();
+                let mut last_ms = None::<u32>;
+                let mut last_at = std::time::Instant::now();
+                let mut age_tick = tokio::time::interval(Duration::from_secs(1));
+                age_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     tokio::select! {
+                        _ = age_tick.tick() => {
+                            let Some(ms) = last_ms else { continue };
+                            let age = last_at.elapsed();
+                            let tcp = slot.lock().unwrap().tcp;
+                            let weak = weak.clone();
+                            let _ = weak.upgrade_in_event_loop(move |ui| {
+                                show_ping(&ui, ms, tcp, age);
+                            });
+                        }
                         changed = delay.changed() => {
                             if changed.is_err() {
                                 continue;
@@ -972,10 +988,12 @@ fn begin(
                             let Some(ms) = *delay.borrow_and_update() else {
                                 continue;
                             };
+                            last_ms = Some(ms);
+                            last_at = std::time::Instant::now();
                             let tcp = slot.lock().unwrap().tcp;
                             let weak = weak.clone();
                             let _ = weak.upgrade_in_event_loop(move |ui| {
-                                show_ping(&ui, ms, tcp);
+                                show_ping(&ui, ms, tcp, Duration::ZERO);
                             });
                         }
                         heard = speak_rx.recv(), if speak_open => {
@@ -1055,6 +1073,16 @@ fn begin(
                                 let notices = notices.clone();
                                 let rt = task_rt.clone();
                                 let reason = reason.clone();
+                                let restore = {
+                                    let mut guard = slot.lock().unwrap();
+                                    guard.pending_channel = None;
+                                    (guard.muted, guard.deaf, guard.ptt)
+                                };
+                                if let Some(ear) = slot.lock().unwrap().ear.as_ref() {
+                                    ear.set_muted(restore.0);
+                                    ear.set_deaf(restore.1);
+                                    ear.set_ptt(restore.2);
+                                }
                                 let _ = weak.upgrade_in_event_loop(move |ui| {
                                     note(&ui, &rt, &notices, &reason);
                                 });
@@ -1067,6 +1095,7 @@ fn begin(
                                 let switches = {
                                     let mut guard = slot.lock().unwrap();
                                     guard.channel = room.channel.clone();
+                                    guard.pending_channel = None;
                                     (
                                         guard.denoise,
                                         guard.muted,
@@ -1087,9 +1116,9 @@ fn begin(
                                     ticket,
                                 );
                             }
-                            let want = slot.lock().unwrap().channel.clone();
+                            let switching = slot.lock().unwrap().pending_channel.is_some();
                             if let Some(ear) = slot.lock().unwrap().ear.as_ref() {
-                                ear.set_live(room.in_channel && room.channel == want);
+                                ear.set_live(room_is_live(room.in_channel, switching));
                             }
                             if left {
                                 room.speaking.clear();
@@ -1359,11 +1388,23 @@ fn send(slot: &Arc<Mutex<Slot>>, f: impl FnOnce(&Link)) {
 
 const PING_EASY: u32 = 80;
 
-fn show_ping(ui: &MainWindow, ms: u32, tcp: bool) {
+fn room_is_live(in_channel: bool, switching: bool) -> bool {
+    in_channel && !switching
+}
+
+fn show_ping(ui: &MainWindow, ms: u32, tcp: bool, age: Duration) {
     let ms = ms.min(9_999);
     let path = if tcp { "TCP" } else { "QUIC" };
-    ui.set_ping_text(format!("{ms} ms · {path}").into());
-    ui.set_ping_hot(ms > PING_EASY);
+    let stale = age >= Duration::from_secs(3);
+    let text = if stale {
+        format!("stale · {path}")
+    } else if age >= Duration::from_secs(1) {
+        format!("{ms} ms · {path} · {}s", age.as_secs())
+    } else {
+        format!("{ms} ms · {path}")
+    };
+    ui.set_ping_text(text.into());
+    ui.set_ping_hot(stale || ms > PING_EASY);
     ui.set_ping_on(true);
 }
 
@@ -1710,11 +1751,18 @@ fn pursue(
 #[cfg(test)]
 mod tests {
     use super::{
-        arrival, chat_body, explain, first_link, next_try, pace, place_label, Arrival, Room,
-        AGAIN_WAIT, ATTEMPTS, QUIET_WAIT,
+        arrival, chat_body, explain, first_link, next_try, pace, place_label, room_is_live,
+        Arrival, Room, AGAIN_WAIT, ATTEMPTS, QUIET_WAIT,
     };
     use ryme_proto::Invite;
     use ryme_server::{Event, LinkError};
+
+    #[test]
+    fn a_rejected_switch_leaves_the_confirmed_room_live() {
+        assert!(!room_is_live(true, true));
+        assert!(room_is_live(true, false));
+        assert!(!room_is_live(false, false));
+    }
 
     #[test]
     fn a_drop_is_tried_three_times_and_then_stops() {

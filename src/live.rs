@@ -508,13 +508,13 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
             let pending = std::mem::replace(&mut *ask.lock().unwrap(), Ask::None);
             match pending {
                 Ask::Logout => {
-                    let (channel, denoise) = {
-                        let guard = slot.lock().unwrap();
-                        (guard.channel.clone(), guard.denoise)
+                    let (channel, denoise, ticket) = {
+                        let mut guard = slot.lock().unwrap();
+                        guard.resume_channel.clear();
+                        (guard.channel.clone(), guard.denoise, guard.resume_secret)
                     };
                     let (muted, deaf, ptt) = {
-                        let mut guard = slot.lock().unwrap();
-                        guard.resume_secret = [0; 32];
+                        let guard = slot.lock().unwrap();
                         (guard.muted, guard.deaf, guard.ptt)
                     };
                     local::store(&Saved {
@@ -526,7 +526,7 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
                         muted,
                         deaf,
                         ptt,
-                        ticket: [0; 32],
+                        ticket,
                     });
                     bump(&slot);
                     clear(&ui);

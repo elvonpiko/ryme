@@ -210,6 +210,19 @@ impl Hub {
                 to_others.extend(self.drop_user(old));
                 replace = Some(old);
             }
+        } else {
+            // Logout forgets the ticket, and a network change can leave the
+            // old connection up. The same install still gets its seat back.
+            let stale: Vec<u32> = self
+                .users
+                .iter()
+                .filter(|(_, existing)| existing.card == card)
+                .map(|(id, _)| *id)
+                .collect();
+            for old in stale {
+                to_others.extend(self.drop_user(old));
+                replace = Some(old);
+            }
         }
         if self.users.values().any(|existing| existing.card == card) {
             return reject(user, "already here");
@@ -894,6 +907,39 @@ mod tests {
                 reason: "already here".into()
             }]
         );
+    }
+
+    #[test]
+    fn a_fresh_hello_from_the_same_install_takes_the_seat() {
+        let mut hub = Hub::new([7; 32]);
+        let first = hub.handle(
+            None,
+            ClientMsg::Hello {
+                name: "Mara".into(),
+                card: 4,
+                pass: [7; 32],
+                resume: [0; 32],
+            },
+        );
+        let id = first.user_id.unwrap();
+        let _ = hub.handle(
+            Some(id),
+            ClientMsg::Join {
+                channel: "Lobby".into(),
+            },
+        );
+        let again = hub.handle(
+            None,
+            ClientMsg::Hello {
+                name: "Mara".into(),
+                card: 4,
+                pass: [7; 32],
+                resume: [0; 32],
+            },
+        );
+        assert_eq!(again.replace, Some(id));
+        assert!(again.user_id.is_some());
+        assert!(matches!(again.to_self[0], ServerMsg::Welcome { .. }));
     }
 
     #[test]

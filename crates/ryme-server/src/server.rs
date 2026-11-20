@@ -78,6 +78,12 @@ impl Server {
         identity::invite_url(host, port, &self.fingerprint, &self.pass)
     }
 
+    /// Remember the address printed on the invite, so a later rotation can
+    /// answer with a link that matches it.
+    pub fn remember_public(&self, host: &str, port: u16) {
+        session::note_published(&self.world, self.fingerprint, host.to_string(), port);
+    }
+
     pub async fn serve(&self) {
         if let Some(addr) = self.host_addr {
             let world = Arc::clone(&self.world);

@@ -45,6 +45,13 @@ pub(crate) struct World {
     hub: Hub,
     pipes: HashMap<u32, Pipes>,
     data: Option<std::path::PathBuf>,
+    published: Option<Published>,
+}
+
+struct Published {
+    fingerprint: [u8; 32],
+    host: String,
+    port: u16,
 }
 
 impl World {
@@ -66,6 +73,7 @@ impl World {
             hub,
             pipes: HashMap::new(),
             data,
+            published: None,
         }
     }
 
@@ -141,19 +149,22 @@ impl World {
         }
     }
 
-    fn set_locked(&mut self, locked: bool) {
+    fn set_locked(&mut self, locked: bool) -> Result<(), String> {
         self.hub.set_locked(locked);
-        if let Some(dir) = &self.data {
-            let path = dir.join("locked");
-            if locked {
-                let _ = std::fs::write(&path, b"1\n");
-            } else {
-                let _ = std::fs::remove_file(path);
-            }
+        let Some(dir) = &self.data else {
+            return Ok(());
+        };
+        let path = dir.join("locked");
+        if locked {
+            std::fs::write(&path, b"1\n").map_err(|err| format!("could not save the lock: {err}"))
+        } else if path.exists() {
+            std::fs::remove_file(path).map_err(|err| format!("could not clear the lock: {err}"))
+        } else {
+            Ok(())
         }
     }
 
-    fn ban_card(&mut self, card: u64, banned: bool) {
+    fn ban_card(&mut self, card: u64, banned: bool) -> Result<(), String> {
         if banned {
             self.hub.ban(card);
             let ids: Vec<u32> = self
@@ -168,22 +179,24 @@ impl World {
         } else {
             self.hub.unban(card);
         }
-        self.store_bans();
+        self.store_bans()?;
+        Ok(())
     }
 
     fn hub_cards(&self) -> Vec<(u32, u64)> {
         self.hub.cards()
     }
 
-    fn store_bans(&self) {
+    fn store_bans(&self) -> Result<(), String> {
         let Some(dir) = &self.data else {
-            return;
+            return Ok(());
         };
         let mut lines = String::new();
         for card in self.hub.banned_cards() {
             lines.push_str(&format!("{card}\n"));
         }
-        let _ = std::fs::write(dir.join("banned"), lines);
+        std::fs::write(dir.join("banned"), lines)
+            .map_err(|err| format!("could not save the ban list: {err}"))
     }
 
     fn dispatch(&self, step: &Step, self_pipes: &Pipes) {
@@ -611,20 +624,81 @@ pub(crate) fn allow(world: &Mutex<World>, name: &str) {
     world.lock().expect("hub").allow(name);
 }
 
-fn apply_host(text: &str, world: &Mutex<World>) {
+pub(crate) fn note_published(world: &Mutex<World>, fingerprint: [u8; 32], host: String, port: u16) {
+    world.lock().expect("hub").published = Some(Published {
+        fingerprint,
+        host,
+        port,
+    });
+}
+
+/// Loopback port for this data directory. Two servers on one machine do not
+/// share a control socket.
+pub fn admin_addr(data: &std::path::Path) -> SocketAddr {
+    let text = data.to_string_lossy();
+    let mut hash = 2166136261u32;
+    for byte in text.bytes() {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    let port = 20000 + (hash % 20000) as u16;
+    SocketAddr::from(([127, 0, 0, 1], port))
+}
+
+fn apply_host(text: &str, world: &Mutex<World>) -> String {
     let text = text.trim();
     let mut hub = world.lock().expect("hub");
-    if let Some(id) = text.strip_prefix("drop ").and_then(|id| id.parse().ok()) {
-        hub.kick(id);
+    let result = if let Some(raw) = text.strip_prefix("drop ") {
+        match raw.parse::<u32>() {
+            Ok(id) if hub.hub.has_user(id) => {
+                hub.kick(id);
+                Ok("ok".to_string())
+            }
+            Ok(_) => Err("no such session".to_string()),
+            Err(_) => Err("usage: drop <id>".to_string()),
+        }
     } else if text == "lock" {
-        hub.set_locked(true);
+        hub.set_locked(true).map(|()| "ok".to_string())
     } else if text == "unlock" {
-        hub.set_locked(false);
-    } else if let Some(card) = text.strip_prefix("ban ").and_then(parse_card) {
-        hub.ban_card(card, true);
-    } else if let Some(card) = text.strip_prefix("unban ").and_then(parse_card) {
-        hub.ban_card(card, false);
+        hub.set_locked(false).map(|()| "ok".to_string())
+    } else if let Some(raw) = text.strip_prefix("ban ") {
+        match parse_card(raw) {
+            Some(card) => hub.ban_card(card, true).map(|()| "ok".to_string()),
+            None => Err("usage: ban <card>".to_string()),
+        }
+    } else if let Some(raw) = text.strip_prefix("unban ") {
+        match parse_card(raw) {
+            Some(card) => hub.ban_card(card, false).map(|()| "ok".to_string()),
+            None => Err("usage: unban <card>".to_string()),
+        }
+    } else if text == "rotate" {
+        rotate_invite(&mut hub)
+    } else {
+        Err("unknown command".to_string())
+    };
+    match result {
+        Ok(line) => line,
+        Err(reason) => format!("error {reason}"),
     }
+}
+
+fn rotate_invite(world: &mut World) -> Result<String, String> {
+    let Some(dir) = world.data.clone() else {
+        return Err("this server has no data directory".into());
+    };
+    let door = identity::Door::rotate(&dir).map_err(|err| err.to_string())?;
+    world.hub.set_pass(door.pass);
+    let invite = world
+        .published
+        .as_ref()
+        .map(|place| identity::invite_url(&place.host, place.port, &place.fingerprint, &door.pass))
+        .unwrap_or_default();
+    tracing::info!("invite rotated");
+    Ok(if invite.is_empty() {
+        "ok".to_string()
+    } else {
+        format!("ok {invite}")
+    })
 }
 
 /// A card from the server log. Sixteen hex digits, or a decimal number.
@@ -681,7 +755,10 @@ pub(crate) async fn listen_host(addr: SocketAddr, key: [u8; 32], world: Arc<Mute
             let Ok(text) = std::str::from_utf8(&line) else {
                 return;
             };
-            apply_host(text, &world);
+            let reply = apply_host(text, &world);
+            let mut bytes = reply.into_bytes();
+            bytes.push(b'\n');
+            let _ = sock.write_all(&bytes).await;
         });
     }
 }
@@ -694,6 +771,26 @@ async fn read_exact(sock: &mut tokio::net::TcpStream, buf: &mut [u8]) -> std::io
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_host_command_reports_success_or_the_reason() {
+        let world = world([7; 32], None);
+        assert_eq!(apply_host("nope", &world), "error unknown command");
+        assert_eq!(apply_host("drop 4", &world), "error no such session");
+        assert_eq!(apply_host("drop x", &world), "error usage: drop <id>");
+        assert_eq!(apply_host("lock", &world), "ok");
+        assert_eq!(apply_host("unlock", &world), "ok");
+        assert_eq!(apply_host("ban nope", &world), "error usage: ban <card>");
+    }
+
+    #[test]
+    fn two_data_directories_do_not_share_an_admin_port() {
+        let one = admin_addr(std::path::Path::new("/var/lib/ryme"));
+        let two = admin_addr(std::path::Path::new("/tmp/other-ryme"));
+        assert_ne!(one.port(), two.port());
+        assert_eq!(one, admin_addr(std::path::Path::new("/var/lib/ryme")));
+        assert!(one.ip().is_loopback());
+    }
 
     #[tokio::test]
     async fn two_speakers_both_wait_for_one_listener() {

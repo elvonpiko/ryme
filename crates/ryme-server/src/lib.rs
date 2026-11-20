@@ -19,6 +19,7 @@ pub use link::{
     VoicePipe, VoiceQueue,
 };
 pub use server::Server;
+pub use session::admin_addr;
 pub use sums::{sign_sums, verify_sums};
 
 #[derive(Debug, thiserror::Error)]

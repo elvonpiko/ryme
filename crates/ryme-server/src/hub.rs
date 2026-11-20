@@ -71,6 +71,14 @@ impl Hub {
         self.locked = locked;
     }
 
+    pub fn set_pass(&mut self, pass: [u8; 32]) {
+        self.pass = pass;
+    }
+
+    pub fn has_user(&self, id: u32) -> bool {
+        self.users.contains_key(&id)
+    }
+
     /// A card is supplied by the client. Banning it blocks that value. It does
     /// not prove who is holding the install, and a different card is a different
     /// value. Replacing a live seat requires the resume secret.

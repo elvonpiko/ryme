@@ -43,6 +43,26 @@ function(get_library_version OPUS_LIBRARY_VERSION OPUS_LIBRARY_VERSION_MAJOR)
 endfunction()
 
 function(get_package_version PACKAGE_VERSION)
+  # Prefer the file shipped with this tree. `git describe` from a parent
+  # checkout would report the Ryme tag instead of the codec.
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/package_version")
+    file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/package_version" opus_package_version_string
+         LIMIT_COUNT 1
+         REGEX "PACKAGE_VERSION=")
+    string(REPLACE "PACKAGE_VERSION="
+                   ""
+                   opus_package_version_string
+                   ${opus_package_version_string})
+    string(REPLACE "\""
+                   ""
+                   opus_package_version_string
+                   ${opus_package_version_string})
+    if(opus_package_version_string)
+      set(PACKAGE_VERSION ${opus_package_version_string} PARENT_SCOPE)
+      return()
+    endif()
+  endif()
+
   find_package(Git)
   if(GIT_FOUND)
     execute_process(COMMAND ${GIT_EXECUTABLE} describe --tags --match "v*"

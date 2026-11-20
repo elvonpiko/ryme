@@ -493,6 +493,7 @@ export component MainWindow inherits Window {
     in-out property <bool> ping-on: false;
     in-out property <bool> ping-hot: false;
     in-out property <string> ping-text: "";
+    in-out property <string> health-line: "0 concealed · 0 late · 0 mic drops";
     in-out property <string> toast: "";
     in-out property <bool> toast-danger: true;
     in-out property <bool> confirming: false;
@@ -1220,6 +1221,20 @@ export component MainWindow inherits Window {
                                     font-family: Theme.sans;
                                     font-size: 13px;
                                     font-weight: 500;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                        Rectangle {
+                            height: 34px;
+                            HorizontalLayout {
+                                alignment: space-between;
+                                Text { text: "Audio"; color: Theme.ink; font-family: Theme.sans; font-size: 14px; font-weight: 500; vertical-alignment: center; }
+                                Text {
+                                    text: root.health-line;
+                                    color: Theme.muted;
+                                    font-family: Theme.sans;
+                                    font-size: 12px;
                                     vertical-alignment: center;
                                 }
                             }

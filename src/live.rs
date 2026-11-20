@@ -354,10 +354,11 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
                 "not connected".into()
             };
             let text = format!(
-                "Ryme {}\n{}\nServer RTT: {}\nMicrophone: {}\nSpeakers: {}",
+                "Ryme {}\n{}\nServer RTT: {}\nAudio: {}\nMicrophone: {}\nSpeakers: {}",
                 env!("CARGO_PKG_VERSION"),
                 ui.get_mic_line(),
                 rtt,
+                ui.get_health_line(),
                 ui.get_input_name(),
                 ui.get_output_name()
             );
@@ -858,6 +859,7 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
                 if !ui.window().is_visible() {
                     crate::ear::release_talk();
                 }
+                ui.set_health_line(crate::ear::health_line().into());
                 ui.set_mic_level(level as f32 / 100.0);
                 ui.set_keyed(keyed);
                 ui.set_input_fault(no_mic);

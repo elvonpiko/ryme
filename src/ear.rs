@@ -489,6 +489,8 @@ fn run(
     let mut frame_device = (play_rate / 100).max(1) as usize;
     let mut tone_phase = 0.0f32;
     let mut drift = 0usize;
+    CONCEALED.store(0, Ordering::Relaxed);
+    LATE_DROPS.store(0, Ordering::Relaxed);
     let mut quiet_run = 0u32;
     let mut held = [0f32; FRAME];
     let mut have_held = false;
@@ -611,7 +613,14 @@ fn run(
                 let mut mix = [0f32; FRAME];
                 let _heard = {
                     let levels = levels.lock().unwrap().clone();
-                    mix_frame(&mut speakers, &mut mix, &speaking, &mut shown, &levels)
+                    mix_frame(
+                        &mut speakers,
+                        &mut mix,
+                        &speaking,
+                        &mut shown,
+                        &levels,
+                        &CONCEALED,
+                    )
                 };
                 if deaf.load(Ordering::Relaxed) {
                     mix.fill(0.0);
@@ -647,6 +656,8 @@ fn run(
                 pending_play.drain(..written);
             }
         }
+        let late: u64 = speakers.values().map(|mouth| mouth.jitter.dropped()).sum();
+        LATE_DROPS.store(late, Ordering::Relaxed);
         thread::sleep(Duration::from_millis(2));
     }
     let _ = cap_thread.join();
@@ -690,6 +701,7 @@ fn mix_frame(
     speaking: &UnboundedSender<(u32, bool)>,
     shown: &mut HashMap<u32, bool>,
     levels: &HashMap<u32, Mix>,
+    concealed: &AtomicU64,
 ) -> bool {
     let ids: Vec<u32> = speakers.keys().copied().collect();
     let mut heard = false;
@@ -718,6 +730,7 @@ fn mix_frame(
                 }
             }
             Play::Loss => {
+                concealed.fetch_add(1, Ordering::Relaxed);
                 mouth.losses = mouth.losses.saturating_add(1);
                 let fec = mouth.jitter.upcoming().map(|packet| packet.to_vec());
                 if let Some(packet) = fec {
@@ -872,6 +885,20 @@ fn blend(pcm: &mut [f32], level: Option<Mix>) -> bool {
 }
 
 const SILENCE_HANG: u32 = 20;
+
+static CONCEALED: AtomicU64 = AtomicU64::new(0);
+static LATE_DROPS: AtomicU64 = AtomicU64::new(0);
+
+/// Concealed frames, frames skipped to stay live, and microphone blocks the
+/// capture ring could not take.
+pub fn health_line() -> String {
+    format!(
+        "{} concealed · {} late · {} mic drops",
+        CONCEALED.load(Ordering::Relaxed),
+        LATE_DROPS.load(Ordering::Relaxed),
+        capture_overrun_total()
+    )
+}
 
 /// Speech is sent, and a short tail after it. A long quiet stretch is not.
 fn voice_due(talking: bool, quiet_frames: u32) -> bool {
@@ -1479,6 +1506,8 @@ struct HeldInput {
 
 #[cfg(not(target_os = "linux"))]
 static CAPTURE_OVERRUNS: AtomicU32 = AtomicU32::new(0);
+#[cfg(not(target_os = "linux"))]
+static CAPTURE_OVERRUN_TOTAL: AtomicU32 = AtomicU32::new(0);
 
 /// Microphone blocks the capture ring could not take. The counter is cleared.
 #[cfg(not(target_os = "linux"))]
@@ -1486,8 +1515,18 @@ pub fn take_capture_overruns() -> u32 {
     CAPTURE_OVERRUNS.swap(0, Ordering::Relaxed)
 }
 
+#[cfg(not(target_os = "linux"))]
+fn capture_overrun_total() -> u32 {
+    CAPTURE_OVERRUN_TOTAL.load(Ordering::Relaxed)
+}
+
 #[cfg(target_os = "linux")]
 pub fn take_capture_overruns() -> u32 {
+    0
+}
+
+#[cfg(target_os = "linux")]
+fn capture_overrun_total() -> u32 {
     0
 }
 
@@ -1665,6 +1704,7 @@ fn build_input(name: &str, broken: Arc<AtomicBool>) -> Option<(cpal::Stream, u32
             move |data, _| {
                 if producer.slots() == 0 {
                     CAPTURE_OVERRUNS.fetch_add(1, Ordering::Relaxed);
+                    CAPTURE_OVERRUN_TOTAL.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
                 push_captured(&mut producer, data, channels);

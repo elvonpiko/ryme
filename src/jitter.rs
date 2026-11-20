@@ -44,6 +44,7 @@ pub struct Jitter {
     /// Highest sequence already played or concealed.
     played: Option<u32>,
     holds: u32,
+    dropped: u64,
 }
 
 impl Jitter {
@@ -87,7 +88,12 @@ impl Jitter {
             comfortable: 0,
             played: None,
             holds: 0,
+            dropped: 0,
         }
+    }
+
+    pub fn dropped(&self) -> u64 {
+        self.dropped
     }
 
     pub fn push(&mut self, seq: u32, timestamp: u32, payload: Vec<u8>) {
@@ -161,6 +167,7 @@ impl Jitter {
                 break;
             };
             self.queued.remove(&oldest);
+            self.dropped = self.dropped.saturating_add(1);
         }
     }
 
@@ -173,6 +180,7 @@ impl Jitter {
             .collect();
         for seq in stale {
             self.queued.remove(&seq);
+            self.dropped = self.dropped.saturating_add(1);
         }
     }
 
@@ -292,6 +300,15 @@ mod tests {
 
     fn push(jitter: &mut Jitter, seq: u32, payload: u8) {
         jitter.push(seq, seq.wrapping_mul(FRAME_SAMPLES), vec![payload]);
+    }
+
+    #[test]
+    fn a_stall_counts_the_frames_it_skips() {
+        let mut jitter = Jitter::new();
+        for seq in 1..=30 {
+            push(&mut jitter, seq, seq as u8);
+        }
+        assert!(jitter.dropped() > 0);
     }
 
     #[test]

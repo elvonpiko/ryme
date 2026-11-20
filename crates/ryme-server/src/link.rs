@@ -143,9 +143,8 @@ impl Inbox {
 
 #[derive(Clone)]
 enum Outbox {
-    /// QUIC. A full queue drops the packet the audio thread just handed over.
-    Wait(tokio::sync::mpsc::Sender<Vec<u8>>),
-    /// TCP. A full queue drops the oldest frame and keeps the newest.
+    /// A full queue drops the oldest frame. Frames older than the voice budget
+    /// are dropped when the socket task reads them.
     Fresh(crate::queue::NewestSender<Vec<u8>>),
 }
 
@@ -158,7 +157,6 @@ pub struct VoiceQueue {
 impl VoiceQueue {
     pub async fn send(&self, packet: Vec<u8>) -> Result<(), ()> {
         match &self.inner {
-            Outbox::Wait(tx) => tx.send(packet).await.map_err(|_| ()),
             Outbox::Fresh(tx) => {
                 tx.offer(packet);
                 Ok(())
@@ -173,9 +171,6 @@ impl VoicePipe {
             return;
         }
         match &*self.outgoing.lock().unwrap() {
-            Outbox::Wait(tx) => {
-                let _ = tx.try_send(packet);
-            }
             Outbox::Fresh(tx) => tx.offer(packet),
         }
     }

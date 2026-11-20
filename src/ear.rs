@@ -495,6 +495,7 @@ fn run(
     let mut held = [0f32; FRAME];
     let mut have_held = false;
     let mut play_rms = 0.0f32;
+    let mut cancel = EchoCancel::speakerphone();
     let mut was_deaf = false;
     let mut heard_tcp = tcp.load(Ordering::Relaxed);
 
@@ -551,6 +552,11 @@ fn run(
                 frame.copy_from_slice(&cap_48[..FRAME]);
                 cap_48.drain(..FRAME);
                 shape_frame(&mut frame, denoise.load(Ordering::Relaxed), &mut tone);
+                if speakerphone.load(Ordering::Relaxed) {
+                    cancel.cancel(&mut frame);
+                } else {
+                    cancel.reset();
+                }
                 let gain = echo_gain(
                     speakerphone.load(Ordering::Relaxed),
                     frame_rms(&frame),
@@ -631,6 +637,7 @@ fn run(
                     add_tone(&mut mix, &mut tone_phase);
                 }
                 play_rms = frame_rms(&mix);
+                cancel.observe(&mix);
                 let before = pending_play.len();
                 play_pace.convert(&mix, &mut pending_play);
                 ready += pending_play.len() - before;
@@ -780,6 +787,75 @@ pub fn echo_gain(speakerphone: bool, mic: f32, playback: f32) -> f32 {
     }
     let ratio = (mic / playback).clamp(0.0, 1.0);
     0.12 + 0.88 * ratio
+}
+
+/// Subtracts a short speaker echo from the microphone. A headset does not use it.
+struct EchoCancel {
+    hist: Vec<f32>,
+    weights: Vec<f32>,
+    at: usize,
+}
+
+impl EchoCancel {
+    fn speakerphone() -> Self {
+        Self::new(640)
+    }
+
+    fn new(taps: usize) -> Self {
+        let taps = taps.max(1);
+        Self {
+            hist: vec![0.0; taps],
+            weights: vec![0.0; taps],
+            at: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.weights.fill(0.0);
+    }
+
+    fn observe(&mut self, playback: &[f32]) {
+        for &sample in playback {
+            self.hist[self.at] = sample;
+            self.at += 1;
+            if self.at == self.hist.len() {
+                self.at = 0;
+            }
+        }
+    }
+
+    fn cancel(&mut self, mic: &mut [f32]) {
+        let taps = self.hist.len();
+        for sample in mic.iter_mut() {
+            let mut hat = 0.0f32;
+            let mut power = 1.0e-4f32;
+            let mut index = self.at;
+            for tap in 0..taps {
+                let x = self.hist[index];
+                hat += self.weights[tap] * x;
+                power += x * x;
+                index += 1;
+                if index == taps {
+                    index = 0;
+                }
+            }
+            let err = (*sample - hat).clamp(-1.5, 1.5);
+            let step = err / power;
+            index = self.at;
+            for tap in 0..taps {
+                let x = self.hist[index];
+                self.weights[tap] += step * x;
+                index += 1;
+                if index == taps {
+                    index = 0;
+                }
+            }
+            *sample = err;
+        }
+        for weight in &mut self.weights {
+            *weight *= 0.999;
+        }
+    }
 }
 
 fn frame_rms(frame: &[f32]) -> f32 {
@@ -2983,6 +3059,48 @@ mod tests {
         assert_eq!(evdev_code('a'), 30);
         assert_eq!(mac_hid('V'), 0x09);
         assert_eq!(input_names().first().map(String::as_str), Some("default"));
+    }
+
+    #[test]
+    fn a_short_echo_is_cancelled_and_a_voice_remains() {
+        let mut cancel = EchoCancel::new(128);
+        let delay = 24;
+        let mut line = std::collections::VecDeque::from(vec![0.0f32; delay]);
+        let mut early = 0.0f32;
+        let mut late = 0.0f32;
+        let mut voice = 0.0f32;
+        for frame in 0..120 {
+            let mut play = [0.0f32; 64];
+            for (index, sample) in play.iter_mut().enumerate() {
+                let n = frame * 64 + index;
+                *sample = (n as f32 * 0.31).sin() * 0.35;
+            }
+            let mut mic = [0.0f32; 64];
+            for index in 0..64 {
+                line.push_back(play[index]);
+                mic[index] = line.pop_front().unwrap_or(0.0) * 0.8;
+            }
+            cancel.observe(&play);
+            if frame == 3 {
+                early = frame_rms(&mic);
+            }
+            if frame == 110 {
+                mic[8] += 0.6;
+            }
+            cancel.cancel(&mut mic);
+            if frame == 100 {
+                late = frame_rms(&mic);
+            }
+            if frame == 110 {
+                voice = mic[8].abs();
+            }
+        }
+        assert!(early > 0.1, "early {early}");
+        assert!(
+            late < early * 0.35,
+            "early {early} late {late} voice {voice}"
+        );
+        assert!(voice > 0.25);
     }
 
     #[test]

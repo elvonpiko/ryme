@@ -59,10 +59,13 @@ impl Room {
                 members,
                 rooms,
             } => {
+                let same = self.in_channel && self.channel == channel;
                 self.channel = channel;
                 self.members = members;
                 self.in_channel = true;
-                self.lines.clear();
+                if !same {
+                    self.lines.clear();
+                }
                 if !rooms.is_empty() {
                     self.rooms = rooms;
                 }
@@ -309,11 +312,14 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
         let rt = rt.clone();
         let notices = notices.clone();
         move |text| {
-            let Some(text) = fit_chat(&text) else {
-                if let Some(ui) = ui_weak.upgrade() {
-                    note(&ui, &rt, &notices, "That line was empty.");
+            let text = match fit_chat(&text) {
+                Ok(text) => text,
+                Err(reason) => {
+                    if let Some(ui) = ui_weak.upgrade() {
+                        note(&ui, &rt, &notices, reason);
+                    }
+                    return;
                 }
-                return;
             };
             send(&slot, |link| link.chat(text));
         }
@@ -456,6 +462,13 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
         move |name| {
             {
                 let mut guard = slot.lock().unwrap();
+                let asked = name.to_string();
+                if guard.channel == asked
+                    && guard.pending_channel.is_none()
+                    && intent::admits(&guard.aim, &asked)
+                {
+                    return;
+                }
                 guard.aim = Aim::Room(name.to_string());
                 guard.pending_channel = Some(name.to_string());
                 if let Some(ear) = guard.ear.as_ref() {
@@ -850,23 +863,23 @@ fn fit_name(name: &str) -> String {
     out
 }
 
-fn fit_chat(text: &str) -> Option<String> {
+fn fit_chat(text: &str) -> Result<String, &'static str> {
     let flat: String = text
         .chars()
         .map(|ch| if ch.is_control() { ' ' } else { ch })
         .collect();
+    let trimmed = flat.trim();
+    if trimmed.is_empty() {
+        return Err("That line was empty.");
+    }
     let mut out = String::new();
-    for ch in flat.trim().chars() {
+    for ch in trimmed.chars() {
         if out.len() + ch.len_utf8() > ryme_proto::MAX_CHAT {
-            break;
+            return Err("That line is longer than 400 bytes.");
         }
         out.push(ch);
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    Ok(out)
 }
 
 fn short_device(name: &str, input: bool) -> String {
@@ -2003,7 +2016,13 @@ mod tests {
         room.apply(Event::Joined {
             channel: "Lobby".into(),
             members: Vec::new(),
-            rooms: vec!["Lobby".into()],
+            rooms: vec!["Lobby".into(), "Stage".into()],
+        });
+        assert_eq!(room.lines.len(), 1);
+        room.apply(Event::Joined {
+            channel: "Stage".into(),
+            members: Vec::new(),
+            rooms: vec!["Lobby".into(), "Stage".into()],
         });
         assert!(room.lines.is_empty());
         room.apply(Event::Past {

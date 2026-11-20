@@ -1,5 +1,5 @@
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -98,6 +98,8 @@ pub struct VoicePipe {
     /// False while the room is changing. Queued frames are dropped instead of
     /// arriving in the next room.
     pass: Arc<AtomicBool>,
+    queued: Arc<AtomicU64>,
+    handed: Arc<AtomicU64>,
 }
 
 /// Frames the audio thread has not played yet. A full inbox drops the oldest.
@@ -152,6 +154,7 @@ enum Outbox {
 /// which never blocks.
 pub struct VoiceQueue {
     inner: Outbox,
+    queued: Arc<AtomicU64>,
 }
 
 impl VoiceQueue {
@@ -159,6 +162,7 @@ impl VoiceQueue {
         match &self.inner {
             Outbox::Fresh(tx) => {
                 tx.offer(packet);
+                self.queued.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
         }
@@ -171,8 +175,19 @@ impl VoicePipe {
             return;
         }
         match &*self.outgoing.lock().unwrap() {
-            Outbox::Fresh(tx) => tx.offer(packet),
+            Outbox::Fresh(tx) => {
+                tx.offer(packet);
+                self.queued.fetch_add(1, Ordering::Relaxed);
+            }
         }
+    }
+
+    /// Frames accepted into the send queue, and frames actually written to the socket.
+    pub fn counts(&self) -> (u64, u64) {
+        (
+            self.queued.load(Ordering::Relaxed),
+            self.handed.load(Ordering::Relaxed),
+        )
     }
 
     /// A sender the bench can move onto its own task. On QUIC, waiting here
@@ -181,6 +196,7 @@ impl VoicePipe {
     pub fn queue(&self) -> VoiceQueue {
         VoiceQueue {
             inner: self.outgoing.lock().unwrap().clone(),
+            queued: Arc::clone(&self.queued),
         }
     }
 
@@ -200,6 +216,7 @@ pub struct Link {
     /// The TCP socket dying after QUIC has the seat is not a dropped call.
     quiet: Arc<AtomicBool>,
     voice_pass: Arc<AtomicBool>,
+    handed: Arc<AtomicU64>,
     stop: tokio::sync::watch::Sender<bool>,
     delay: tokio::sync::watch::Sender<Option<u32>>,
 }
@@ -366,6 +383,36 @@ pub async fn connect(
     resume: [u8; 32],
 ) -> Result<Live, LinkError> {
     connect_room(invite, name, card, resume, Some("Lobby")).await
+}
+
+/// TLS on TCP only. A measurement can ask for this path on its own.
+pub async fn connect_tcp_invite(
+    invite: &str,
+    name: &str,
+    card: u64,
+    resume: [u8; 32],
+) -> Result<Live, LinkError> {
+    let parsed = parse_invite(invite).map_err(|_| LinkError::Invite)?;
+    let addrs = addresses(&parsed.host, parsed.port).await?;
+    let mut last = LinkError::Unreachable;
+    for addr in addrs {
+        match dial_tcp(addr, parsed.fingerprint).await {
+            Ok(stream) => {
+                return finish_tcp(
+                    stream,
+                    name,
+                    card,
+                    parsed.pass,
+                    resume,
+                    Some("Lobby".to_string()),
+                )
+                .await;
+            }
+            Err(LinkError::Pin) => return Err(LinkError::Pin),
+            Err(err) => last = err,
+        }
+    }
+    Err(last)
 }
 
 /// `room` is the channel to enter with the hello. `None` stays connected and
@@ -562,6 +609,7 @@ fn seat(
         channel: Arc::new(Mutex::new(channel)),
         quiet: Arc::new(AtomicBool::new(false)),
         voice_pass: Arc::new(AtomicBool::new(true)),
+        handed: Arc::new(AtomicU64::new(0)),
         stop,
         delay,
     };
@@ -569,6 +617,8 @@ fn seat(
         incoming,
         outgoing,
         pass: Arc::clone(&link.voice_pass),
+        queued: Arc::new(AtomicU64::new(0)),
+        handed: Arc::clone(&link.handed),
     };
     (link, voice)
 }
@@ -655,6 +705,7 @@ async fn finish_quic(
         Arc::clone(&link.incoming),
         delay_tx,
         Arc::clone(&link.voice_pass),
+        Arc::clone(&link.handed),
     ));
 
     Ok(Live {
@@ -743,6 +794,7 @@ async fn finish_tcp(
         clock,
         pending_tx,
         Arc::clone(&link.voice_pass),
+        Arc::clone(&link.handed),
     ));
     tokio::spawn(read_tcp_in(
         read,
@@ -891,6 +943,7 @@ async fn write_tcp_out<W>(
     clock: std::time::Instant,
     pending: tokio::sync::watch::Sender<Vec<u64>>,
     voice_pass: Arc<AtomicBool>,
+    handed: Arc<AtomicU64>,
 ) where
     W: AsyncWrite + Unpin,
 {
@@ -942,6 +995,7 @@ async fn write_tcp_out<W>(
                         if !write_limited(&mut write, TCP_VOICE, &packet).await {
                             break;
                         }
+                        handed.fetch_add(1, Ordering::Relaxed);
                     }
                     None => break,
                 }
@@ -1240,6 +1294,7 @@ async fn move_to_quic(
         Arc::clone(&link.incoming),
         link.delay.clone(),
         Arc::clone(&link.voice_pass),
+        Arc::clone(&link.handed),
     ));
     if let Some(event) = joined {
         let _ = link.events.send(event);
@@ -1381,6 +1436,7 @@ async fn run(
     voice_in: std::sync::Arc<Inbox>,
     delay: tokio::sync::watch::Sender<Option<u32>>,
     voice_pass: Arc<AtomicBool>,
+    handed: Arc<AtomicU64>,
 ) {
     let mut tmp = [0u8; 2048];
     let mut intentional = false;
@@ -1424,8 +1480,10 @@ async fn run(
             packet = voice_out.recv_within(crate::queue::VOICE_MAX_AGE), if voice_open => {
                 match packet {
                     Some(packet) => {
-                        if voice_pass.load(Ordering::Relaxed) {
-                            let _ = conn.send_datagram(bytes::Bytes::from(packet));
+                        if voice_pass.load(Ordering::Relaxed)
+                            && conn.send_datagram(bytes::Bytes::from(packet)).is_ok()
+                        {
+                            handed.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     None => voice_open = false,

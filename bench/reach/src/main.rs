@@ -1,15 +1,16 @@
 //! One speaker and one listener on a real path.
 //!
-//! Both run in this process. The server is the invite's host. A received
-//! packet was forwarded to the other participant. Loss is packets handed to
-//! the socket minus packets the listener read. Delay is that same interval.
+//! Both run in this process. The server is the invite's host. `queued` is
+//! frames accepted by the send queue. `socket_sent` is frames written to the
+//! socket. Loss is socket writes the listener did not read. No audio is a
+//! failed run. `RYME_TRANSPORT=tcp` stays on TLS.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ryme_proto::{decode_voice, encode_voice, VoicePacket};
-use ryme_server::connect;
+use ryme_proto::{decode_voice, encode_voice, parse_invite, VoicePacket};
+use ryme_server::{connect, connect_tcp_invite};
 
 #[tokio::main]
 async fn main() {
@@ -25,13 +26,24 @@ async fn main() {
         .parse()
         .expect("interval ms");
 
+    let parsed = parse_invite(&invite).expect("invite");
+    println!("host {}", parsed.host);
+    let tcp_only = std::env::var("RYME_TRANSPORT")
+        .ok()
+        .is_some_and(|value| value.eq_ignore_ascii_case("tcp"));
     let started = Instant::now();
-    let listener = connect(&invite, "ear", 1, [0; 32])
-        .await
-        .expect("listener");
-    let speaker = connect(&invite, "mouth", 2, [0; 32])
-        .await
-        .expect("speaker");
+    let listener = if tcp_only {
+        connect_tcp_invite(&invite, "ear", 1, [0; 32]).await
+    } else {
+        connect(&invite, "ear", 1, [0; 32]).await
+    }
+    .expect("listener");
+    let speaker = if tcp_only {
+        connect_tcp_invite(&invite, "mouth", 2, [0; 32]).await
+    } else {
+        connect(&invite, "mouth", 2, [0; 32]).await
+    }
+    .expect("speaker");
     let connect_ms = started.elapsed().as_millis();
 
     let marks: Arc<Mutex<HashMap<u32, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -76,24 +88,55 @@ async fn main() {
         }
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
-    let sent = sending.await.expect("speaker");
+    let queued_attempt = sending.await.expect("speaker");
+    let _ = queued_attempt;
     listener.link.logout();
     speaker.link.logout();
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     delays.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let received = got.len() as u32;
-    let lost = sent.saturating_sub(received);
+    let (queued, socket_sent) = speaker.voice.counts();
+    let received = got.len() as u64;
     let (low, mid, high) = summary(&delays);
+    println!("transport {}", if tcp_only { "tcp" } else { "auto" });
     println!("connected_ms {connect_ms}");
     println!("elapsed_ms {}", started.elapsed().as_millis());
-    println!("sent {sent}");
+    println!("queued {queued}");
+    println!("socket_sent {socket_sent}");
     println!("received {received}");
-    println!("lost {lost}");
-    println!("delay_ms min={low:.1} p50={mid:.1} max={high:.1}");
-    if received == 0 {
-        eprintln!("no audio arrived");
-        std::process::exit(1);
+    match delivery(socket_sent, received) {
+        Ok(lost) => {
+            println!("lost {lost}");
+            if delays.is_empty() {
+                println!("delay_ms none");
+            } else {
+                println!("delay_ms min={low:.1} p50={mid:.1} max={high:.1}");
+            }
+        }
+        Err(reason) => {
+            eprintln!("{reason}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn delivery(socket_sent: u64, received: u64) -> Result<u64, &'static str> {
+    if socket_sent == 0 || received == 0 {
+        Err("no audio arrived")
+    } else {
+        Ok(socket_sent.saturating_sub(received))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::delivery;
+
+    #[test]
+    fn silence_is_a_failed_run() {
+        assert!(delivery(0, 0).is_err());
+        assert!(delivery(4, 0).is_err());
+        assert_eq!(delivery(4, 3).unwrap(), 1);
     }
 }
 

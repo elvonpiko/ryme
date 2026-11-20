@@ -15,9 +15,12 @@
 
 set -eu
 
-invite=${1:?container invite, ryme://172.28.0.10:1542/#...}
+invite=${1:?container invite}
 bin=${2:-bench/load/target/release/ryme-load}
-host=$(printf '%s' "$invite" | sed -n 's#^ryme://\([^:/]*\).*#\1#p')
+case "$invite" in
+  ryme://*) host=$(printf '%s' "$invite" | sed -n 's#^ryme://\([^:/]*\).*#\1#p') ;;
+  *) host=$(printf '%s' "$invite" | sed -n 's/.*#\([^/:]*\).*/\1/p') ;;
+esac
 case "$host" in
   172.28.0.10 | 127.0.0.1) ;;
   *)

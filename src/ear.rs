@@ -750,6 +750,12 @@ fn add(mix: &mut [f32], pcm: &[f32]) {
     }
 }
 
+/// A speaker tone reached the microphone when the tone window is clearly
+/// above the quiet window and above the digital floor.
+pub fn heard_speakers(noise_rms: f32, tone_rms: f32) -> bool {
+    tone_rms > 0.01 && tone_rms > noise_rms * 2.0
+}
+
 /// Headset leaves the mic alone. Speakerphone lowers it while playback is
 /// loud, and leaves a louder voice mostly in place.
 pub fn echo_gain(speakerphone: bool, mic: f32, playback: f32) -> f32 {
@@ -2937,6 +2943,13 @@ mod tests {
         assert_eq!(evdev_code('a'), 30);
         assert_eq!(mac_hid('V'), 0x09);
         assert_eq!(input_names().first().map(String::as_str), Some("default"));
+    }
+
+    #[test]
+    fn a_speaker_tone_has_to_rise_above_the_room() {
+        assert!(!heard_speakers(0.001, 0.001));
+        assert!(!heard_speakers(0.02, 0.03));
+        assert!(heard_speakers(0.005, 0.04));
     }
 
     #[test]

@@ -296,6 +296,17 @@ pub async fn probe_invite(invite: &str) -> Result<Vec<HandshakeReport>, LinkErro
             millis: started.elapsed().as_millis(),
         });
         if let Ok((endpoint, conn)) = quic {
+            let media_started = Instant::now();
+            let media = probe_media(&conn, parsed.pass).await;
+            reports.push(HandshakeReport {
+                transport: "media",
+                address: addr,
+                outcome: match &media {
+                    Ok(()) => "ok",
+                    Err(err) => outcome(err),
+                },
+                millis: media_started.elapsed().as_millis(),
+            });
             conn.close(quinn::VarInt::from_u32(0), b"probe");
             endpoint.close(quinn::VarInt::from_u32(0), b"probe");
         }
@@ -333,7 +344,14 @@ fn diag(addr: SocketAddr, transport: &str, result: &str, millis: u128) {
 }
 
 enum Opened {
-    Quic(quinn::Endpoint, quinn::Connection),
+    /// The QUIC handshake finished. `tcp` is still dialing until media is proved.
+    Quic {
+        endpoint: quinn::Endpoint,
+        conn: quinn::Connection,
+        tcp: tokio::task::JoinHandle<
+            Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, LinkError>,
+        >,
+    },
     /// TCP answered first. `quic` is still dialing.
     Tcp {
         stream: tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
@@ -365,8 +383,12 @@ pub async fn connect_room(
     let room = room.map(str::to_string);
     for addr in addrs {
         match open(addr, parsed.fingerprint).await {
-            Ok(Opened::Quic(endpoint, conn)) => {
-                return finish_quic(
+            Ok(Opened::Quic {
+                endpoint,
+                conn,
+                tcp,
+            }) => {
+                match finish_quic(
                     endpoint,
                     conn,
                     name,
@@ -375,7 +397,29 @@ pub async fn connect_room(
                     resume,
                     room.clone(),
                 )
-                .await;
+                .await
+                {
+                    Ok(live) => {
+                        tcp.abort();
+                        return Ok(live);
+                    }
+                    Err(LinkError::Rejected(reason)) => {
+                        tcp.abort();
+                        return Err(LinkError::Rejected(reason));
+                    }
+                    Err(LinkError::Pin) => {
+                        tcp.abort();
+                        return Err(LinkError::Pin);
+                    }
+                    Err(err) => {
+                        return match tcp.await {
+                            Ok(Ok(stream)) => {
+                                finish_tcp(stream, name, card, parsed.pass, resume, room).await
+                            }
+                            _ => Err(err),
+                        };
+                    }
+                }
             }
             Ok(Opened::Tcp { stream, quic }) => {
                 let live =
@@ -424,10 +468,12 @@ async fn open(addr: SocketAddr, fingerprint: [u8; 32]) -> Result<Opened, LinkErr
     tokio::select! {
         q = &mut quic => match q {
             Ok(Ok((endpoint, conn))) => {
-                tcp.abort();
                 diag(addr, "quic", "ok", quic_started.elapsed().as_millis());
-                diag(addr, "tcp", "cancelled", tcp_started.elapsed().as_millis());
-                Ok(Opened::Quic(endpoint, conn))
+                Ok(Opened::Quic {
+                    endpoint,
+                    conn,
+                    tcp,
+                })
             }
             Ok(Err(LinkError::Pin)) => {
                 tcp.abort();
@@ -470,7 +516,11 @@ async fn open(addr: SocketAddr, fingerprint: [u8; 32]) -> Result<Opened, LinkErr
                 match quic.await {
                     Ok(Ok((endpoint, conn))) => {
                         diag(addr, "quic", "ok", quic_started.elapsed().as_millis());
-                        Ok(Opened::Quic(endpoint, conn))
+                        Ok(Opened::Quic {
+                            endpoint,
+                            conn,
+                            tcp: tokio::spawn(async { Err(tcp_err) }),
+                        })
                     }
                     Ok(Err(err)) => {
                         diag(addr, "quic", outcome(&err), quic_started.elapsed().as_millis());
@@ -480,7 +530,11 @@ async fn open(addr: SocketAddr, fingerprint: [u8; 32]) -> Result<Opened, LinkErr
                 }
             }
             Err(_) => match quic.await {
-                Ok(Ok((endpoint, conn))) => Ok(Opened::Quic(endpoint, conn)),
+                Ok(Ok((endpoint, conn))) => Ok(Opened::Quic {
+                    endpoint,
+                    conn,
+                    tcp: tokio::spawn(async { Err(LinkError::Unreachable) }),
+                }),
                 Ok(Err(err)) => Err(err),
                 Err(_) => Err(LinkError::Unreachable),
             },
@@ -529,6 +583,13 @@ async fn finish_quic(
     room: Option<String>,
 ) -> Result<Live, LinkError> {
     let (mut send, mut recv) = conn.open_bi().await.map_err(|_| LinkError::Unreachable)?;
+    if prove_media(&conn, &mut send, &mut recv, pass)
+        .await
+        .is_err()
+    {
+        drop_quic(&endpoint, &conn);
+        return Err(LinkError::Unreachable);
+    }
 
     write_msg(
         &mut send,
@@ -1143,6 +1204,11 @@ async fn move_to_quic(
         resume,
     });
     Ok(())
+}
+
+async fn probe_media(conn: &quinn::Connection, pass: [u8; 32]) -> Result<(), LinkError> {
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|_| LinkError::Unreachable)?;
+    prove_media(conn, &mut send, &mut recv, pass).await
 }
 
 async fn prove_media(

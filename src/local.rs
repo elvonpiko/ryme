@@ -351,6 +351,7 @@ pub struct AudioPref {
     pub input: String,
     pub output: String,
     pub key: char,
+    pub speakerphone: bool,
 }
 
 pub fn load_audio() -> AudioPref {
@@ -366,7 +367,13 @@ pub fn load_audio() -> AudioPref {
         .filter(|ch| ch.is_ascii_alphabetic())
         .map(|ch| ch.to_ascii_uppercase())
         .unwrap_or('V');
-    AudioPref { input, output, key }
+    let speakerphone = lines.next().is_some_and(|line| line == "1");
+    AudioPref {
+        input,
+        output,
+        key,
+        speakerphone,
+    }
 }
 
 pub fn store_audio(pref: &AudioPref) {
@@ -379,9 +386,10 @@ pub fn store_audio(pref: &AudioPref) {
         'V'
     };
     let body = format!(
-        "{}\n{}\n{key}\n",
+        "{}\n{}\n{key}\n{}\n",
         device_name(&pref.input),
-        device_name(&pref.output)
+        device_name(&pref.output),
+        if pref.speakerphone { "1" } else { "0" }
     );
     let _ = write_private(&path, body.as_bytes());
 }

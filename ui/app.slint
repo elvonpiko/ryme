@@ -465,6 +465,7 @@ export component MainWindow inherits Window {
     callback logout();
     callback set-ptt(bool);
     callback set-denoise(bool);
+    callback set-speakerphone(bool);
     callback v-key(bool);
     callback tune(float);
     callback hush(bool);
@@ -510,6 +511,10 @@ export component MainWindow inherits Window {
     in-out property <bool> denoise: true;
     changed denoise => {
         root.set-denoise(root.denoise);
+    }
+    in-out property <bool> speakerphone: false;
+    changed speakerphone => {
+        root.set-speakerphone(root.speakerphone);
     }
     in-out property <string> talk-key: "V";
     in-out property <bool> capture-key: false;
@@ -1354,6 +1359,24 @@ export component MainWindow inherits Window {
                                     Switch { on <=> root.denoise; }
                                 }
                             }
+                        }
+                        Rectangle {
+                            height: 36px;
+                            HorizontalLayout {
+                                alignment: space-between;
+                                Text { text: "Speakerphone"; color: Theme.ink; font-family: Theme.sans; font-size: 14px; font-weight: 500; vertical-alignment: center; }
+                                VerticalLayout {
+                                    alignment: center;
+                                    Switch { on <=> root.speakerphone; }
+                                }
+                            }
+                        }
+                        Text {
+                            text: "Speakerphone ducks the mic while the speakers are loud. Leave it off with a headset.";
+                            wrap: word-wrap;
+                            color: Theme.muted;
+                            font-family: Theme.sans;
+                            font-size: 11px;
                         }
                     }
                 }

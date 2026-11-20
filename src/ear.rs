@@ -40,6 +40,7 @@ pub struct Ear {
     live: Arc<AtomicBool>,
     ptt: Arc<AtomicBool>,
     denoise: Arc<AtomicBool>,
+    speakerphone: Arc<AtomicBool>,
     vkey: Arc<AtomicBool>,
     levels: Arc<Mutex<HashMap<u32, Mix>>>,
     input: Arc<Mutex<String>>,
@@ -96,6 +97,11 @@ impl Ear {
 
     pub fn set_denoise(&self, on: bool) {
         self.denoise.store(on, Ordering::Relaxed);
+    }
+
+    /// Speakerphone ducks the mic while local playback is loud. A headset leaves this off.
+    pub fn set_speakerphone(&self, on: bool) {
+        self.speakerphone.store(on, Ordering::Relaxed);
     }
 
     /// The configured letter, as seen by the window. The audio thread also reads
@@ -276,6 +282,7 @@ pub struct Gate {
     pub deaf: bool,
     pub ptt: bool,
     pub denoise: bool,
+    pub speakerphone: bool,
 }
 
 /// True only when this client is in the intended room, the mic is open, and
@@ -299,6 +306,7 @@ pub fn open(
     let live = Arc::new(AtomicBool::new(false));
     let ptt = Arc::new(AtomicBool::new(gate.ptt));
     let denoise = Arc::new(AtomicBool::new(gate.denoise));
+    let speakerphone = Arc::new(AtomicBool::new(gate.speakerphone));
     let vkey = Arc::new(AtomicBool::new(false));
     let levels = Arc::new(Mutex::new(HashMap::new()));
     let input = Arc::new(Mutex::new(device_label(input)));
@@ -321,6 +329,7 @@ pub fn open(
         let live = live.clone();
         let ptt = ptt.clone();
         let denoise = denoise.clone();
+        let speakerphone = speakerphone.clone();
         let vkey = vkey.clone();
         let levels = levels.clone();
         let input = input.clone();
@@ -346,6 +355,7 @@ pub fn open(
                 live,
                 ptt,
                 denoise,
+                speakerphone,
                 vkey,
                 levels,
                 input,
@@ -376,6 +386,7 @@ pub fn open(
         live,
         ptt,
         denoise,
+        speakerphone,
         vkey,
         levels,
         input,
@@ -411,6 +422,7 @@ fn run(
     live: Arc<AtomicBool>,
     ptt: Arc<AtomicBool>,
     denoise: Arc<AtomicBool>,
+    speakerphone: Arc<AtomicBool>,
     vkey: Arc<AtomicBool>,
     levels: Arc<Mutex<HashMap<u32, Mix>>>,
     input: Arc<Mutex<String>>,
@@ -480,6 +492,7 @@ fn run(
     let mut quiet_run = 0u32;
     let mut held = [0f32; FRAME];
     let mut have_held = false;
+    let mut play_rms = 0.0f32;
     let mut was_deaf = false;
     let mut heard_tcp = tcp.load(Ordering::Relaxed);
 
@@ -536,6 +549,16 @@ fn run(
                 frame.copy_from_slice(&cap_48[..FRAME]);
                 cap_48.drain(..FRAME);
                 shape_frame(&mut frame, denoise.load(Ordering::Relaxed), &mut tone);
+                let gain = echo_gain(
+                    speakerphone.load(Ordering::Relaxed),
+                    frame_rms(&frame),
+                    play_rms,
+                );
+                if gain < 1.0 {
+                    for sample in frame.iter_mut() {
+                        *sample *= gain;
+                    }
+                }
                 remember_peak(&peak, &frame);
                 let sending = may_send(
                     live.load(Ordering::Relaxed),
@@ -598,6 +621,7 @@ fn run(
                     let _ = tone_left.fetch_sub(1, Ordering::Relaxed);
                     add_tone(&mut mix, &mut tone_phase);
                 }
+                play_rms = frame_rms(&mix);
                 let before = pending_play.len();
                 play_pace.convert(&mix, &mut pending_play);
                 ready += pending_play.len() - before;
@@ -724,6 +748,27 @@ fn add(mix: &mut [f32], pcm: &[f32]) {
     for (slot, sample) in mix.iter_mut().zip(pcm) {
         *slot += sample;
     }
+}
+
+/// Headset leaves the mic alone. Speakerphone lowers it while playback is
+/// loud, and leaves a louder voice mostly in place.
+pub fn echo_gain(speakerphone: bool, mic: f32, playback: f32) -> f32 {
+    if !speakerphone || playback < 0.02 {
+        return 1.0;
+    }
+    if mic > playback * 1.5 {
+        return 0.85;
+    }
+    let ratio = (mic / playback).clamp(0.0, 1.0);
+    0.12 + 0.88 * ratio
+}
+
+fn frame_rms(frame: &[f32]) -> f32 {
+    if frame.is_empty() {
+        return 0.0;
+    }
+    let sum: f32 = frame.iter().map(|sample| sample * sample).sum();
+    (sum / frame.len() as f32).sqrt()
 }
 
 /// Quiet speech stays within 6 dB of an open gate. The old square curve
@@ -2892,6 +2937,14 @@ mod tests {
         assert_eq!(evdev_code('a'), 30);
         assert_eq!(mac_hid('V'), 0x09);
         assert_eq!(input_names().first().map(String::as_str), Some("default"));
+    }
+
+    #[test]
+    fn a_headset_ignores_the_speakers_and_a_speakerphone_ducks_them() {
+        assert_eq!(echo_gain(false, 0.01, 0.2), 1.0);
+        assert_eq!(echo_gain(true, 0.01, 0.01), 1.0);
+        assert!(echo_gain(true, 0.01, 0.2) < 0.3);
+        assert!(echo_gain(true, 0.4, 0.2) > 0.8);
     }
 
     #[test]

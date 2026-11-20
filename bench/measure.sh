@@ -4,8 +4,8 @@
 # Run this on the Pi, against the container address, never the public tunnel.
 # The server only forwards. Each speaker sends an 80-byte voice packet every
 # 10 milliseconds for 12 seconds. CPU is (utime + stime of every thread) divided
-# by those 12 seconds, so the short connect is included and the percent is a
-# little high. Memory is VmRSS. docker stats reports 0 for this container.
+# by the measured wall time of that run. Memory is VmRSS. docker stats
+# reports 0 for this container.
 #
 #   cargo build --release --manifest-path bench/load/Cargo.toml
 #   ./bench/measure.sh 'ryme://172.28.0.10:1542/#<fingerprint>'
@@ -40,26 +40,38 @@ report() {
   t0=$2
   t1=$3
   kb=$4
-  python3 - "$name" "$t0" "$t1" "$clk" "$kb" <<'PY'
+  seconds=$5
+  python3 - "$name" "$t0" "$t1" "$clk" "$kb" "$seconds" <<'PY'
 import sys
-name, t0, t1, clk, kb = sys.argv[1:]
-cpu = (int(t1) - int(t0)) / int(clk) / 12 * 100
-print(f"{name} cpu={cpu:.2f}% rss_kb={kb}")
+name, t0, t1, clk, kb, seconds = sys.argv[1:]
+elapsed = float(seconds)
+if elapsed <= 0:
+    elapsed = 0.001
+cpu = (int(t1) - int(t0)) / int(clk) / elapsed * 100
+print(f"{name} cpu={cpu:.2f}% rss_kb={kb} seconds={elapsed:.2f}")
 PY
+}
+
+now_s() {
+  python3 -c 'import time; print(f"{time.time():.6f}")'
 }
 
 echo "pid=$pid idle"
 t0=$(ticks "$pid")
+s0=$(now_s)
 sleep 12
+s1=$(now_s)
 t1=$(ticks "$pid")
-report idle "$t0" "$t1" "$(rss "$pid")"
+report idle "$t0" "$t1" "$(rss "$pid")" "$(python3 -c "print($s1 - $s0)")"
 
 run() {
   n=$1
   t0=$(ticks "$pid")
+  s0=$(now_s)
   "$bin" "$invite" "$n" 12
+  s1=$(now_s)
   t1=$(ticks "$pid")
-  report "speakers=$n" "$t0" "$t1" "$(rss "$pid")"
+  report "speakers=$n" "$t0" "$t1" "$(rss "$pid")" "$(python3 -c "print($s1 - $s0)")"
 }
 
 run 10

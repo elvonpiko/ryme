@@ -137,6 +137,18 @@ impl Room {
         }
     }
 
+    fn for_speaking(&self) -> Self {
+        Self {
+            me: self.me,
+            channel: self.channel.clone(),
+            members: self.members.clone(),
+            rooms: self.rooms.clone(),
+            lines: Vec::new(),
+            in_channel: self.in_channel,
+            speaking: self.speaking.clone(),
+        }
+    }
+
     fn keep_lines(&mut self) {
         const CHAT_KEEP: usize = 200;
         if self.lines.len() > CHAT_KEEP {
@@ -159,6 +171,7 @@ struct Slot {
     resume_channel: String,
     ptt: bool,
     denoise: bool,
+    speakerphone: bool,
     muted: bool,
     deaf: bool,
     resume_secret: [u8; 32],
@@ -219,6 +232,7 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
     let audio = local::load_audio();
     crate::ear::set_talk_key(audio.key);
     ui.set_talk_key(audio.key.to_string().into());
+    ui.set_speakerphone(audio.speakerphone);
     ui.set_input_name(short_device(&audio.input, true).into());
     ui.set_output_name(short_device(&audio.output, false).into());
     local::forget_servers();
@@ -235,6 +249,7 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
         resume_channel: String::new(),
         ptt: ui.get_ptt(),
         denoise: ui.get_denoise(),
+        speakerphone: audio.speakerphone,
         muted: ui.get_muted(),
         deaf: ui.get_deafened(),
         resume_secret: [0; 32],
@@ -415,6 +430,23 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
             }
             drop(guard);
             keep_switches(&slot);
+        }
+    });
+
+    ui.on_set_speakerphone({
+        let slot = slot.clone();
+        move |on| {
+            let mut guard = slot.lock().unwrap();
+            guard.speakerphone = on;
+            if let Some(ear) = guard.ear.as_ref() {
+                ear.set_speakerphone(on);
+            }
+            local::store_audio(&local::AudioPref {
+                input: guard.input.clone(),
+                output: guard.output.clone(),
+                key: crate::ear::talk_key(),
+                speakerphone: on,
+            });
         }
     });
 
@@ -767,6 +799,7 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
                 input: guard.input.clone(),
                 output: guard.output.clone(),
                 key,
+                speakerphone: guard.speakerphone,
             });
         }
     });
@@ -792,6 +825,7 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
                         input: guard.input.clone(),
                         output: guard.output.clone(),
                         key: crate::ear::talk_key(),
+                        speakerphone: guard.speakerphone,
                     });
                     switched = Some((input, applied));
                 }
@@ -975,6 +1009,7 @@ fn cycle_device(ui: &MainWindow, slot: &Arc<Mutex<Slot>>, input: bool) {
         input: guard.input.clone(),
         output: guard.output.clone(),
         key: crate::ear::talk_key(),
+        speakerphone: guard.speakerphone,
     });
 }
 
@@ -1105,6 +1140,7 @@ fn begin(
                         deaf: deafened,
                         ptt,
                         denoise,
+                        speakerphone: slot.lock().unwrap().speakerphone,
                     },
                     &input,
                     &output,
@@ -1118,6 +1154,7 @@ fn begin(
                     }
                     ear.set_ptt(guard.ptt);
                     ear.set_denoise(guard.denoise);
+                    ear.set_speakerphone(guard.speakerphone);
                     ear.set_muted(guard.muted);
                     ear.set_deaf(guard.deaf);
                     if !pending {
@@ -1180,7 +1217,7 @@ fn begin(
                                     } else {
                                         room.speaking.remove(&id);
                                     }
-                                    let snapshot = room.clone();
+                                    let snapshot = room.for_speaking();
                                     let weak = weak.clone();
                                     let slot = slot.clone();
                                     let _ = weak.upgrade_in_event_loop(move |ui| {

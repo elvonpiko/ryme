@@ -477,6 +477,11 @@ fn run(
     let mut frame_device = (play_rate / 100).max(1) as usize;
     let mut tone_phase = 0.0f32;
     let mut drift = 0usize;
+    let mut quiet_run = 0u32;
+    let mut held = [0f32; FRAME];
+    let mut have_held = false;
+    let mut was_deaf = false;
+    let mut heard_tcp = tcp.load(Ordering::Relaxed);
 
     while !stop.load(Ordering::Relaxed) {
         if follow_rate(&cap_rates, &mut seen_cap) {
@@ -491,9 +496,24 @@ fn run(
             pending_play.clear();
             frame_device = (seen_play / 100).max(1) as usize;
         }
-        while let Some(packet) = pipe.try_recv() {
-            // QUIC datagrams and TCP voice frames are the same packet.
-            ingest(&mut speakers, packet, tcp.load(Ordering::Relaxed));
+        let path_tcp = tcp.load(Ordering::Relaxed);
+        if path_tcp != heard_tcp {
+            heard_tcp = path_tcp;
+            for mouth in speakers.values_mut() {
+                mouth.jitter.follow_path(path_tcp);
+            }
+        }
+        let deaf_now = deaf.load(Ordering::Relaxed);
+        if deaf_now && !was_deaf {
+            speakers.clear();
+        }
+        was_deaf = deaf_now;
+        if !deaf_now {
+            while let Some(packet) = pipe.try_recv() {
+                ingest(&mut speakers, packet, path_tcp);
+            }
+        } else {
+            while pipe.try_recv().is_some() {}
         }
         let who = me.load(Ordering::Relaxed);
         let keyed = if ptt.load(Ordering::Relaxed) {
@@ -525,11 +545,37 @@ fn run(
                 let talking = sending && mine.tick(&frame);
                 tell(&speaking, &mut shown, who, talking);
                 if sending {
-                    if let Some(encoder) = encoder.as_mut() {
-                        send_frame(encoder, &pipe, seq, &frame);
+                    if talking && quiet_run >= SILENCE_HANG {
+                        seq = seq.wrapping_add(64);
+                        if have_held {
+                            if let Some(encoder) = encoder.as_mut() {
+                                send_frame(encoder, &pipe, seq, &held);
+                            }
+                            seq = seq.wrapping_add(1);
+                            have_held = false;
+                        }
                     }
+                    if voice_due(talking, quiet_run) {
+                        if let Some(encoder) = encoder.as_mut() {
+                            send_frame(encoder, &pipe, seq, &frame);
+                        }
+                        seq = seq.wrapping_add(1);
+                        quiet_run = if talking {
+                            0
+                        } else {
+                            quiet_run.saturating_add(1)
+                        };
+                        have_held = false;
+                    } else {
+                        held = frame;
+                        have_held = true;
+                        quiet_run = quiet_run.saturating_add(1);
+                    }
+                } else {
+                    quiet_run = 0;
+                    have_held = false;
+                    seq = seq.wrapping_add(1);
                 }
-                seq = seq.wrapping_add(1);
             }
         }
         if play_tx.is_some() {
@@ -772,6 +818,13 @@ fn blend(pcm: &mut [f32], level: Option<Mix>) -> bool {
         }
     }
     true
+}
+
+const SILENCE_HANG: u32 = 20;
+
+/// Speech is sent, and a short tail after it. A long quiet stretch is not.
+fn voice_due(talking: bool, quiet_frames: u32) -> bool {
+    talking || quiet_frames < SILENCE_HANG
 }
 
 fn send_frame(encoder: &mut Encoder, pipe: &VoicePipe, seq: u32, frame: &[f32]) {
@@ -1368,9 +1421,23 @@ mod alsa {
 #[cfg(not(target_os = "linux"))]
 struct HeldInput {
     _stream: cpal::Stream,
-    rx: std::sync::mpsc::Receiver<Vec<f32>>,
+    incoming: Consumer<f32>,
     broken: Arc<AtomicBool>,
     name: String,
+}
+
+#[cfg(not(target_os = "linux"))]
+static CAPTURE_OVERRUNS: AtomicU32 = AtomicU32::new(0);
+
+/// Microphone blocks the capture ring could not take. The counter is cleared.
+#[cfg(not(target_os = "linux"))]
+pub fn take_capture_overruns() -> u32 {
+    CAPTURE_OVERRUNS.swap(0, Ordering::Relaxed)
+}
+
+#[cfg(target_os = "linux")]
+pub fn take_capture_overruns() -> u32 {
+    0
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1393,12 +1460,11 @@ fn capture_thread(
             || (switching && current.as_ref().is_some_and(|held| held.name != chosen));
         if rebuild {
             let broken = Arc::new(AtomicBool::new(false));
-            let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(8);
-            match build_input(&chosen, tx, broken.clone()) {
-                Some((stream, rate)) => {
+            match build_input(&chosen, broken.clone()) {
+                Some((stream, rate, incoming)) => {
                     current = Some(HeldInput {
                         _stream: stream,
-                        rx,
+                        incoming,
                         broken,
                         name: chosen.clone(),
                     });
@@ -1435,11 +1501,9 @@ fn capture_thread(
             thread::sleep(Duration::from_millis(200));
             continue;
         }
-        while let Ok(samples) = held.rx.try_recv() {
-            for sample in samples {
-                if producer.push(sample).is_err() {
-                    break;
-                }
+        while let Ok(sample) = held.incoming.pop() {
+            if producer.push(sample).is_err() {
+                break;
             }
         }
         thread::sleep(Duration::from_millis(5));
@@ -1535,32 +1599,31 @@ fn playback_thread(
 }
 
 #[cfg(not(target_os = "linux"))]
-fn build_input(
-    name: &str,
-    tx: std::sync::mpsc::SyncSender<Vec<f32>>,
-    broken: Arc<AtomicBool>,
-) -> Option<(cpal::Stream, u32)> {
+fn build_input(name: &str, broken: Arc<AtomicBool>) -> Option<(cpal::Stream, u32, Consumer<f32>)> {
     use cpal::traits::{DeviceTrait, StreamTrait};
     let device = pick_device(name, true)?;
     let supported = device.default_input_config().ok()?;
     let chosen = prefer_f32(&device, supported, true);
     let channels = chosen.channels() as usize;
     let rate = chosen.sample_rate();
+    let (mut producer, consumer) = RingBuffer::<f32>::new(RING);
     let stream = device
         .build_input_stream_raw(
             stream_config(&chosen),
             chosen.sample_format(),
             move |data, _| {
-                let mut mono = Vec::new();
-                push_captured_vec(&mut mono, data, channels);
-                let _ = tx.try_send(mono);
+                if producer.slots() == 0 {
+                    CAPTURE_OVERRUNS.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                push_captured(&mut producer, data, channels);
             },
             move |_| broken.store(true, Ordering::Relaxed),
             None,
         )
         .ok()?;
     stream.play().ok()?;
-    Some((stream, rate))
+    Some((stream, rate, consumer))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -2829,6 +2892,14 @@ mod tests {
         assert_eq!(evdev_code('a'), 30);
         assert_eq!(mac_hid('V'), 0x09);
         assert_eq!(input_names().first().map(String::as_str), Some("default"));
+    }
+
+    #[test]
+    fn silence_after_the_tail_is_not_sent() {
+        assert!(voice_due(true, 100));
+        assert!(voice_due(false, 0));
+        assert!(voice_due(false, 19));
+        assert!(!voice_due(false, 20));
     }
 
     #[test]

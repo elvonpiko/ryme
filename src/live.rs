@@ -776,6 +776,7 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
                 .ear
                 .as_ref()
                 .is_some_and(|ear| !ear.mic);
+            let overruns = crate::ear::take_capture_overruns();
             let keyed = crate::ear::key_is_down();
             let (pref, muted_now) = {
                 let guard = meter_slot.lock().unwrap();
@@ -796,6 +797,15 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
                 ui.set_input_fault(no_mic);
                 if paint_mute {
                     ui.set_muted(muted_now);
+                }
+                if overruns > 0 {
+                    toast(
+                        &ui,
+                        &toast_rt,
+                        &toast_notices,
+                        "The microphone dropped a block.",
+                        true,
+                    );
                 }
                 if let Some((input, applied)) = switched {
                     if input {

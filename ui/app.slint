@@ -515,7 +515,7 @@ export component MainWindow inherits Window {
     in-out property <string> input-name: "Default";
     in-out property <string> output-name: "Default";
     in-out property <bool> input-fault: false;
-    in-out property <string> mic-line: !root.inside ? "Disconnected" : root.joined < 0 ? "Not in a room" : root.input-fault ? "No microphone" : root.muted ? "Muted" : root.ptt ? (root.keyed ? "Mic live" : "Hold " + root.talk-key + " to talk") : "Mic live";
+    in-out property <string> mic-line: !root.inside ? "Disconnected" : root.joined < 0 ? "Not in a room" : root.input-fault ? "No microphone" : root.muted ? "Muted" : root.deafened ? "Deafened · others hear you" : root.ptt ? (root.keyed ? "Mic live" : "Hold " + root.talk-key + " to talk") : "Mic live";
     in-out property <[Band]> bands: [];
     in-out property <int> picked: -1;
     in-out property <string> picked-name: "";

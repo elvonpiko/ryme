@@ -58,6 +58,21 @@ impl Jitter {
         Self::profile(5, 3, 20)
     }
 
+    /// The socket changed. Keep the audio already queued and use the new budget.
+    pub fn follow_path(&mut self, tcp: bool) {
+        let (start, min_depth, max_depth) = if tcp { (5, 3, 20) } else { (3, 2, 8) };
+        self.start = start;
+        self.min_depth = min_depth;
+        self.max_depth = max_depth;
+        if self.target > max_depth {
+            self.target = max_depth;
+        }
+        if self.target < min_depth {
+            self.target = min_depth.max(1);
+        }
+        self.trim_to_max();
+    }
+
     fn profile(start: usize, min_depth: usize, max_depth: usize) -> Self {
         Self {
             next: None,
@@ -385,6 +400,17 @@ mod tests {
         assert_eq!(jitter.pull(), Play::Wait);
         assert_eq!(jitter.pull(), Play::Wait);
         assert_eq!(jitter.pull(), Play::Packet(vec![1]));
+    }
+
+    #[test]
+    fn a_path_change_keeps_the_queue_and_uses_the_new_budget() {
+        let mut jitter = Jitter::tcp();
+        assert_eq!(jitter.max_depth, 20);
+        push(&mut jitter, 1, 1);
+        jitter.follow_path(false);
+        assert_eq!(jitter.max_depth, 8);
+        assert_eq!(jitter.min_depth, 2);
+        assert!(jitter.queued.contains_key(&1));
     }
 
     #[test]

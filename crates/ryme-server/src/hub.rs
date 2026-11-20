@@ -172,7 +172,9 @@ impl Hub {
         let mut targets: Vec<u32> = self
             .users
             .iter()
-            .filter(|(id, other)| **id != from && other.channel.as_deref() == Some(channel))
+            .filter(|(id, other)| {
+                **id != from && !other.deafened && other.channel.as_deref() == Some(channel)
+            })
             .map(|(id, _)| *id)
             .collect();
         targets.sort_unstable();
@@ -787,7 +789,10 @@ mod tests {
         let deaf = hub.handle(Some(jonas), ClientMsg::Deafen { deafened: true });
         assert!(deaf.to_self.is_empty());
         assert!(deaf.to_others.is_empty());
-        assert_eq!(hub.voice_targets(mara, &voice(1)), vec![jonas]);
+        assert!(
+            hub.voice_targets(mara, &voice(1)).is_empty(),
+            "a deafened listener is not sent audio"
+        );
 
         let mute = hub.handle(Some(mara), ClientMsg::Mute { muted: true });
         assert_eq!(

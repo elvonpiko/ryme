@@ -31,6 +31,7 @@ pub enum Event {
         user_id: u32,
         name: String,
         card: u64,
+        muted: bool,
     },
     PeerLeft {
         user_id: u32,
@@ -94,6 +95,9 @@ pub struct Live {
 pub struct VoicePipe {
     incoming: Arc<Inbox>,
     outgoing: Arc<Mutex<Outbox>>,
+    /// False while the room is changing. Queued frames are dropped instead of
+    /// arriving in the next room.
+    pass: Arc<AtomicBool>,
 }
 
 /// Frames the audio thread has not played yet. A full inbox drops the oldest.
@@ -165,6 +169,9 @@ impl VoiceQueue {
 
 impl VoicePipe {
     pub fn send(&self, packet: Vec<u8>) {
+        if !self.pass.load(Ordering::Relaxed) {
+            return;
+        }
         match &*self.outgoing.lock().unwrap() {
             Outbox::Wait(tx) => {
                 let _ = tx.try_send(packet);
@@ -197,6 +204,7 @@ pub struct Link {
     channel: Arc<Mutex<String>>,
     /// The TCP socket dying after QUIC has the seat is not a dropped call.
     quiet: Arc<AtomicBool>,
+    voice_pass: Arc<AtomicBool>,
     stop: tokio::sync::watch::Sender<bool>,
     delay: tokio::sync::watch::Sender<Option<u32>>,
 }
@@ -205,6 +213,9 @@ impl Link {
     fn command(&self, cmd: Cmd) {
         if let Cmd::Join(channel) = &cmd {
             *self.channel.lock().unwrap() = channel.clone();
+        }
+        if matches!(cmd, Cmd::Leave | Cmd::Join(_)) {
+            self.voice_pass.store(false, Ordering::Relaxed);
         }
         if matches!(cmd, Cmd::Leave) {
             self.channel.lock().unwrap().clear();
@@ -237,6 +248,11 @@ impl Link {
 
     pub fn logout(&self) {
         self.command(Cmd::Logout);
+    }
+
+    /// Voice may leave the machine again. Called once the asked room is confirmed.
+    pub fn release_voice(&self) {
+        self.voice_pass.store(true, Ordering::Relaxed);
     }
 }
 
@@ -331,16 +347,39 @@ pub async fn connect(
     card: u64,
     resume: [u8; 32],
 ) -> Result<Live, LinkError> {
+    connect_room(invite, name, card, resume, Some("Lobby")).await
+}
+
+/// `room` is the channel to enter with the hello. `None` stays connected and
+/// outside every room, so a restore cannot transmit in Lobby first.
+pub async fn connect_room(
+    invite: &str,
+    name: &str,
+    card: u64,
+    resume: [u8; 32],
+    room: Option<&str>,
+) -> Result<Live, LinkError> {
     let parsed = parse_invite(invite).map_err(|_| LinkError::Invite)?;
     let addrs = addresses(&parsed.host, parsed.port)?;
     let mut last = LinkError::Unreachable;
+    let room = room.map(str::to_string);
     for addr in addrs {
         match open(addr, parsed.fingerprint).await {
             Ok(Opened::Quic(endpoint, conn)) => {
-                return finish_quic(endpoint, conn, name, card, parsed.pass, resume).await;
+                return finish_quic(
+                    endpoint,
+                    conn,
+                    name,
+                    card,
+                    parsed.pass,
+                    resume,
+                    room.clone(),
+                )
+                .await;
             }
             Ok(Opened::Tcp { stream, quic }) => {
-                let live = finish_tcp(stream, name, card, parsed.pass, resume).await?;
+                let live =
+                    finish_tcp(stream, name, card, parsed.pass, resume, room.clone()).await?;
                 let link = live.link.clone();
                 tokio::spawn(pursue_quic(
                     addr,
@@ -371,7 +410,7 @@ pub(crate) async fn connect_tcp(
     resume: [u8; 32],
 ) -> Result<Live, LinkError> {
     let stream = dial_tcp(addr, fingerprint).await?;
-    finish_tcp(stream, name, card, pass, resume).await
+    finish_tcp(stream, name, card, pass, resume, Some("Lobby".into())).await
 }
 
 async fn open(addr: SocketAddr, fingerprint: [u8; 32]) -> Result<Opened, LinkError> {
@@ -468,10 +507,15 @@ fn seat(
         resume: Arc::new(Mutex::new(resume)),
         channel: Arc::new(Mutex::new(channel)),
         quiet: Arc::new(AtomicBool::new(false)),
+        voice_pass: Arc::new(AtomicBool::new(true)),
         stop,
         delay,
     };
-    let voice = VoicePipe { incoming, outgoing };
+    let voice = VoicePipe {
+        incoming,
+        outgoing,
+        pass: Arc::clone(&link.voice_pass),
+    };
     (link, voice)
 }
 
@@ -482,6 +526,7 @@ async fn finish_quic(
     card: u64,
     pass: [u8; 32],
     resume: [u8; 32],
+    room: Option<String>,
 ) -> Result<Live, LinkError> {
     let (mut send, mut recv) = conn.open_bi().await.map_err(|_| LinkError::Unreachable)?;
 
@@ -496,27 +541,29 @@ async fn finish_quic(
     )
     .await?;
     let mut buf = Vec::new();
-    let (me, resume) = match read_msg(&mut recv, &mut buf).await? {
-        ServerMsg::Welcome { user_id, resume } => (user_id, resume),
+    let (me, resume, welcome_rooms) = match read_msg(&mut recv, &mut buf).await? {
+        ServerMsg::Welcome {
+            user_id,
+            resume,
+            rooms,
+        } => (user_id, resume, rooms),
         ServerMsg::Reject { reason } => return Err(LinkError::Rejected(reason)),
         _ => return Err(LinkError::Unreachable),
     };
 
-    write_msg(
-        &mut send,
-        &ClientMsg::Join {
-            channel: "Lobby".into(),
-        },
-    )
-    .await?;
-    let (channel, members, rooms) = match read_msg(&mut recv, &mut buf).await? {
-        ServerMsg::Joined {
-            channel,
-            members,
-            rooms,
-        } => (channel, peers(members), rooms),
-        ServerMsg::Reject { reason } => return Err(LinkError::Rejected(reason)),
-        _ => return Err(LinkError::Unreachable),
+    let (channel, members, rooms) = if let Some(room) = room {
+        write_msg(&mut send, &ClientMsg::Join { channel: room }).await?;
+        match read_msg(&mut recv, &mut buf).await? {
+            ServerMsg::Joined {
+                channel,
+                members,
+                rooms,
+            } => (channel, peers(members), rooms),
+            ServerMsg::Reject { reason } => return Err(LinkError::Rejected(reason)),
+            _ => return Err(LinkError::Unreachable),
+        }
+    } else {
+        (String::new(), Vec::new(), welcome_rooms)
     };
 
     let (cmd_tx, cmd_rx) = unbounded_channel();
@@ -525,6 +572,16 @@ async fn finish_quic(
     let voice_in = Inbox::new(64);
     let (delay_tx, delay) = tokio::sync::watch::channel(None);
     let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
+    let (link, voice) = seat(
+        cmd_tx,
+        event_tx.clone(),
+        voice_in,
+        Outbox::Wait(voice_out_tx),
+        resume,
+        channel.clone(),
+        delay_tx.clone(),
+        stop_tx,
+    );
     tokio::spawn(run(
         endpoint,
         conn,
@@ -532,21 +589,12 @@ async fn finish_quic(
         recv,
         buf,
         cmd_rx,
-        event_tx.clone(),
-        voice_out_rx,
-        Arc::clone(&voice_in),
-        delay_tx.clone(),
-    ));
-    let (link, voice) = seat(
-        cmd_tx,
         event_tx,
-        voice_in,
-        Outbox::Wait(voice_out_tx),
-        resume,
-        channel.clone(),
+        voice_out_rx,
+        Arc::clone(&link.incoming),
         delay_tx,
-        stop_tx,
-    );
+        Arc::clone(&link.voice_pass),
+    ));
 
     Ok(Live {
         me,
@@ -568,6 +616,7 @@ async fn finish_tcp(
     card: u64,
     pass: [u8; 32],
     resume: [u8; 32],
+    room: Option<String>,
 ) -> Result<Live, LinkError> {
     let (mut read, mut write) = tokio::io::split(stream);
     let mut acc = Vec::new();
@@ -581,26 +630,28 @@ async fn finish_tcp(
         },
     )
     .await?;
-    let (me, resume) = match read_control(&mut read, &mut acc).await? {
-        ServerMsg::Welcome { user_id, resume } => (user_id, resume),
+    let (me, resume, welcome_rooms) = match read_control(&mut read, &mut acc).await? {
+        ServerMsg::Welcome {
+            user_id,
+            resume,
+            rooms,
+        } => (user_id, resume, rooms),
         ServerMsg::Reject { reason } => return Err(LinkError::Rejected(reason)),
         _ => return Err(LinkError::Unreachable),
     };
-    write_control(
-        &mut write,
-        &ClientMsg::Join {
-            channel: "Lobby".into(),
-        },
-    )
-    .await?;
-    let (channel, members, rooms) = match read_control(&mut read, &mut acc).await? {
-        ServerMsg::Joined {
-            channel,
-            members,
-            rooms,
-        } => (channel, peers(members), rooms),
-        ServerMsg::Reject { reason } => return Err(LinkError::Rejected(reason)),
-        _ => return Err(LinkError::Unreachable),
+    let (channel, members, rooms) = if let Some(room) = room {
+        write_control(&mut write, &ClientMsg::Join { channel: room }).await?;
+        match read_control(&mut read, &mut acc).await? {
+            ServerMsg::Joined {
+                channel,
+                members,
+                rooms,
+            } => (channel, peers(members), rooms),
+            ServerMsg::Reject { reason } => return Err(LinkError::Rejected(reason)),
+            _ => return Err(LinkError::Unreachable),
+        }
+    } else {
+        (String::new(), Vec::new(), welcome_rooms)
     };
 
     let (cmd_tx, cmd_rx) = unbounded_channel();
@@ -630,6 +681,7 @@ async fn finish_tcp(
         stop_tx,
         clock,
         pending_tx,
+        Arc::clone(&link.voice_pass),
     ));
     tokio::spawn(read_tcp_in(
         read,
@@ -777,6 +829,7 @@ async fn write_tcp_out<W>(
     stop: tokio::sync::watch::Sender<bool>,
     clock: std::time::Instant,
     pending: tokio::sync::watch::Sender<Option<u64>>,
+    voice_pass: Arc<AtomicBool>,
 ) where
     W: AsyncWrite + Unpin,
 {
@@ -789,6 +842,9 @@ async fn write_tcp_out<W>(
                 let Some(cmd) = cmd else { break };
                 if matches!(cmd, Cmd::Logout) {
                     let _ = stop.send(true);
+                    if let Ok(frame) = encode_client(&ClientMsg::Logout) {
+                        let _ = write_limited(&mut write, TCP_CONTROL, &frame).await;
+                    }
                     let _ = write.shutdown().await;
                     return;
                 }
@@ -811,6 +867,9 @@ async fn write_tcp_out<W>(
             packet = voice_rx.recv_within(crate::queue::VOICE_MAX_AGE) => {
                 match packet {
                     Some(packet) => {
+                        if !voice_pass.load(Ordering::Relaxed) {
+                            continue;
+                        }
                         // A timed-out write may already have put bytes on the
                         // stream. The connection closes instead of sending
                         // another frame after that.
@@ -1042,7 +1101,9 @@ async fn move_to_quic(
     }
     let mut buf = Vec::new();
     let (me, resume) = match read_msg(&mut recv, &mut buf).await {
-        Ok(ServerMsg::Welcome { user_id, resume }) => (user_id, resume),
+        Ok(ServerMsg::Welcome {
+            user_id, resume, ..
+        }) => (user_id, resume),
         Ok(ServerMsg::Reject { reason }) => {
             link.quiet.store(false, Ordering::SeqCst);
             drop_quic(&endpoint, &conn);
@@ -1075,6 +1136,7 @@ async fn move_to_quic(
         voice_rx,
         Arc::clone(&link.incoming),
         link.delay.clone(),
+        Arc::clone(&link.voice_pass),
     ));
     let _ = link.events.send(Event::Moved {
         user_id: me,
@@ -1200,6 +1262,7 @@ async fn run(
     mut voice_out: tokio::sync::mpsc::Receiver<Vec<u8>>,
     voice_in: std::sync::Arc<Inbox>,
     delay: tokio::sync::watch::Sender<Option<u32>>,
+    voice_pass: Arc<AtomicBool>,
 ) {
     let mut tmp = [0u8; 2048];
     let mut intentional = false;
@@ -1240,7 +1303,9 @@ async fn run(
             packet = voice_out.recv(), if voice_open => {
                 match packet {
                     Some(packet) => {
-                        let _ = conn.send_datagram(bytes::Bytes::from(packet));
+                        if voice_pass.load(Ordering::Relaxed) {
+                            let _ = conn.send_datagram(bytes::Bytes::from(packet));
+                        }
                     }
                     None => voice_open = false,
                 }
@@ -1266,6 +1331,7 @@ async fn handle_cmd(send: &mut quinn::SendStream, cmd: Cmd, intentional: &mut bo
         Cmd::Leave => ClientMsg::Leave,
         Cmd::Logout => {
             *intentional = true;
+            let _ = write_msg(send, &ClientMsg::Logout).await;
             return false;
         }
     };
@@ -1308,10 +1374,12 @@ fn drain(buf: &mut Vec<u8>, events: &UnboundedSender<Event>, mut on_pong: impl F
                         user_id,
                         name,
                         card,
+                        muted,
                     } => Event::PeerJoined {
                         user_id,
                         name,
                         card,
+                        muted,
                     },
                     ServerMsg::PeerLeft { user_id } => Event::PeerLeft { user_id },
                     ServerMsg::Chat { user_id, text } => Event::Chat { user_id, text },
@@ -1410,6 +1478,7 @@ mod tests {
                 user_id: jonas.me,
                 name: "Jonas".into(),
                 card: 2,
+                muted: false,
             }
         );
 

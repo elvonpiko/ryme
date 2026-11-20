@@ -1,6 +1,11 @@
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use ryme_proto::{voice_ok, ClientMsg, Member, ServerMsg};
+
+/// How long a verified member can re-enter a locked server after the connection
+/// drops. A kick, a ban, or an explicit logout removes the grant.
+const RECONNECT_GRANT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
@@ -30,6 +35,12 @@ struct Said {
     text: String,
 }
 
+struct Grant {
+    card: u64,
+    resume: [u8; 32],
+    until: Instant,
+}
+
 pub struct Hub {
     next_id: u32,
     users: HashMap<u32, User>,
@@ -39,6 +50,7 @@ pub struct Hub {
     pass: [u8; 32],
     locked: bool,
     banned: std::collections::HashSet<u64>,
+    grants: Vec<Grant>,
 }
 
 impl Hub {
@@ -51,6 +63,7 @@ impl Hub {
             pass,
             locked: false,
             banned: std::collections::HashSet::new(),
+            grants: Vec::new(),
         }
     }
 
@@ -58,9 +71,13 @@ impl Hub {
         self.locked = locked;
     }
 
+    /// A card is supplied by the client. Banning it blocks that value. It does
+    /// not prove who is holding the install, and a different card is a different
+    /// value. Replacing a live seat requires the resume secret.
     pub fn ban(&mut self, card: u64) {
         if card != 0 {
             self.banned.insert(card);
+            self.grants.retain(|grant| grant.card != card);
         }
     }
 
@@ -115,6 +132,15 @@ impl Hub {
                 to_self: Vec::new(),
                 to_others: Vec::new(),
             },
+            ClientMsg::Logout => {
+                let to_others = user.map(|id| self.forget(id)).unwrap_or_default();
+                Step {
+                    user_id: user,
+                    replace: None,
+                    to_self: vec![ServerMsg::Left],
+                    to_others,
+                }
+            }
         }
     }
 
@@ -147,19 +173,38 @@ impl Hub {
     }
 
     pub fn disconnect(&mut self, id: u32) -> Vec<(u32, ServerMsg)> {
-        let gone = self.drop_user(id);
+        let gone = self.remove_user(id, true);
         if self.users.is_empty() {
             self.chat.clear();
         }
         gone
     }
 
-    /// Remove a session without forgetting chat. A resume hello uses this so
-    /// the replacement is inserted before the room can look empty.
-    fn drop_user(&mut self, id: u32) -> Vec<(u32, ServerMsg)> {
+    /// Drop a member and do not leave a reconnect grant. Kick, ban, logout,
+    /// and an authenticated replacement use this.
+    pub fn forget(&mut self, id: u32) -> Vec<(u32, ServerMsg)> {
+        let gone = self.remove_user(id, false);
+        if self.users.is_empty() {
+            self.chat.clear();
+        }
+        gone
+    }
+
+    fn remove_user(&mut self, id: u32, grant: bool) -> Vec<(u32, ServerMsg)> {
         let Some(user) = self.users.remove(&id) else {
             return Vec::new();
         };
+        if grant && user.resume != [0; 32] {
+            self.grants.push(Grant {
+                card: user.card,
+                resume: user.resume,
+                until: Instant::now() + RECONNECT_GRANT,
+            });
+        } else {
+            self.grants.retain(|held| {
+                !(held.card == user.card && crate::identity::same(&held.resume, &user.resume))
+            });
+        }
         let Some(channel) = user.channel else {
             return Vec::new();
         };
@@ -167,6 +212,14 @@ impl Hub {
             .into_iter()
             .map(|peer| (peer, ServerMsg::PeerLeft { user_id: id }))
             .collect()
+    }
+
+    fn grant_for(&mut self, card: u64, resume: &[u8; 32]) -> bool {
+        let now = Instant::now();
+        self.grants.retain(|grant| grant.until > now);
+        self.grants
+            .iter()
+            .any(|grant| grant.card == card && crate::identity::same(&grant.resume, resume))
     }
 
     fn hello(
@@ -189,12 +242,23 @@ impl Hub {
         if self.banned.contains(&card) {
             return reject(user, "not invited");
         }
-        let replacing = resume != [0; 32]
-            && self.users.values().any(|existing| {
-                existing.card == card && crate::identity::same(&existing.resume, &resume)
-            });
-        if self.locked && !replacing {
+        let live = if resume != [0; 32] {
+            self.users
+                .iter()
+                .find(|(_, existing)| {
+                    existing.card == card && crate::identity::same(&existing.resume, &resume)
+                })
+                .map(|(id, _)| *id)
+        } else {
+            None
+        };
+        let granted = live.is_none() && resume != [0; 32] && self.grant_for(card, &resume);
+        if self.locked && live.is_none() && !granted {
             return reject(user, "room is locked");
+        }
+        // A matching card without the resume secret stays where it is.
+        if live.is_none() && self.users.values().any(|existing| existing.card == card) {
+            return reject(user, "already here");
         }
         let fresh = match crate::identity::random_32() {
             Ok(fresh) => fresh,
@@ -202,34 +266,13 @@ impl Hub {
         };
         let mut replace = None;
         let mut to_others = Vec::new();
-        if resume != [0; 32] {
-            let old = self
-                .users
-                .iter()
-                .find(|(_, existing)| {
-                    existing.card == card && crate::identity::same(&existing.resume, &resume)
-                })
-                .map(|(id, _)| *id);
-            if let Some(old) = old {
-                to_others.extend(self.drop_user(old));
-                replace = Some(old);
-            }
-        } else {
-            // Logout forgets the ticket, and a network change can leave the
-            // old connection up. The same install still gets its seat back.
-            let stale: Vec<u32> = self
-                .users
-                .iter()
-                .filter(|(_, existing)| existing.card == card)
-                .map(|(id, _)| *id)
-                .collect();
-            for old in stale {
-                to_others.extend(self.drop_user(old));
-                replace = Some(old);
-            }
-        }
-        if self.users.values().any(|existing| existing.card == card) {
-            return reject(user, "already here");
+        if let Some(old) = live {
+            to_others.extend(self.remove_user(old, false));
+            replace = Some(old);
+        } else if granted {
+            self.grants.retain(|held| {
+                !(held.card == card && crate::identity::same(&held.resume, &resume))
+            });
         }
         if self.users.len() >= MAX_PEOPLE {
             return reject(user, "server is full");
@@ -253,6 +296,7 @@ impl Hub {
             to_self: vec![ServerMsg::Welcome {
                 user_id: id,
                 resume: fresh,
+                rooms: self.channels.clone(),
             }],
             to_others,
         }
@@ -285,6 +329,7 @@ impl Hub {
         let previous = existing.channel.clone();
         let name = existing.name.clone();
         let card = existing.card;
+        let muted = existing.muted;
         if let Some(user) = self.users.get_mut(&id) {
             user.channel = Some(channel.clone());
         }
@@ -303,6 +348,7 @@ impl Hub {
                     user_id: id,
                     name: name.clone(),
                     card,
+                    muted,
                 },
             )
         }));
@@ -583,6 +629,7 @@ mod tests {
                     user_id: jonas,
                     name: "Jonas".into(),
                     card: card_of("Jonas"),
+                    muted: false,
                 }
             )]
         );
@@ -876,7 +923,9 @@ mod tests {
             },
         );
         let (id, secret) = match &first.to_self[0] {
-            ServerMsg::Welcome { user_id, resume } => (*user_id, *resume),
+            ServerMsg::Welcome {
+                user_id, resume, ..
+            } => (*user_id, *resume),
             other => panic!("expected a welcome, got {other:?}"),
         };
         let _ = hub.handle(
@@ -914,7 +963,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_hello_from_the_same_install_takes_the_seat() {
+    fn a_fresh_hello_from_the_same_install_keeps_the_existing_member() {
         let mut hub = Hub::new([7; 32]);
         let first = hub.handle(
             None,
@@ -941,9 +990,14 @@ mod tests {
                 resume: [0; 32],
             },
         );
-        assert_eq!(again.replace, Some(id));
-        assert!(again.user_id.is_some());
-        assert!(matches!(again.to_self[0], ServerMsg::Welcome { .. }));
+        assert_eq!(
+            again.to_self,
+            vec![ServerMsg::Reject {
+                reason: "already here".into()
+            }]
+        );
+        assert_eq!(again.replace, None);
+        assert!(hub.cards().iter().any(|(kept, _)| *kept == id));
     }
 
     #[test]
@@ -1134,5 +1188,109 @@ mod tests {
                 reason: "not invited".into()
             }]
         );
+    }
+
+    fn sign_in(hub: &mut Hub, name: &str, card: u64, resume: [u8; 32]) -> Step {
+        hub.handle(
+            None,
+            ClientMsg::Hello {
+                name: name.into(),
+                card,
+                pass: [7; 32],
+                resume,
+            },
+        )
+    }
+
+    #[test]
+    fn a_dropped_member_can_reenter_a_locked_server_until_the_grant_ends() {
+        let mut hub = Hub::new([7; 32]);
+        let first = sign_in(&mut hub, "Mara", 4, [0; 32]);
+        let id = first.user_id.unwrap();
+        let secret = match first.to_self[0] {
+            ServerMsg::Welcome { resume, .. } => resume,
+            _ => panic!("welcome"),
+        };
+        let _ = hub.handle(
+            Some(id),
+            ClientMsg::Join {
+                channel: "Lobby".into(),
+            },
+        );
+        hub.set_locked(true);
+        hub.disconnect(id);
+        let back = sign_in(&mut hub, "Mara", 4, secret);
+        assert!(back.user_id.is_some());
+        let back_id = back.user_id.unwrap();
+        hub.disconnect(back_id);
+        hub.grants.clear();
+        let late = sign_in(&mut hub, "Mara", 4, secret);
+        assert_eq!(
+            late.to_self,
+            vec![ServerMsg::Reject {
+                reason: "room is locked".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn logout_and_kick_do_not_leave_a_reconnect_grant() {
+        let mut hub = Hub::new([7; 32]);
+        let first = sign_in(&mut hub, "Mara", 4, [0; 32]);
+        let id = first.user_id.unwrap();
+        let secret = match first.to_self[0] {
+            ServerMsg::Welcome { resume, .. } => resume,
+            _ => panic!("welcome"),
+        };
+        hub.set_locked(true);
+        let _ = hub.handle(Some(id), ClientMsg::Logout);
+        let gone = sign_in(&mut hub, "Mara", 4, secret);
+        assert_eq!(
+            gone.to_self,
+            vec![ServerMsg::Reject {
+                reason: "room is locked".into()
+            }]
+        );
+
+        hub.set_locked(false);
+        let second = sign_in(&mut hub, "Mara", 4, [0; 32]);
+        let id = second.user_id.unwrap();
+        let secret = match second.to_self[0] {
+            ServerMsg::Welcome { resume, .. } => resume,
+            _ => panic!("welcome"),
+        };
+        hub.set_locked(true);
+        hub.forget(id);
+        let kicked = sign_in(&mut hub, "Mara", 4, secret);
+        assert_eq!(
+            kicked.to_self,
+            vec![ServerMsg::Reject {
+                reason: "room is locked".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_muted_arrival_is_muted_for_the_people_already_there() {
+        let mut hub = Hub::new([7; 32]);
+        let mara = sign_in(&mut hub, "Mara", 4, [0; 32]).user_id.unwrap();
+        let _ = hub.handle(
+            Some(mara),
+            ClientMsg::Join {
+                channel: "Lobby".into(),
+            },
+        );
+        let jonas = sign_in(&mut hub, "Jonas", 5, [0; 32]).user_id.unwrap();
+        let _ = hub.handle(Some(jonas), ClientMsg::Mute { muted: true });
+        let moved = hub.handle(
+            Some(jonas),
+            ClientMsg::Join {
+                channel: "Lobby".into(),
+            },
+        );
+        assert!(moved
+            .to_others
+            .iter()
+            .any(|(_, msg)| matches!(msg, ServerMsg::PeerJoined { muted: true, .. })));
     }
 }

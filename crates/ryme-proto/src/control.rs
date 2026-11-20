@@ -50,6 +50,9 @@ pub enum ClientMsg {
         pass: [u8; 32],
         nonce: u64,
     },
+    /// This client is leaving on purpose. The resume secret must not keep a
+    /// reconnect grant after this.
+    Logout,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +62,9 @@ pub enum ServerMsg {
         /// Known only to this client. Present it on the next hello to replace
         /// this session instead of sitting beside it.
         resume: [u8; 32],
+        /// Rooms this server is offering. Present even when the client has not
+        /// joined one yet.
+        rooms: Vec<String>,
     },
     Reject {
         reason: String,
@@ -73,6 +79,7 @@ pub enum ServerMsg {
         user_id: u32,
         name: String,
         card: u64,
+        muted: bool,
     },
     PeerLeft {
         user_id: u32,
@@ -168,10 +175,12 @@ pub fn normalize_server(msg: ServerMsg) -> Result<ServerMsg, ProtoError> {
             user_id,
             name,
             card,
+            muted,
         } => ServerMsg::PeerJoined {
             user_id,
             name: clean_name(&name)?,
             card,
+            muted,
         },
         ServerMsg::Chat { user_id, text } => ServerMsg::Chat {
             user_id,

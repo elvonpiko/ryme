@@ -6,7 +6,7 @@
 //! resampled on that thread.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -2218,6 +2218,14 @@ fn push_i16(producer: &mut Producer<f32>, samples: &[i16], channels: usize) {
 
 static TALK: AtomicU8 = AtomicU8::new(b'V');
 static WINDOW_KEY: AtomicBool = AtomicBool::new(false);
+static TALK_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Drop every latched talk key. Hide, blur, and a lost keyboard call this so
+/// push-to-talk cannot stay down without a fresh press.
+pub fn release_talk() {
+    WINDOW_KEY.store(false, Ordering::Relaxed);
+    TALK_EPOCH.fetch_add(1, Ordering::Relaxed);
+}
 
 /// The talk key is one letter. Windows can see it in other applications.
 /// macOS and a focused Linux window see it while Ryme is the focused app.
@@ -2455,8 +2463,9 @@ fn evdev_key_held() -> bool {
 #[cfg(target_os = "linux")]
 struct Evdev {
     files: Vec<std::fs::File>,
-    held: i32,
+    holds: Vec<i32>,
     code: u16,
+    epoch: u64,
 }
 
 #[cfg(target_os = "linux")]
@@ -2476,19 +2485,25 @@ impl Evdev {
             };
             files.push(file);
         }
+        let holds = vec![0; files.len()];
         Self {
             files,
-            held: 0,
+            holds,
             code: evdev_code(talk_key()),
+            epoch: TALK_EPOCH.load(Ordering::Relaxed),
         }
     }
 
     fn down(&mut self) -> bool {
         use std::io::Read;
         let code_now = evdev_code(talk_key());
-        if code_now != self.code {
+        let epoch = TALK_EPOCH.load(Ordering::Relaxed);
+        if code_now != self.code || epoch != self.epoch {
             self.code = code_now;
-            self.held = 0;
+            self.epoch = epoch;
+            for hold in &mut self.holds {
+                *hold = 0;
+            }
         }
         let mut dead = Vec::new();
         for (index, file) in self.files.iter_mut().enumerate() {
@@ -2502,9 +2517,9 @@ impl Evdev {
                         // EV_KEY. Repeat (2) does not change the hold.
                         if kind == 1 && code == self.code {
                             if value == 1 {
-                                self.held = self.held.saturating_add(1);
+                                self.holds[index] = self.holds[index].saturating_add(1);
                             } else if value == 0 {
-                                self.held = self.held.saturating_sub(1);
+                                self.holds[index] = self.holds[index].saturating_sub(1);
                             }
                         }
                     }
@@ -2523,8 +2538,9 @@ impl Evdev {
         }
         for index in dead.into_iter().rev() {
             self.files.swap_remove(index);
+            self.holds.swap_remove(index);
         }
-        self.held > 0
+        self.holds.iter().any(|hold| *hold > 0)
     }
 }
 

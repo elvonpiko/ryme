@@ -132,7 +132,13 @@ impl World {
         if let Some(pipes) = self.pipes.get(&id) {
             let _ = pipes.close.try_send(());
         }
-        self.disconnect(id);
+        let notices = self.hub.forget(id);
+        self.pipes.remove(&id);
+        for (peer, msg) in notices {
+            if let Some(pipes) = self.pipes.get(&peer) {
+                offer_control(pipes, msg);
+            }
+        }
     }
 
     fn set_locked(&mut self, locked: bool) {

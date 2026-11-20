@@ -15,8 +15,8 @@ mod net_test;
 
 pub use identity::{client_config, Door, Identity};
 pub use link::{
-    connect, probe_invite, Event, HandshakeReport, Link, LinkError, Live, Peer, VoicePipe,
-    VoiceQueue,
+    connect, connect_room, probe_invite, Event, HandshakeReport, Link, LinkError, Live, Peer,
+    VoicePipe, VoiceQueue,
 };
 pub use server::Server;
 pub use sums::{sign_sums, verify_sums};

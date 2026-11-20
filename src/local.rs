@@ -99,6 +99,21 @@ pub(crate) fn update_dir() -> Option<PathBuf> {
 }
 
 /// This install's stable id. Other people store a volume against it.
+/// The card this install shows to one server. A different host sees a different
+/// value, so rooms on unrelated servers cannot be tied together by it.
+pub fn card_for(server: &[u8; 32]) -> u64 {
+    let mut mixed = card().wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    for (index, byte) in server.iter().enumerate() {
+        mixed ^= (*byte as u64).wrapping_shl(((index % 8) * 8) as u32);
+        mixed = mixed.wrapping_mul(0x100_0000_01B3);
+    }
+    if mixed == 0 {
+        1
+    } else {
+        mixed
+    }
+}
+
 pub fn card() -> u64 {
     if let Some(card) = read_card() {
         return card;

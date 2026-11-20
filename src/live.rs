@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ryme_proto::{parse_invite, Invite, DEFAULT_PORT};
-use ryme_server::{connect, Event, Link, LinkError, Peer};
+use ryme_server::{connect_room, Event, Link, LinkError, Peer};
+
+use crate::intent::{self, Aim};
 
 use crate::ear::{Ear, Mix};
 use crate::local::{self, Level, Saved};
@@ -69,12 +71,15 @@ impl Room {
                 user_id,
                 name,
                 card,
+                muted,
             } => {
-                if !self.members.iter().any(|peer| peer.user_id == user_id) {
+                if let Some(peer) = self.members.iter_mut().find(|peer| peer.user_id == user_id) {
+                    peer.muted = muted;
+                } else {
                     self.members.push(Peer {
                         user_id,
                         name,
-                        muted: false,
+                        muted,
                         card,
                     });
                 }
@@ -154,6 +159,10 @@ struct Slot {
     muted: bool,
     deaf: bool,
     resume_secret: [u8; 32],
+    /// Fingerprint of the server that issued `resume_secret`.
+    ticket_server: [u8; 32],
+    aim: Aim,
+    pref_tick: u64,
     tcp: bool,
     server: [u8; 32],
     roster: HashMap<u32, u64>,
@@ -184,6 +193,23 @@ impl Shutdown {
             false
         }
     }
+
+    /// Flip the local mute and tell the server. The tray uses this when the
+    /// card is hidden.
+    pub fn toggle_mute(&self) {
+        let mut guard = self.slot.lock().unwrap();
+        guard.muted = !guard.muted;
+        guard.pref_tick = guard.pref_tick.wrapping_add(1);
+        if let Some(ear) = guard.ear.as_ref() {
+            ear.set_muted(guard.muted);
+        }
+        if guard.muted {
+            crate::ear::release_talk();
+        }
+        if let Some(link) = guard.link.as_ref() {
+            link.mute(guard.muted);
+        }
+    }
 }
 
 pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
@@ -209,6 +235,9 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
         muted: ui.get_muted(),
         deaf: ui.get_deafened(),
         resume_secret: [0; 32],
+        ticket_server: [0; 32],
+        aim: Aim::Outside,
+        pref_tick: 0,
         tcp: false,
         server: [0; 32],
         roster: HashMap::new(),
@@ -233,10 +262,22 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
             guard.deaf = saved.deaf;
             guard.ptt = saved.ptt;
             guard.resume_secret = saved.ticket;
+            guard.ticket_server = parse_invite(&saved.invite)
+                .map(|parsed| parsed.fingerprint)
+                .unwrap_or([0; 32]);
+            if saved.channel.is_empty() {
+                guard.aim = Aim::Outside;
+            } else {
+                guard.aim = Aim::Room(saved.channel.clone());
+            }
         }
         if saved.resume && staged.is_none() {
             resuming = true;
-            slot.lock().unwrap().resume_channel = saved.channel;
+            let mut guard = slot.lock().unwrap();
+            if let Aim::Room(name) = &guard.aim {
+                guard.resume_channel = name.clone();
+            }
+            drop(guard);
             begin(ui, &slot, rt, &notices, false, 0);
         }
     }
@@ -251,6 +292,12 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
         let notices = notices.clone();
         move || {
             if let Some(ui) = ui_weak.upgrade() {
+                {
+                    let mut guard = slot.lock().unwrap();
+                    if matches!(guard.aim, Aim::Outside) {
+                        guard.aim = Aim::Room("Lobby".into());
+                    }
+                }
                 begin(&ui, &slot, &rt, &notices, false, 0);
             }
         }
@@ -370,10 +417,37 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
     ui.on_leave_channel({
         let slot = slot.clone();
         move || {
-            if let Some(ear) = slot.lock().unwrap().ear.as_ref() {
-                ear.set_live(false);
+            let (denoise, muted, deaf, ptt, ticket) = {
+                let mut guard = slot.lock().unwrap();
+                guard.aim = Aim::Outside;
+                guard.channel.clear();
+                guard.resume_channel.clear();
+                guard.pending_channel = None;
+                if let Some(ear) = guard.ear.as_ref() {
+                    ear.set_live(false);
+                }
+                (
+                    guard.denoise,
+                    guard.muted,
+                    guard.deaf,
+                    guard.ptt,
+                    guard.resume_secret,
+                )
+            };
+            send(&slot, |link| link.leave());
+            if let Some(saved) = local::load() {
+                remember(
+                    &saved.name,
+                    &saved.invite,
+                    "",
+                    true,
+                    denoise,
+                    muted,
+                    deaf,
+                    ptt,
+                    ticket,
+                );
             }
-            send(&slot, |link| link.leave())
         }
     });
 
@@ -382,6 +456,7 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
         move |name| {
             {
                 let mut guard = slot.lock().unwrap();
+                guard.aim = Aim::Room(name.to_string());
                 guard.pending_channel = Some(name.to_string());
                 if let Some(ear) = guard.ear.as_ref() {
                     ear.set_live(false);
@@ -518,7 +593,9 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
                     let (channel, denoise, ticket) = {
                         let mut guard = slot.lock().unwrap();
                         guard.resume_channel.clear();
-                        (guard.channel.clone(), guard.denoise, guard.resume_secret)
+                        guard.aim = Aim::Outside;
+                        guard.channel.clear();
+                        (String::new(), guard.denoise, guard.resume_secret)
                     };
                     let (muted, deaf, ptt) = {
                         let guard = slot.lock().unwrap();
@@ -545,6 +622,8 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
                         let mut guard = slot.lock().unwrap();
                         guard.resume_channel.clear();
                         guard.resume_secret = [0; 32];
+                        guard.ticket_server = [0; 32];
+                        guard.aim = Aim::Room("Lobby".into());
                         (guard.denoise, guard.muted, guard.deaf, guard.ptt)
                     };
                     local::store(&Saved {
@@ -645,6 +724,7 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
     let meter_rt = rt.clone();
     let meter_notices = notices.clone();
     rt.spawn(async move {
+        let mut seen_pref = 0u64;
         loop {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let mut switched = None;
@@ -670,12 +750,33 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
                     .or_else(|| guard.preview.as_ref().map(|preview| preview.level()))
                     .unwrap_or(0)
             };
+            let no_mic = meter_slot
+                .lock()
+                .unwrap()
+                .ear
+                .as_ref()
+                .is_some_and(|ear| !ear.mic);
             let keyed = crate::ear::key_is_down();
+            let (pref, muted_now) = {
+                let guard = meter_slot.lock().unwrap();
+                (guard.pref_tick, guard.muted)
+            };
+            let paint_mute = pref != seen_pref;
+            if paint_mute {
+                seen_pref = pref;
+            }
             let toast_rt = meter_rt.clone();
             let toast_notices = meter_notices.clone();
             let _ = meter_ui.upgrade_in_event_loop(move |ui| {
+                if !ui.window().is_visible() {
+                    crate::ear::release_talk();
+                }
                 ui.set_mic_level(level as f32 / 100.0);
                 ui.set_keyed(keyed);
+                ui.set_input_fault(no_mic);
+                if paint_mute {
+                    ui.set_muted(muted_now);
+                }
                 if let Some((input, applied)) = switched {
                     if input {
                         ui.set_input_name(short_device(&applied, true).into());
@@ -840,15 +941,13 @@ fn begin(
     }
     ui.set_display_name(name.clone().into());
     let invite = ui.get_invite().to_string();
-    let muted = ui.get_muted();
-    let deafened = ui.get_deafened();
-    let ptt = ui.get_ptt();
-    {
-        let mut guard = slot.lock().unwrap();
-        guard.muted = muted;
-        guard.deaf = deafened;
-        guard.ptt = ptt;
-    }
+    let (muted, deafened, ptt) = {
+        let guard = slot.lock().unwrap();
+        (guard.muted, guard.deaf, guard.ptt)
+    };
+    ui.set_muted(muted);
+    ui.set_deafened(deafened);
+    ui.set_ptt(ptt);
     let gen = bump(slot);
     ui.set_reconnecting(retry);
     ui.set_joining(true);
@@ -868,10 +967,26 @@ fn begin(
             guard.server = server;
             guard.levels = local::load_levels(&server);
         }
-        let resume_secret = slot.lock().unwrap().resume_secret;
-        match connect(&invite, &name, local::card(), resume_secret).await {
+        let (resume_secret, room) = {
+            let guard = slot.lock().unwrap();
+            let secret = intent::ticket_for(guard.ticket_server, server, guard.resume_secret);
+            let room = match &guard.aim {
+                Aim::Room(name) => Some(name.clone()),
+                Aim::Outside => None,
+            };
+            (secret, room)
+        };
+        match connect_room(
+            &invite,
+            &name,
+            local::card_for(&server),
+            resume_secret,
+            room.as_deref(),
+        )
+        .await
+        {
             Ok(live) => {
-                let resume_channel = {
+                {
                     let mut guard = slot.lock().unwrap();
                     if guard.generation != gen {
                         live.link.logout();
@@ -880,18 +995,12 @@ fn begin(
                     guard.link = Some(live.link.clone());
                     guard.tcp = live.tcp;
                     guard.resume_secret = live.resume;
-                    let resume = std::mem::take(&mut guard.resume_channel);
-                    guard.channel = if resume.is_empty() {
-                        live.channel.clone()
-                    } else {
-                        resume.clone()
-                    };
-                    resume
+                    guard.ticket_server = server;
+                    guard.channel = live.channel.clone();
+                    guard.resume_channel.clear();
+                    guard.pending_channel = None;
                 };
-                let pending = !resume_channel.is_empty() && resume_channel != live.channel;
-                if pending {
-                    live.link.join(resume_channel.clone());
-                }
+                let pending = !intent::admits(&slot.lock().unwrap().aim, &live.channel);
                 if muted {
                     live.link.mute(true);
                 }
@@ -915,6 +1024,9 @@ fn begin(
                     ticket,
                 );
                 let mut room = Room::new(live.me, live.channel.clone(), live.members, live.rooms);
+                if live.channel.is_empty() {
+                    room.in_channel = false;
+                }
                 if muted {
                     if let Some(me) = room.members.iter_mut().find(|peer| peer.user_id == room.me) {
                         me.muted = true;
@@ -1045,7 +1157,13 @@ fn begin(
                                         guard.link = None;
                                         let ear = guard.ear.take();
                                         guard.generation += 1;
-                                        guard.resume_channel = guard.channel.clone();
+                                        guard.resume_channel = match &guard.aim {
+                                            Aim::Room(name) => name.clone(),
+                                            Aim::Outside => String::new(),
+                                        };
+                                        if let Aim::Room(name) = &guard.aim {
+                                            guard.channel = name.clone();
+                                        }
                                         Some((ear, guard.generation))
                                     }
                                 };
@@ -1083,6 +1201,11 @@ fn begin(
                                 let restore = {
                                     let mut guard = slot.lock().unwrap();
                                     guard.pending_channel = None;
+                                    if !guard.channel.is_empty() {
+                                        guard.aim = Aim::Room(guard.channel.clone());
+                                    } else {
+                                        guard.aim = Aim::Outside;
+                                    }
                                     (guard.muted, guard.deaf, guard.ptt)
                                 };
                                 if let Some(ear) = slot.lock().unwrap().ear.as_ref() {
@@ -1162,9 +1285,17 @@ fn begin(
                                     ticket,
                                 );
                             }
-                            let switching = slot.lock().unwrap().pending_channel.is_some();
+                            let open = {
+                                let guard = slot.lock().unwrap();
+                                room.in_channel && intent::admits(&guard.aim, &room.channel)
+                            };
+                            if open {
+                                if let Some(link) = slot.lock().unwrap().link.as_ref() {
+                                    link.release_voice();
+                                }
+                            }
                             if let Some(ear) = slot.lock().unwrap().ear.as_ref() {
-                                ear.set_live(room_is_live(room.in_channel, switching));
+                                ear.set_live(open);
                             }
                             if left {
                                 room.speaking.clear();
@@ -1299,6 +1430,8 @@ fn open_invite(
                 let mut guard = slot.lock().unwrap();
                 guard.resume_channel.clear();
                 guard.resume_secret = [0; 32];
+                guard.ticket_server = [0; 32];
+                guard.aim = Aim::Room("Lobby".into());
                 drop(guard);
                 begin(ui, slot, rt, notices, false, 0);
             }
@@ -1434,10 +1567,6 @@ fn send(slot: &Arc<Mutex<Slot>>, f: impl FnOnce(&Link)) {
 
 const PING_EASY: u32 = 80;
 
-fn room_is_live(in_channel: bool, switching: bool) -> bool {
-    in_channel && !switching
-}
-
 fn show_ping(ui: &MainWindow, ms: u32, tcp: bool, age: Duration) {
     let ms = ms.min(9_999);
     let path = if tcp { "TCP" } else { "QUIC" };
@@ -1515,9 +1644,6 @@ fn show(
                 ui.set_picked(-1);
             }
         }
-        if let Some(me) = room.members.iter().find(|peer| peer.user_id == room.me) {
-            ui.set_muted(me.muted);
-        }
     });
 }
 
@@ -1547,8 +1673,6 @@ fn clear(ui: &MainWindow) {
     ui.set_ping_on(false);
     ui.set_joined(-1);
     ui.set_panel(0);
-    ui.set_muted(false);
-    ui.set_deafened(false);
     ui.set_channels(ModelRc::new(VecModel::from(Vec::<Channel>::new())));
     ui.set_lines(ModelRc::new(VecModel::from(Vec::<Line>::new())));
     ui.set_bands(ModelRc::new(VecModel::from(Vec::<Band>::new())));
@@ -1797,17 +1921,21 @@ fn pursue(
 #[cfg(test)]
 mod tests {
     use super::{
-        arrival, chat_body, explain, first_link, next_try, pace, place_label, room_is_live,
-        Arrival, Room, AGAIN_WAIT, ATTEMPTS, QUIET_WAIT,
+        arrival, chat_body, explain, first_link, next_try, pace, place_label, Arrival, Room,
+        AGAIN_WAIT, ATTEMPTS, QUIET_WAIT,
     };
     use ryme_proto::Invite;
     use ryme_server::{Event, LinkError};
 
     #[test]
     fn a_rejected_switch_leaves_the_confirmed_room_live() {
-        assert!(!room_is_live(true, true));
-        assert!(room_is_live(true, false));
-        assert!(!room_is_live(false, false));
+        let stage = crate::intent::Aim::Room("Stage".into());
+        assert!(!crate::intent::admits(&stage, "Lobby"));
+        assert!(crate::intent::admits(&stage, "Stage"));
+        assert!(!crate::intent::admits(
+            &crate::intent::Aim::Outside,
+            "Stage"
+        ));
     }
 
     #[test]

@@ -57,6 +57,16 @@ impl ksni::Tray for LinuxTray {
             }
             .into(),
             StandardItem {
+                label: "Mute".into(),
+                activate: Box::new(|_| {
+                    if let Some(stop) = STOP.lock().unwrap().as_ref() {
+                        stop.toggle_mute();
+                    }
+                }),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
                 label: "Quit".into(),
                 activate: Box::new(|_| quit()),
                 ..Default::default()

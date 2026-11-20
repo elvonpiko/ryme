@@ -3,6 +3,7 @@
 slint::include_modules!();
 
 mod ear;
+mod intent;
 mod jitter;
 mod live;
 mod local;
@@ -49,6 +50,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let weak = ui.as_weak();
     ui.on_minimize(move || {
+        crate::ear::release_talk();
         if let Some(ui) = weak.upgrade() {
             ui.window().set_minimized(true);
         }
@@ -68,8 +70,10 @@ fn main() -> Result<(), slint::PlatformError> {
 
     // Closing the card hides it. The tray is what keeps the process, and the
     // call, alive after that.
-    ui.window()
-        .on_close_requested(|| slint::CloseRequestResponse::HideWindow);
+    ui.window().on_close_requested(|| {
+        crate::ear::release_talk();
+        slint::CloseRequestResponse::HideWindow
+    });
 
     // Slint's own tray registers as "slint-tray". GNOME treats that as a
     // second application, so the dock shows two windows. The Linux tray uses

@@ -79,6 +79,28 @@ impl Hub {
         self.users.contains_key(&id)
     }
 
+    pub fn is_locked(&self) -> bool {
+        self.locked
+    }
+
+    pub fn room_count(&self) -> usize {
+        self.channels.len()
+    }
+
+    /// Id, name, and room. The card and the resume secret stay off this list.
+    pub fn roster(&self) -> Vec<(u32, String, String)> {
+        let mut rows: Vec<_> = self
+            .users
+            .iter()
+            .map(|(id, user)| {
+                let room = user.channel.clone().unwrap_or_else(|| "-".into());
+                (*id, user.name.replace(['\t', '\n', '\r'], " "), room)
+            })
+            .collect();
+        rows.sort_by_key(|row| row.0);
+        rows
+    }
+
     /// A card is supplied by the client. Banning it blocks that value. It does
     /// not prove who is holding the install, and a different card is a different
     /// value. Replacing a live seat requires the resume secret.

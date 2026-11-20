@@ -403,6 +403,55 @@ fn device_name(name: &str) -> String {
     }
 }
 
+pub struct Switches {
+    pub muted: bool,
+    pub deaf: bool,
+    pub ptt: bool,
+    pub denoise: bool,
+}
+
+pub fn load_switches() -> Option<Switches> {
+    let text = fs::read_to_string(dir()?.join("switches")).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != "v1" {
+        return None;
+    }
+    Some(Switches {
+        muted: lines.next()? == "1",
+        deaf: lines.next()? == "1",
+        ptt: lines.next()? == "1",
+        denoise: lines.next().map(|line| line != "0").unwrap_or(true),
+    })
+}
+
+pub fn store_switches(switches: &Switches) {
+    let Some(path) = dir().map(|dir| dir.join("switches")) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let body = format!(
+        "v1\n{}\n{}\n{}\n{}\n",
+        if switches.muted { "1" } else { "0" },
+        if switches.deaf { "1" } else { "0" },
+        if switches.ptt { "1" } else { "0" },
+        if switches.denoise { "1" } else { "0" }
+    );
+    let _ = write_private(&path, body.as_bytes());
+}
+
+/// Remove the saved invite and resume ticket. Device and mute files stay.
+pub fn forget_session() -> bool {
+    let Some(path) = path() else {
+        return false;
+    };
+    if !path.exists() {
+        return true;
+    }
+    fs::remove_file(path).is_ok()
+}
+
 /// The clickable list of old invites is gone. Drop the file so it cannot return.
 pub fn forget_servers() {
     if let Some(path) = dir().map(|dir| dir.join("servers")) {

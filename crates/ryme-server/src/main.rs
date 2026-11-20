@@ -121,9 +121,11 @@ fn host_request(args: &[String]) -> anyhow::Result<Option<String>> {
         format!("unban {card}")
     } else if arg == "--rotate" {
         "rotate".into()
+    } else if arg == "--status" {
+        "status".into()
     } else {
         return Err(anyhow::anyhow!(
-            "unknown argument {arg}. host commands are --drop, --lock, --unlock, --ban, --unban, --rotate"
+            "unknown argument {arg}. host commands are --drop, --lock, --unlock, --ban, --unban, --rotate, --status"
         ));
     };
     if rest.next().is_some() {
@@ -198,6 +200,10 @@ mod tests {
             Some("lock")
         );
         assert!(host_request(&["--new-invite".into()]).unwrap().is_none());
+        assert_eq!(
+            host_request(&["--status".into()]).unwrap().as_deref(),
+            Some("status")
+        );
     }
 
     #[test]

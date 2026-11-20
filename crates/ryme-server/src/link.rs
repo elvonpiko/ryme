@@ -84,8 +84,16 @@ pub struct Live {
     pub resume: [u8; 32],
     /// The QUIC handshake did not finish, so this session is TLS on TCP.
     pub tcp: bool,
-    /// Latest round trip in milliseconds. `None` until the first sample.
-    pub delay: tokio::sync::watch::Receiver<Option<u32>>,
+    /// Latest round trip. `None` until the first sample.
+    pub delay: tokio::sync::watch::Receiver<Option<RoundTrip>>,
+}
+
+/// One round-trip sample. An older reply bumps `beat` and leaves `ms` alone,
+/// so a late echo cannot paint a second, larger number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoundTrip {
+    pub beat: u64,
+    pub ms: u32,
 }
 
 /// Voice packets cross here so the audio thread never waits on the socket.
@@ -218,7 +226,7 @@ pub struct Link {
     voice_pass: Arc<AtomicBool>,
     handed: Arc<AtomicU64>,
     stop: tokio::sync::watch::Sender<bool>,
-    delay: tokio::sync::watch::Sender<Option<u32>>,
+    delay: tokio::sync::watch::Sender<Option<RoundTrip>>,
 }
 
 impl Link {
@@ -596,7 +604,7 @@ fn seat(
     outgoing: Outbox,
     resume: [u8; 32],
     channel: String,
-    delay: tokio::sync::watch::Sender<Option<u32>>,
+    delay: tokio::sync::watch::Sender<Option<RoundTrip>>,
     stop: tokio::sync::watch::Sender<bool>,
 ) -> (Link, VoicePipe) {
     let outgoing = Arc::new(Mutex::new(outgoing));
@@ -1016,6 +1024,10 @@ fn cmd_msg(cmd: Cmd) -> Option<ClientMsg> {
     })
 }
 
+/// No accepted pong for this long means the TCP path is quiet. The call
+/// reconnects instead of sitting on a stale round trip.
+const TCP_QUIET: Duration = Duration::from_secs(8);
+
 async fn read_tcp_in<R>(
     mut read: R,
     mut acc: Vec<u8>,
@@ -1025,37 +1037,59 @@ async fn read_tcp_in<R>(
     mut stop: tokio::sync::watch::Receiver<bool>,
     clock: std::time::Instant,
     pending: tokio::sync::watch::Receiver<Vec<u64>>,
-    delay: tokio::sync::watch::Sender<Option<u32>>,
+    delay: tokio::sync::watch::Sender<Option<RoundTrip>>,
 ) where
     R: AsyncRead + Unpin,
 {
     let mut tmp = [0u8; 2048];
-    if !acc.is_empty() && !drain_tcp_in(&mut acc, &events, &voice_in, clock, &pending, &delay) {
-        let _ = dead.send(true);
-        return;
+    let mut heard = std::time::Instant::now();
+    let mut quiet = tokio::time::interval(Duration::from_secs(1));
+    quiet.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    if !acc.is_empty() {
+        match drain_tcp_in(&mut acc, &events, &voice_in, clock, &pending, &delay) {
+            Ok(saw) => {
+                if saw {
+                    heard = std::time::Instant::now();
+                }
+            }
+            Err(()) => {
+                let _ = dead.send(true);
+                return;
+            }
+        }
     }
     loop {
         if *stop.borrow() {
             return;
         }
-        let read = tokio::select! {
+        tokio::select! {
             changed = stop.changed() => {
                 if changed.is_err() || *stop.borrow() {
                     return;
                 }
-                continue;
             }
-            n = read.read(&mut tmp) => n,
-        };
-        let Ok(n) = read else {
-            break;
-        };
-        if n == 0 {
-            break;
-        }
-        acc.extend_from_slice(&tmp[..n]);
-        if !drain_tcp_in(&mut acc, &events, &voice_in, clock, &pending, &delay) {
-            break;
+            _ = quiet.tick() => {
+                if heard.elapsed() >= TCP_QUIET {
+                    break;
+                }
+            }
+            n = read.read(&mut tmp) => {
+                let Ok(n) = n else {
+                    break;
+                };
+                if n == 0 {
+                    break;
+                }
+                acc.extend_from_slice(&tmp[..n]);
+                match drain_tcp_in(&mut acc, &events, &voice_in, clock, &pending, &delay) {
+                    Ok(saw) => {
+                        if saw {
+                            heard = std::time::Instant::now();
+                        }
+                    }
+                    Err(()) => break,
+                }
+            }
         }
     }
     if !*stop.borrow() {
@@ -1063,14 +1097,16 @@ async fn read_tcp_in<R>(
     }
 }
 
+/// `Ok(true)` when this buffer carried one of our pongs.
 fn drain_tcp_in(
     acc: &mut Vec<u8>,
     events: &UnboundedSender<Event>,
     voice_in: &Inbox,
     clock: std::time::Instant,
     pending: &tokio::sync::watch::Receiver<Vec<u64>>,
-    delay: &tokio::sync::watch::Sender<Option<u32>>,
-) -> bool {
+    delay: &tokio::sync::watch::Sender<Option<RoundTrip>>,
+) -> Result<bool, ()> {
+    let mut saw = false;
     loop {
         match decode_tagged(acc) {
             Ok(Some((tag, payload, n))) => {
@@ -1081,18 +1117,20 @@ fn drain_tcp_in(
                     continue;
                 }
                 if tag != TCP_CONTROL {
-                    return false;
+                    return Err(());
                 }
                 let mut body = owned;
                 if !drain(&mut body, events, |token| {
-                    note_pong(clock, pending, delay, token);
+                    if note_pong(clock, pending, delay, token) {
+                        saw = true;
+                    }
                 }) || !body.is_empty()
                 {
-                    return false;
+                    return Err(());
                 }
             }
-            Ok(None) => return true,
-            Err(_) => return false,
+            Ok(None) => return Ok(saw),
+            Err(_) => return Err(()),
         }
     }
 }
@@ -1434,7 +1472,7 @@ async fn run(
     events: UnboundedSender<Event>,
     mut voice_out: crate::queue::NewestReceiver<Vec<u8>>,
     voice_in: std::sync::Arc<Inbox>,
-    delay: tokio::sync::watch::Sender<Option<u32>>,
+    delay: tokio::sync::watch::Sender<Option<RoundTrip>>,
     voice_pass: Arc<AtomicBool>,
     handed: Arc<AtomicU64>,
 ) {
@@ -1450,7 +1488,15 @@ async fn run(
         tokio::select! {
             _ = pulse.tick() => {
                 let ms = u32::try_from(conn.rtt().as_millis()).unwrap_or(u32::MAX);
-                let _ = delay.send(Some(ms.min(9_999)));
+                let beat = delay
+                    .borrow()
+                    .map(|sample| sample.beat)
+                    .unwrap_or(0)
+                    .wrapping_add(1);
+                let _ = delay.send(Some(RoundTrip {
+                    beat,
+                    ms: ms.min(9_999),
+                }));
             }
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
@@ -1517,21 +1563,50 @@ async fn handle_cmd(send: &mut quinn::SendStream, cmd: Cmd, intentional: &mut bo
     write_msg(send, &msg).await.is_ok()
 }
 
+/// `true` when `token` was one of ours. Only the newest outstanding ping
+/// changes the displayed milliseconds. An older echo still counts as alive.
 fn note_pong(
     clock: std::time::Instant,
     pending: &tokio::sync::watch::Receiver<Vec<u64>>,
-    delay: &tokio::sync::watch::Sender<Option<u32>>,
+    delay: &tokio::sync::watch::Sender<Option<RoundTrip>>,
     token: u64,
-) {
-    if !pending.borrow().contains(&token) {
-        return;
-    }
+) -> bool {
+    let newest = {
+        let tokens = pending.borrow();
+        if !tokens.contains(&token) {
+            return false;
+        }
+        tokens.iter().copied().max().unwrap_or(token)
+    };
     let now = clock.elapsed().as_micros() as u64;
     if token > now {
-        return;
+        return false;
     }
-    let ms = u32::try_from((now - token) / 1000).unwrap_or(u32::MAX);
-    let _ = delay.send(Some(ms.min(9_999)));
+    let measured = u32::try_from((now - token) / 1000)
+        .unwrap_or(u32::MAX)
+        .min(9_999);
+    let current = *delay.borrow();
+    let sample = if token == newest {
+        RoundTrip {
+            beat: current
+                .map(|sample| sample.beat)
+                .unwrap_or(0)
+                .wrapping_add(1),
+            ms: measured,
+        }
+    } else if let Some(sample) = current {
+        RoundTrip {
+            beat: sample.beat.wrapping_add(1),
+            ms: sample.ms,
+        }
+    } else {
+        RoundTrip {
+            beat: 1,
+            ms: measured,
+        }
+    };
+    let _ = delay.send(Some(sample));
+    true
 }
 
 fn drain(buf: &mut Vec<u8>, events: &UnboundedSender<Event>, mut on_pong: impl FnMut(u64)) -> bool {
@@ -1815,20 +1890,38 @@ mod tests {
         assert!(!mara.tcp);
     }
 
-    async fn next_delay(delay: &mut tokio::sync::watch::Receiver<Option<u32>>) -> u32 {
-        if let Some(ms) = *delay.borrow() {
-            return ms;
+    async fn next_delay(delay: &mut tokio::sync::watch::Receiver<Option<RoundTrip>>) -> u32 {
+        if let Some(sample) = *delay.borrow() {
+            return sample.ms;
         }
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 delay.changed().await.expect("delay watch");
-                if let Some(ms) = *delay.borrow_and_update() {
-                    return ms;
+                if let Some(sample) = *delay.borrow_and_update() {
+                    return sample.ms;
                 }
             }
         })
         .await
         .expect("delay sample")
+    }
+
+    #[test]
+    fn an_older_pong_keeps_the_newest_round_trip() {
+        let clock = std::time::Instant::now() - Duration::from_millis(800);
+        let now = clock.elapsed().as_micros() as u64;
+        let older = now - 600_000;
+        let newer = now - 200_000;
+        let (_pending_tx, pending) = tokio::sync::watch::channel(vec![older, newer]);
+        let (delay_tx, delay) = tokio::sync::watch::channel(None);
+        assert!(note_pong(clock, &pending, &delay_tx, newer));
+        let first = (*delay.borrow()).expect("sample");
+        assert!(note_pong(clock, &pending, &delay_tx, older));
+        let second = (*delay.borrow()).expect("sample");
+        assert_eq!(second.ms, first.ms);
+        assert!(second.beat > first.beat);
+        assert!(!note_pong(clock, &pending, &delay_tx, newer + 5));
+        assert_eq!((*delay.borrow()).expect("sample").beat, second.beat);
     }
 
     #[tokio::test]

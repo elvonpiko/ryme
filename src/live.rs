@@ -188,6 +188,8 @@ struct Slot {
 enum Ask {
     None,
     Logout,
+    /// Drop the saved invite and resume ticket. Mute stays on this computer.
+    Forget,
     Update,
     /// Leave the live server and open this invite.
     Switch(String),
@@ -298,6 +300,16 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
             drop(guard);
             begin(ui, &slot, rt, &notices, false, 0);
         }
+    } else if let Some(switches) = local::load_switches() {
+        ui.set_denoise(switches.denoise);
+        ui.set_muted(switches.muted);
+        ui.set_deafened(switches.deaf);
+        ui.set_ptt(switches.ptt);
+        let mut guard = slot.lock().unwrap();
+        guard.denoise = switches.denoise;
+        guard.muted = switches.muted;
+        guard.deaf = switches.deaf;
+        guard.ptt = switches.ptt;
     }
     if let Some(url) = staged {
         ui.set_invite(url.into());
@@ -558,6 +570,27 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
         }
     });
 
+    ui.on_forget_server({
+        let weak = ui.as_weak();
+        let ask = ask.clone();
+        move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            if ui.get_confirming() {
+                return;
+            }
+            *ask.lock().unwrap() = Ask::Forget;
+            ui.set_confirm_danger(true);
+            pose(
+                &ui,
+                "Forget this server",
+                "The saved invite and resume ticket are removed from this computer. Mute stays as you set it.",
+                "Forget",
+            );
+        }
+    });
+
     ui.on_logout({
         let weak = ui.as_weak();
         let ask = ask.clone();
@@ -667,6 +700,25 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
             ui.set_confirming(false);
             let pending = std::mem::replace(&mut *ask.lock().unwrap(), Ask::None);
             match pending {
+                Ask::Forget => {
+                    let (denoise, muted, deaf, ptt) = {
+                        let guard = slot.lock().unwrap();
+                        (guard.denoise, guard.muted, guard.deaf, guard.ptt)
+                    };
+                    local::store_switches(&local::Switches {
+                        muted,
+                        deaf,
+                        ptt,
+                        denoise,
+                    });
+                    if !local::forget_session() {
+                        note(&ui, &rt, &notices, "Could not remove the saved server.");
+                    }
+                    bump(&slot);
+                    ui.set_invite("".into());
+                    clear(&ui);
+                    listen_local(&slot);
+                }
                 Ask::Logout => {
                     let (channel, denoise, ticket) = {
                         let mut guard = slot.lock().unwrap();
@@ -1190,6 +1242,9 @@ fn begin(
                         _ = age_tick.tick() => {
                             let Some(ms) = last_ms else { continue };
                             let age = last_at.elapsed();
+                            if age < PING_STALE {
+                                continue;
+                            }
                             let tcp = slot.lock().unwrap().tcp;
                             let weak = weak.clone();
                             let _ = weak.upgrade_in_event_loop(move |ui| {
@@ -1200,13 +1255,14 @@ fn begin(
                             if changed.is_err() {
                                 continue;
                             }
-                            let Some(ms) = *delay.borrow_and_update() else {
+                            let Some(sample) = *delay.borrow_and_update() else {
                                 continue;
                             };
-                            last_ms = Some(ms);
+                            last_ms = Some(sample.ms);
                             last_at = std::time::Instant::now();
                             let tcp = slot.lock().unwrap().tcp;
                             let weak = weak.clone();
+                            let ms = sample.ms;
                             let _ = weak.upgrade_in_event_loop(move |ui| {
                                 show_ping(&ui, ms, tcp, Duration::ZERO);
                             });
@@ -1214,10 +1270,16 @@ fn begin(
                         heard = speak_rx.recv(), if speak_open => {
                             match heard {
                                 Some((id, on)) => {
-                                    if on {
-                                        room.speaking.insert(id, true);
-                                    } else {
-                                        room.speaking.remove(&id);
+                                    let mut apply = |id, on| {
+                                        if on {
+                                            room.speaking.insert(id, true);
+                                        } else {
+                                            room.speaking.remove(&id);
+                                        }
+                                    };
+                                    apply(id, on);
+                                    while let Ok((id, on)) = speak_rx.try_recv() {
+                                        apply(id, on);
                                     }
                                     let snapshot = room.for_speaking();
                                     let weak = weak.clone();
@@ -1639,11 +1701,14 @@ fn adjust(slot: &Arc<Mutex<Slot>>, weak: &Weak<MainWindow>, change: impl FnOnce(
         quiet: false,
     });
     change(level);
-    local::store_levels(&guard.server, &guard.levels);
+    let server = guard.server;
+    let levels = guard.levels.clone();
     let mixes = hearing(&guard.roster, &guard.levels);
     if let Some(ear) = guard.ear.as_ref() {
         ear.set_levels(mixes);
     }
+    drop(guard);
+    remember_levels(server, levels);
 }
 
 fn bump(slot: &Arc<Mutex<Slot>>) -> u64 {
@@ -1664,20 +1729,35 @@ fn send(slot: &Arc<Mutex<Slot>>, f: impl FnOnce(&Link)) {
 }
 
 const PING_EASY: u32 = 80;
+const PING_STALE: Duration = Duration::from_secs(8);
 
-fn show_ping(ui: &MainWindow, ms: u32, tcp: bool, age: Duration) {
+fn remember_levels(server: [u8; 32], levels: HashMap<u64, Level>) {
+    static TICK: AtomicU64 = AtomicU64::new(0);
+    let tick = TICK.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        if TICK.load(Ordering::Relaxed) == tick {
+            local::store_levels(&server, &levels);
+        }
+    });
+}
+
+fn ping_label(ms: u32, tcp: bool, age: Duration) -> (String, bool) {
     let ms = ms.min(9_999);
     let path = if tcp { "TCP" } else { "QUIC" };
-    let stale = age >= Duration::from_secs(3);
+    let stale = age >= PING_STALE;
     let text = if stale {
         format!("stale · {path}")
-    } else if age >= Duration::from_secs(1) {
-        format!("{ms} ms · {path} · {}s", age.as_secs())
     } else {
         format!("{ms} ms · {path}")
     };
+    (text, stale || ms > PING_EASY)
+}
+
+fn show_ping(ui: &MainWindow, ms: u32, tcp: bool, age: Duration) {
+    let (text, hot) = ping_label(ms, tcp, age);
     ui.set_ping_text(text.into());
-    ui.set_ping_hot(stale || ms > PING_EASY);
+    ui.set_ping_hot(hot);
     ui.set_ping_on(true);
 }
 
@@ -2018,9 +2098,11 @@ fn pursue(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
-        arrival, chat_body, explain, first_link, next_try, pace, place_label, Arrival, Room,
-        AGAIN_WAIT, ATTEMPTS, QUIET_WAIT,
+        arrival, chat_body, explain, first_link, next_try, pace, ping_label, place_label, Arrival,
+        Room, AGAIN_WAIT, ATTEMPTS, PING_STALE, QUIET_WAIT,
     };
     use ryme_proto::Invite;
     use ryme_server::{Event, LinkError};
@@ -2034,6 +2116,21 @@ mod tests {
             &crate::intent::Aim::Outside,
             "Stage"
         ));
+    }
+
+    #[test]
+    fn a_round_trip_stays_put_until_the_path_is_quiet() {
+        let (fresh, hot) = ping_label(282, true, Duration::from_millis(900));
+        assert_eq!(fresh, "282 ms · TCP");
+        assert!(hot);
+        let (held, _) = ping_label(282, true, Duration::from_secs(3));
+        assert_eq!(held, "282 ms · TCP");
+        let (stale, stale_hot) = ping_label(282, true, PING_STALE);
+        assert_eq!(stale, "stale · TCP");
+        assert!(stale_hot);
+        let (easy, easy_hot) = ping_label(40, false, Duration::from_secs(1));
+        assert_eq!(easy, "40 ms · QUIC");
+        assert!(!easy_hot);
     }
 
     #[test]

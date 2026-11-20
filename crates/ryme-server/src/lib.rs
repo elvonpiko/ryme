@@ -16,7 +16,7 @@ mod net_test;
 pub use identity::{client_config, Door, Identity};
 pub use link::{
     connect, connect_room, connect_tcp_invite, probe_invite, Event, HandshakeReport, Link,
-    LinkError, Live, Peer, VoicePipe, VoiceQueue,
+    LinkError, Live, Peer, RoundTrip, VoicePipe, VoiceQueue,
 };
 pub use server::Server;
 pub use session::admin_addr;

@@ -254,6 +254,7 @@ pub async fn run(conn: quinn::Connection, world: Arc<Mutex<World>>) {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 2048];
     let mut pace = Pace::new();
+    let mut tell_version = false;
     loop {
         if user_id.is_none() && tokio::time::Instant::now() >= admitted {
             break;
@@ -269,8 +270,13 @@ pub async fn run(conn: quinn::Connection, world: Arc<Mutex<World>>) {
                         if buf.len() > ryme_proto::MAX_FRAME {
                             break;
                         }
-                        match drain_frames(&mut buf, &world, &mut user_id, &pipes, &mut pace) {
+                        match drain_frames(&mut buf, &world, &mut user_id, &pipes, &mut pace, None)
+                        {
                             Ok(true) => {}
+                            Err(ProtoError::Version) => {
+                                tell_version = true;
+                                break;
+                            }
                             Ok(false) | Err(_) => break,
                         }
                     }
@@ -302,7 +308,11 @@ pub async fn run(conn: quinn::Connection, world: Arc<Mutex<World>>) {
         world.lock().expect("hub").disconnect(id);
     }
     drop(pipes);
-    control_task.abort();
+    if tell_version {
+        let _ = tokio::time::timeout(Duration::from_millis(400), control_task).await;
+    } else {
+        control_task.abort();
+    }
     voice_task.abort();
     conn.close(quinn::VarInt::from_u32(0), b"bye");
     tracing::info!(%peer, "disconnected");
@@ -314,10 +324,19 @@ fn drain_frames(
     user_id: &mut Option<u32>,
     pipes: &Pipes,
     pace: &mut Pace,
+    pong: Option<&watch::Sender<Option<u64>>>,
 ) -> Result<bool, ProtoError> {
     loop {
-        match take_client_frame(buf)? {
-            Some((ClientFrame::Refused, n)) => {
+        match take_client_frame(buf) {
+            Err(ProtoError::Version) => {
+                let _ = pipes.control.try_send(ServerMsg::Reject {
+                    reason: "this server speaks a different Ryme version".into(),
+                });
+                return Err(ProtoError::Version);
+            }
+            Err(err) => return Err(err),
+            Ok(None) => return Ok(true),
+            Ok(Some((ClientFrame::Refused, n))) => {
                 buf.drain(..n);
                 // A bad line is a no. It is not a reason to drop the call.
                 let _ = pipes.control.try_send(ServerMsg::Reject {
@@ -325,11 +344,16 @@ fn drain_frames(
                 });
                 continue;
             }
-            Some((ClientFrame::Message(msg), n)) => {
+            Ok(Some((ClientFrame::Message(msg), n))) => {
                 buf.drain(..n);
                 if let ClientMsg::Ping { token } = msg {
-                    // A full control queue drops the echo. It does not close the call.
-                    let _ = pipes.control.try_send(ServerMsg::Pong { token });
+                    // The TCP writer sends this ahead of voice. A full control
+                    // queue must not be the only way a ping is answered.
+                    if let Some(pong) = pong {
+                        let _ = pong.send(Some(token));
+                    } else {
+                        let _ = pipes.control.try_send(ServerMsg::Pong { token });
+                    }
                     continue;
                 }
                 if let ClientMsg::Probe { pass, nonce } = msg {
@@ -354,7 +378,6 @@ fn drain_frames(
                     *user_id = Some(id);
                 }
             }
-            None => return Ok(true),
         }
     }
 }
@@ -436,13 +459,15 @@ where
         voice: voice_tx,
         close: close_tx,
     };
-    let writer = tokio::spawn(write_tcp(write, control_rx, voice_rx, fail_tx));
+    let (pong_tx, pong_rx) = watch::channel(None::<u64>);
+    let writer = tokio::spawn(write_tcp(write, control_rx, voice_rx, fail_tx, pong_rx));
 
     let admitted = tokio::time::Instant::now() + ADMIT_WAIT;
     let mut user_id = None;
     let mut buf = Vec::new();
     let mut tmp = [0u8; 2048];
     let mut pace = Pace::new();
+    let mut tell_version = false;
     loop {
         if user_id.is_none() && tokio::time::Instant::now() >= admitted {
             break;
@@ -455,8 +480,14 @@ where
                 match read {
                     Ok(n) if n > 0 => {
                         buf.extend_from_slice(&tmp[..n]);
-                        if !drain_tcp(&mut buf, &world, &mut user_id, &pipes, &mut pace) {
-                            break;
+                        match drain_tcp(&mut buf, &world, &mut user_id, &pipes, &mut pace, &pong_tx)
+                        {
+                            Ok(true) => {}
+                            Err(ProtoError::Version) => {
+                                tell_version = true;
+                                break;
+                            }
+                            Ok(false) | Err(_) => break,
                         }
                     }
                     _ => break,
@@ -469,7 +500,11 @@ where
         world.lock().expect("hub").disconnect(id);
     }
     drop(pipes);
-    writer.abort();
+    if tell_version {
+        let _ = tokio::time::timeout(Duration::from_millis(400), writer).await;
+    } else {
+        writer.abort();
+    }
     tracing::info!(%peer, transport = "tcp", "disconnected");
 }
 
@@ -479,7 +514,8 @@ fn drain_tcp(
     user_id: &mut Option<u32>,
     pipes: &Pipes,
     pace: &mut Pace,
-) -> bool {
+    pong: &watch::Sender<Option<u64>>,
+) -> Result<bool, ProtoError> {
     loop {
         let frame = match decode_tagged(buf) {
             Ok(Some((tag, payload, n))) => {
@@ -487,15 +523,16 @@ fn drain_tcp(
                 buf.drain(..n);
                 (tag, owned)
             }
-            Ok(None) => return true,
-            Err(_) => return false,
+            Ok(None) => return Ok(true),
+            Err(_) => return Ok(false),
         };
         match frame.0 {
             TCP_CONTROL => {
                 let mut body = frame.1;
-                match drain_frames(&mut body, world, user_id, pipes, pace) {
+                match drain_frames(&mut body, world, user_id, pipes, pace, Some(pong)) {
                     Ok(true) if body.is_empty() => {}
-                    _ => return false,
+                    Ok(_) => return Ok(false),
+                    Err(err) => return Err(err),
                 }
             }
             TCP_VOICE => {
@@ -505,7 +542,7 @@ fn drain_tcp(
                 let Some(id) = *user_id else { continue };
                 deliver_voice(world, id, Bytes::from(frame.1));
             }
-            _ => return false,
+            _ => return Ok(false),
         }
     }
 }
@@ -522,12 +559,29 @@ async fn write_tcp<W>(
     mut control_rx: Receiver<ServerMsg>,
     mut voice_rx: FairReceiver<Bytes>,
     fail: watch::Sender<bool>,
+    mut pong_rx: watch::Receiver<Option<u64>>,
 ) where
     W: AsyncWrite + Unpin,
 {
     loop {
         tokio::select! {
             biased;
+            changed = pong_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let Some(token) = *pong_rx.borrow_and_update() else {
+                    continue;
+                };
+                let Ok(frame) = encode_server(&ServerMsg::Pong { token }) else {
+                    let _ = fail.send(true);
+                    break;
+                };
+                if !write_tagged(&mut write, TCP_CONTROL, &frame).await {
+                    let _ = fail.send(true);
+                    break;
+                }
+            }
             msg = control_rx.recv() => {
                 let Some(msg) = msg else { break };
                 let Ok(frame) = encode_server(&msg) else {
@@ -675,6 +729,19 @@ fn apply_host(text: &str, world: &Mutex<World>) -> String {
         }
     } else if text == "rotate" {
         rotate_invite(&mut hub)
+    } else if text == "status" {
+        let rows = hub.hub.roster();
+        let mut lines = vec![format!(
+            "ok release={} people={} locked={} rooms={}",
+            crate::RELEASE,
+            rows.len(),
+            hub.hub.is_locked(),
+            hub.hub.room_count()
+        )];
+        for (id, name, room) in rows {
+            lines.push(format!("{id}\t{name}\t{room}"));
+        }
+        Ok(lines.join("\n"))
     } else {
         Err("unknown command".to_string())
     };
@@ -783,6 +850,34 @@ mod tests {
         assert_eq!(apply_host("lock", &world), "ok");
         assert_eq!(apply_host("unlock", &world), "ok");
         assert_eq!(apply_host("ban nope", &world), "error usage: ban <card>");
+        let status = apply_host("status", &world);
+        assert!(status.starts_with("ok release="), "{status}");
+        assert!(status.contains("people=0"));
+        assert!(status.contains("locked=false"));
+        assert!(!status.contains("ticket"));
+    }
+
+    #[test]
+    fn a_different_control_version_is_refused_in_words() {
+        let world = world([7; 32], None);
+        let (control, mut rx) = tokio::sync::mpsc::channel(4);
+        let (voice, _voice_rx) = queue::fair(1, 1, Duration::from_millis(100));
+        let (close, _close_rx) = tokio::sync::mpsc::channel(1);
+        let pipes = Pipes {
+            control,
+            voice,
+            close,
+        };
+        let mut user_id = None;
+        let mut pace = Pace::new();
+        let mut buf = vec![5, 0, 0, 0, 9, 1, 2, 3, 4];
+        let err =
+            drain_frames(&mut buf, &world, &mut user_id, &pipes, &mut pace, None).unwrap_err();
+        assert!(matches!(err, ProtoError::Version));
+        match rx.try_recv().unwrap() {
+            ServerMsg::Reject { reason } => assert!(reason.contains("version"), "{reason}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
 
     #[test]

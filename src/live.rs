@@ -325,6 +325,38 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
         }
     });
 
+    ui.on_copy_status({
+        let ui_weak = ui.as_weak();
+        let rt = rt.clone();
+        let notices = notices.clone();
+        move || {
+            let Some(ui) = ui_weak.upgrade() else {
+                return;
+            };
+            let rtt = if ui.get_ping_on() {
+                ui.get_ping_text().to_string()
+            } else {
+                "not connected".into()
+            };
+            let text = format!(
+                "Ryme {}\n{}\nServer RTT: {}\nMicrophone: {}\nSpeakers: {}",
+                env!("CARGO_PKG_VERSION"),
+                ui.get_mic_line(),
+                rtt,
+                ui.get_input_name(),
+                ui.get_output_name()
+            );
+            let copied = copy_text(&text);
+            toast(
+                &ui,
+                &rt,
+                &notices,
+                if copied { "Copied." } else { "Could not copy." },
+                !copied,
+            );
+        }
+    });
+
     ui.on_copy_link({
         let ui_weak = ui.as_weak();
         let rt = rt.clone();

@@ -175,7 +175,8 @@ static LISTENER: Mutex<Option<std::os::unix::net::UnixListener>> = Mutex::new(No
 #[cfg(unix)]
 fn unix_primary(handoff: bool) -> bool {
     let path = socket_path();
-    if !handoff && poke(&path) {
+    if poke(&path) {
+        let _ = handoff;
         return false;
     }
     if let Some(parent) = path.parent() {
@@ -188,8 +189,7 @@ fn unix_primary(handoff: bool) -> bool {
             *SOCKET.lock().unwrap() = Some(SocketPath(path));
             true
         }
-        Err(_) if handoff => false,
-        Err(_) => !poke(&path),
+        Err(_) => false,
     }
 }
 

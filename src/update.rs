@@ -183,6 +183,8 @@ fn fetch_latest() -> Result<Release, String> {
     Ok(Release { tag, assets })
 }
 
+const MAX_UPDATE: u64 = 80 * 1024 * 1024;
+
 fn download(url: &str, dest: &Path) -> Result<(), String> {
     if !allowed(url) {
         return Err("unexpected download".into());
@@ -192,9 +194,38 @@ fn download(url: &str, dest: &Path) -> Result<(), String> {
         .set("User-Agent", "ryme")
         .call()
         .map_err(|_| "download failed".to_string())?;
+    if let Some(len) = response
+        .header("content-length")
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        if len > MAX_UPDATE {
+            return Err("the update is too large".into());
+        }
+    }
+    save_limited(&mut response.into_reader(), dest, MAX_UPDATE)
+}
+
+fn save_limited(reader: &mut impl Read, dest: &Path, max: u64) -> Result<(), String> {
     let partial = dest.with_extension("partial");
     let mut file = File::create(&partial).map_err(|_| "could not save the update".to_string())?;
-    io::copy(&mut response.into_reader(), &mut file).map_err(|_| "download failed".to_string())?;
+    let mut buf = [0_u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .map_err(|_| "download failed".to_string())?;
+        if n == 0 {
+            break;
+        }
+        total = total.saturating_add(n as u64);
+        if total > max {
+            drop(file);
+            let _ = fs::remove_file(&partial);
+            return Err("the update is too large".into());
+        }
+        file.write_all(&buf[..n])
+            .map_err(|_| "download failed".to_string())?;
+    }
     file.flush().ok();
     drop(file);
     fs::rename(&partial, dest).map_err(|_| "could not save the update".to_string())?;
@@ -249,7 +280,6 @@ fn install_replace(new_file: &Path) -> Result<(), String> {
         let _ = fs::copy(&backup, &exe);
         return Err("could not replace Ryme".into());
     }
-    crate::single::release();
     if std::process::Command::new(&exe)
         .arg("--handoff")
         .spawn()
@@ -258,6 +288,7 @@ fn install_replace(new_file: &Path) -> Result<(), String> {
         let _ = fs::copy(&backup, &exe);
         return Err("could not restart Ryme".into());
     }
+    crate::single::release();
     Ok(())
 }
 
@@ -308,7 +339,6 @@ fn install_disk(dmg: &Path) -> Result<(), String> {
         let _ = fs::rename(&backup, &app);
         return Err("could not replace Ryme".into());
     }
-    crate::single::release();
     if std::process::Command::new("open")
         .arg(&app)
         .args(["--args", "--handoff"])
@@ -319,6 +349,7 @@ fn install_disk(dmg: &Path) -> Result<(), String> {
         let _ = fs::rename(&backup, &app);
         return Err("could not restart Ryme".into());
     }
+    crate::single::release();
     Ok(())
 }
 
@@ -333,6 +364,7 @@ fn app_bundle(exe: &Path) -> Option<PathBuf> {
 }
 
 fn install_deb(path: &Path) -> Result<(), String> {
+    let relaunch = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ryme"));
     let status = std::process::Command::new("pkexec")
         .args(["dpkg", "-i"])
         .arg(path)
@@ -341,12 +373,11 @@ fn install_deb(path: &Path) -> Result<(), String> {
     if !status.success() {
         return Err("The update was not installed.".into());
     }
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ryme"));
-    crate::single::release();
-    std::process::Command::new(exe)
+    std::process::Command::new(&relaunch)
         .arg("--handoff")
         .spawn()
         .map_err(|_| "Ryme was updated. Open it again.".to_string())?;
+    crate::single::release();
     Ok(())
 }
 
@@ -485,7 +516,8 @@ impl Ready {
 
 #[cfg(test)]
 mod tests {
-    use super::{allowed, app_bundle, decode_hex, is_newer, sum_for};
+    use super::{allowed, app_bundle, decode_hex, is_newer, save_limited, sum_for};
+    use std::io::Cursor;
     use std::path::Path;
 
     #[test]
@@ -526,5 +558,21 @@ mod tests {
             "https://github.com/elvonpiko/ryme/releases/download/v0.1.2/Ryme-Setup-x64.exe"
         ));
         assert!(!allowed("https://example.com/Ryme-Setup-x64.exe"));
+    }
+
+    #[test]
+    fn a_download_larger_than_the_cap_is_not_kept() {
+        let dir = std::env::temp_dir().join(format!("ryme-update-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let dest = dir.join("blob");
+        let mut big = Cursor::new(vec![1u8; 32]);
+        let err = save_limited(&mut big, &dest, 8).unwrap_err();
+        assert!(err.contains("too large"));
+        assert!(!dest.exists());
+        assert!(!dest.with_extension("partial").exists());
+        let mut small = Cursor::new(b"ryme".to_vec());
+        save_limited(&mut small, &dest, 8).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"ryme");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -86,10 +86,15 @@ async fn main() {
     let lost = sent.saturating_sub(received);
     let (low, mid, high) = summary(&delays);
     println!("connected_ms {connect_ms}");
+    println!("elapsed_ms {}", started.elapsed().as_millis());
     println!("sent {sent}");
     println!("received {received}");
     println!("lost {lost}");
     println!("delay_ms min={low:.1} p50={mid:.1} max={high:.1}");
+    if received == 0 {
+        eprintln!("no audio arrived");
+        std::process::exit(1);
+    }
 }
 
 fn summary(delays: &[f64]) -> (f64, f64, f64) {

@@ -202,7 +202,7 @@ jobs:
             || echo "The image was pushed. If it is private, make the package public in GitHub package settings."
 
   publish:
-    needs: [server, client]
+    needs: [server, client, image]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4

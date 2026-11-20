@@ -582,7 +582,9 @@ where
 }
 
 fn offer_control(pipes: &Pipes, msg: ServerMsg) {
-    let _ = pipes.control.try_send(msg);
+    if pipes.control.try_send(msg).is_err() {
+        let _ = pipes.close.try_send(());
+    }
 }
 
 struct Pace {

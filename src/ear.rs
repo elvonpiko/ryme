@@ -1474,6 +1474,7 @@ fn playback_thread(
         let rebuild = current.is_none()
             || (switching && current.as_ref().is_some_and(|held| held.name != chosen));
         if rebuild {
+            let previous = current.as_ref().map(|held| held.name.clone());
             current = None;
             if let Some(rx) = shared.lock().unwrap().as_mut() {
                 discard_consumer(rx);
@@ -1494,20 +1495,30 @@ fn playback_thread(
                     }
                 }
                 None => {
-                    if current.is_none() {
-                        if !announced {
-                            let _ = ready.send((false, RATE));
-                            announced = true;
-                        }
-                        thread::sleep(Duration::from_millis(400));
-                        continue;
-                    }
-                    let opened = current
-                        .as_ref()
-                        .map(|held| held.name.clone())
-                        .unwrap_or_default();
-                    keep_opened(&name, &chosen, &opened);
                     failed.store(true, Ordering::Relaxed);
+                    let fallback = previous.filter(|opened| opened != &chosen);
+                    if let Some(opened) = fallback {
+                        let broken = Arc::new(AtomicBool::new(false));
+                        if let Some((stream, rate)) =
+                            build_output(&opened, shared.clone(), broken.clone(), play_need.clone())
+                        {
+                            current = Some(HeldOutput {
+                                _stream: stream,
+                                broken,
+                                name: opened.clone(),
+                            });
+                            *applied.lock().unwrap() = opened.clone();
+                            *name.lock().unwrap() = opened;
+                            rate_out.store(rate, Ordering::Relaxed);
+                            continue;
+                        }
+                    }
+                    if !announced {
+                        let _ = ready.send((false, RATE));
+                        announced = true;
+                    }
+                    thread::sleep(Duration::from_millis(400));
+                    continue;
                 }
             }
         }

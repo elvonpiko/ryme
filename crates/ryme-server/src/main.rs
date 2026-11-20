@@ -61,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let host_addr = ryme_server::admin_addr(&data);
     let server = Server::bind_identity(addr, identity, door, Some(host_addr), Some(data.clone()))?;
-    for name in channels_from(&data) {
+    for name in channels_from(&data)? {
         server.allow(&name);
     }
     let (host, port) = published(addr);
@@ -166,16 +166,22 @@ fn hex_of(bytes: &[u8]) -> String {
 }
 
 /// One channel name per line in `<data>/channels`. Lobby is always open.
-fn channels_from(dir: &Path) -> Vec<String> {
+fn channels_from(dir: &Path) -> anyhow::Result<Vec<String>> {
     let Ok(text) = std::fs::read_to_string(dir.join("channels")) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .filter(|line| line.len() <= ryme_proto::MAX_CHANNEL && !line.contains(['\n', '\r']))
-        .map(str::to_string)
-        .collect()
+    let mut rooms = Vec::new();
+    for (number, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let name = ryme_proto::clean_label(line, ryme_proto::MAX_CHANNEL).map_err(|_| {
+            anyhow::anyhow!("channels line {} is not a room name: {line}", number + 1)
+        })?;
+        rooms.push(name);
+    }
+    Ok(rooms)
 }
 
 #[cfg(test)]
@@ -200,9 +206,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("channels"), "# note\n\nRanked\n  Night  \n").unwrap();
         assert_eq!(
-            channels_from(&dir),
+            channels_from(&dir).unwrap(),
             vec!["Ranked".to_string(), "Night".to_string()]
         );
+        std::fs::write(dir.join("channels"), "Ranked\nBad\tRoom\n").unwrap();
+        let err = channels_from(&dir).unwrap_err();
+        assert!(err.to_string().contains("line 2"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

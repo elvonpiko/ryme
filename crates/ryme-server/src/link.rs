@@ -254,6 +254,11 @@ impl Link {
     pub fn release_voice(&self) {
         self.voice_pass.store(true, Ordering::Relaxed);
     }
+
+    /// Stop every dial this call still has open.
+    pub fn cancel(&self) {
+        let _ = self.stop.send(true);
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -281,7 +286,7 @@ pub struct HandshakeReport {
 
 pub async fn probe_invite(invite: &str) -> Result<Vec<HandshakeReport>, LinkError> {
     let parsed = parse_invite(invite).map_err(|_| LinkError::Invite)?;
-    let addrs = addresses(&parsed.host, parsed.port)?;
+    let addrs = addresses(&parsed.host, parsed.port).await?;
     let mut reports = Vec::new();
     for addr in addrs {
         let started = Instant::now();
@@ -378,7 +383,7 @@ pub async fn connect_room(
     room: Option<&str>,
 ) -> Result<Live, LinkError> {
     let parsed = parse_invite(invite).map_err(|_| LinkError::Invite)?;
-    let addrs = addresses(&parsed.host, parsed.port)?;
+    let addrs = addresses(&parsed.host, parsed.port).await?;
     let mut last = LinkError::Unreachable;
     let room = room.map(str::to_string);
     for addr in addrs {
@@ -629,7 +634,7 @@ async fn finish_quic(
 
     let (cmd_tx, cmd_rx) = unbounded_channel();
     let (event_tx, events) = unbounded_channel();
-    let (voice_out_tx, voice_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+    let (voice_out_tx, voice_out_rx) = crate::queue::newest(TCP_VOICE_QUEUE);
     let voice_in = Inbox::new(64);
     let (delay_tx, delay) = tokio::sync::watch::channel(None);
     let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
@@ -637,7 +642,7 @@ async fn finish_quic(
         cmd_tx,
         event_tx.clone(),
         voice_in,
-        Outbox::Wait(voice_out_tx),
+        Outbox::Fresh(voice_out_tx),
         resume,
         channel.clone(),
         delay_tx.clone(),
@@ -722,7 +727,7 @@ async fn finish_tcp(
     let (dead_tx, dead_rx) = tokio::sync::watch::channel(false);
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let clock = std::time::Instant::now();
-    let (pending_tx, pending_rx) = tokio::sync::watch::channel(None::<u64>);
+    let (pending_tx, pending_rx) = tokio::sync::watch::channel(Vec::<u64>::new());
     let (delay_tx, delay) = tokio::sync::watch::channel(None);
     let (link, voice) = seat(
         cmd_tx,
@@ -889,7 +894,7 @@ async fn write_tcp_out<W>(
     dead: tokio::sync::watch::Sender<bool>,
     stop: tokio::sync::watch::Sender<bool>,
     clock: std::time::Instant,
-    pending: tokio::sync::watch::Sender<Option<u64>>,
+    pending: tokio::sync::watch::Sender<Vec<u64>>,
     voice_pass: Arc<AtomicBool>,
 ) where
     W: AsyncWrite + Unpin,
@@ -917,7 +922,12 @@ async fn write_tcp_out<W>(
             }
             _ = pulse.tick() => {
                 let token = clock.elapsed().as_micros() as u64;
-                let _ = pending.send(Some(token));
+                let mut tokens = pending.borrow().clone();
+                tokens.push(token);
+                if tokens.len() > 4 {
+                    tokens.remove(0);
+                }
+                let _ = pending.send(tokens);
                 let Ok(frame) = encode_client(&ClientMsg::Ping { token }) else {
                     break;
                 };
@@ -965,12 +975,16 @@ async fn read_tcp_in<R>(
     dead: tokio::sync::watch::Sender<bool>,
     mut stop: tokio::sync::watch::Receiver<bool>,
     clock: std::time::Instant,
-    pending: tokio::sync::watch::Receiver<Option<u64>>,
+    pending: tokio::sync::watch::Receiver<Vec<u64>>,
     delay: tokio::sync::watch::Sender<Option<u32>>,
 ) where
     R: AsyncRead + Unpin,
 {
     let mut tmp = [0u8; 2048];
+    if !acc.is_empty() && !drain_tcp_in(&mut acc, &events, &voice_in, clock, &pending, &delay) {
+        let _ = dead.send(true);
+        return;
+    }
     loop {
         if *stop.borrow() {
             return;
@@ -1005,7 +1019,7 @@ fn drain_tcp_in(
     events: &UnboundedSender<Event>,
     voice_in: &Inbox,
     clock: std::time::Instant,
-    pending: &tokio::sync::watch::Receiver<Option<u64>>,
+    pending: &tokio::sync::watch::Receiver<Vec<u64>>,
     delay: &tokio::sync::watch::Sender<Option<u32>>,
 ) -> bool {
     loop {
@@ -1059,6 +1073,7 @@ async fn pursue_quic(
     >,
     link: Link,
 ) {
+    let mut misses = 0u32;
     loop {
         if *link.stop.borrow() {
             if let Some(task) = inflight.take() {
@@ -1092,6 +1107,8 @@ async fn pursue_quic(
             Err(LinkError::Pin) => return,
             Err(_) => {}
         }
+        misses = misses.saturating_add(1);
+        let wait = QUIC_RETRY.saturating_mul(1 << misses.min(4));
         let mut stop = link.stop.subscribe();
         tokio::select! {
             changed = stop.changed() => {
@@ -1099,7 +1116,7 @@ async fn pursue_quic(
                     return;
                 }
             }
-            _ = tokio::time::sleep(QUIC_RETRY) => {}
+            _ = tokio::time::sleep(wait.min(Duration::from_secs(30))) => {}
         }
     }
 }
@@ -1177,13 +1194,43 @@ async fn move_to_quic(
         }
     };
     let channel = link.channel.lock().unwrap().clone();
-    if !channel.is_empty() {
-        let _ = write_msg(&mut send, &ClientMsg::Join { channel }).await;
-        let _ = read_msg(&mut recv, &mut buf).await;
-    }
-    let (voice_tx, voice_rx) = tokio::sync::mpsc::channel(32);
+    let joined = if !channel.is_empty() {
+        if write_msg(&mut send, &ClientMsg::Join { channel })
+            .await
+            .is_err()
+        {
+            link.quiet.store(false, Ordering::SeqCst);
+            drop_quic(&endpoint, &conn);
+            let _ = link.events.send(Event::Disconnected);
+            return Err(LinkError::Unreachable);
+        }
+        match read_msg(&mut recv, &mut buf).await {
+            Ok(ServerMsg::Joined {
+                channel,
+                members,
+                rooms,
+            }) => Some(Event::Joined {
+                channel,
+                members: peers(members),
+                rooms,
+            }),
+            Ok(ServerMsg::Reject { reason }) => {
+                let _ = link.events.send(Event::Rejected { reason });
+                None
+            }
+            _ => {
+                link.quiet.store(false, Ordering::SeqCst);
+                drop_quic(&endpoint, &conn);
+                let _ = link.events.send(Event::Disconnected);
+                return Err(LinkError::Unreachable);
+            }
+        }
+    } else {
+        None
+    };
+    let (voice_tx, voice_rx) = crate::queue::newest(TCP_VOICE_QUEUE);
     let (cmd_tx, cmd_rx) = unbounded_channel();
-    *link.outgoing.lock().unwrap() = Outbox::Wait(voice_tx);
+    *link.outgoing.lock().unwrap() = Outbox::Fresh(voice_tx);
     *link.cmd.lock().unwrap() = cmd_tx;
     *link.resume.lock().unwrap() = resume;
     tokio::spawn(run(
@@ -1199,6 +1246,9 @@ async fn move_to_quic(
         link.delay.clone(),
         Arc::clone(&link.voice_pass),
     ));
+    if let Some(event) = joined {
+        let _ = link.events.send(event);
+    }
     let _ = link.events.send(Event::Moved {
         user_id: me,
         resume,
@@ -1260,7 +1310,7 @@ fn bind_for(addr: SocketAddr) -> &'static str {
     }
 }
 
-fn addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>, LinkError> {
+fn resolve_addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>, LinkError> {
     let host = match host {
         "0.0.0.0" => "127.0.0.1",
         "::" | "[::]" => "::1",
@@ -1280,6 +1330,13 @@ fn addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>, LinkError> {
     } else {
         Ok(seen)
     }
+}
+
+async fn addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>, LinkError> {
+    let host = host.to_string();
+    tokio::task::spawn_blocking(move || resolve_addresses(&host, port))
+        .await
+        .map_err(|_| LinkError::Address)?
 }
 
 fn peers(members: Vec<Member>) -> Vec<Peer> {
@@ -1325,7 +1382,7 @@ async fn run(
     mut buf: Vec<u8>,
     mut cmd_rx: UnboundedReceiver<Cmd>,
     events: UnboundedSender<Event>,
-    mut voice_out: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    mut voice_out: crate::queue::NewestReceiver<Vec<u8>>,
     voice_in: std::sync::Arc<Inbox>,
     delay: tokio::sync::watch::Sender<Option<u32>>,
     voice_pass: Arc<AtomicBool>,
@@ -1333,6 +1390,9 @@ async fn run(
     let mut tmp = [0u8; 2048];
     let mut intentional = false;
     let mut voice_open = true;
+    if !drain(&mut buf, &events, |_| {}) {
+        return;
+    }
     let mut pulse = tokio::time::interval(Duration::from_secs(1));
     pulse.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -1366,7 +1426,7 @@ async fn run(
                     Err(_) => break,
                 }
             }
-            packet = voice_out.recv(), if voice_open => {
+            packet = voice_out.recv_within(crate::queue::VOICE_MAX_AGE), if voice_open => {
                 match packet {
                     Some(packet) => {
                         if voice_pass.load(Ordering::Relaxed) {
@@ -1406,11 +1466,11 @@ async fn handle_cmd(send: &mut quinn::SendStream, cmd: Cmd, intentional: &mut bo
 
 fn note_pong(
     clock: std::time::Instant,
-    pending: &tokio::sync::watch::Receiver<Option<u64>>,
+    pending: &tokio::sync::watch::Receiver<Vec<u64>>,
     delay: &tokio::sync::watch::Sender<Option<u32>>,
     token: u64,
 ) {
-    if pending.borrow().is_none_or(|sent| sent != token) {
+    if !pending.borrow().contains(&token) {
         return;
     }
     let now = clock.elapsed().as_micros() as u64;
@@ -2008,9 +2068,9 @@ mod tests {
 
     #[test]
     fn a_literal_keeps_its_family_and_an_unspecified_host_is_local() {
-        let v4 = addresses("127.0.0.1", 1542).unwrap();
+        let v4 = resolve_addresses("127.0.0.1", 1542).unwrap();
         assert!(v4.iter().all(|addr| addr.is_ipv4()));
-        let local = addresses("0.0.0.0", 1542).unwrap();
+        let local = resolve_addresses("0.0.0.0", 1542).unwrap();
         assert_eq!(local, vec![SocketAddr::from(([127, 0, 0, 1], 1542))]);
     }
 

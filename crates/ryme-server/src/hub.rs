@@ -108,17 +108,16 @@ impl Hub {
 
     /// The host decides which rooms exist. A join cannot invent one.
     pub fn allow(&mut self, name: &str) {
-        let name = name.trim();
-        if name.is_empty() || name.len() > ryme_proto::MAX_CHANNEL || name.contains(['\n', '\r']) {
+        let Ok(name) = ryme_proto::clean_label(name, ryme_proto::MAX_CHANNEL) else {
             return;
-        }
-        if self.channels.iter().any(|room| room == name) {
+        };
+        if self.channels.iter().any(|room| room == &name) {
             return;
         }
         if self.channels.len() >= MAX_ROOMS {
             return;
         }
-        self.channels.push(name.to_string());
+        self.channels.push(name);
     }
 
     pub fn handle(&mut self, user: Option<u32>, msg: ClientMsg) -> Step {

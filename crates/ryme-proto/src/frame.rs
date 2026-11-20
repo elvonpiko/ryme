@@ -3,7 +3,8 @@ use serde::{de::DeserializeOwned, Serialize};
 use crate::control::{normalize_client, normalize_server, ClientMsg, ServerMsg};
 use crate::ProtoError;
 
-pub const MAX_FRAME: usize = 4096;
+/// A full room is 32 names of 128 bytes, plus member fields and 16 room names.
+pub const MAX_FRAME: usize = 16384;
 const CONTROL_VERSION: u8 = 1;
 
 pub fn encode_client(msg: &ClientMsg) -> Result<Vec<u8>, ProtoError> {
@@ -85,6 +86,30 @@ fn decode_frame<T: DeserializeOwned>(buf: &[u8]) -> Result<Option<(T, usize)>, P
 mod tests {
     use super::*;
     use crate::control::ClientMsg;
+
+    #[test]
+    fn a_full_roster_fits_in_one_frame() {
+        use crate::control::{Member, ServerMsg};
+        let name = "名".repeat(32);
+        let members = (0..32)
+            .map(|id| Member {
+                user_id: id,
+                name: name.clone(),
+                muted: id % 2 == 0,
+                card: id as u64 + 1,
+            })
+            .collect();
+        let rooms = (0..16).map(|n| format!("房间{n}")).collect();
+        let msg = ServerMsg::Joined {
+            channel: "大厅".into(),
+            members,
+            rooms,
+        };
+        let frame = encode_server(&msg).expect("full roster");
+        let (back, n) = decode_server_frame(&frame).unwrap().unwrap();
+        assert_eq!(n, frame.len());
+        assert_eq!(back, msg);
+    }
 
     #[test]
     fn one_frame_roundtrips() {

@@ -314,7 +314,19 @@ fn expire_fair<T>(slots: &mut FairSlots<T>, max_age: Duration) {
     }
     if !empty.is_empty() {
         slots.turn.retain(|id| !empty.contains(id));
+        for speaker in empty {
+            slots.lanes.remove(&speaker);
+        }
     }
+    bound_retired(&mut slots.evicted, &slots.lanes);
+    bound_retired(&mut slots.expired, &slots.lanes);
+}
+
+fn bound_retired<T>(counts: &mut HashMap<u32, u64>, lanes: &HashMap<u32, Lane<T>>) {
+    if counts.len() <= 64 {
+        return;
+    }
+    counts.retain(|speaker, _| lanes.contains_key(speaker));
 }
 
 impl<T> Clone for FairSender<T> {

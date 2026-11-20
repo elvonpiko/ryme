@@ -682,10 +682,17 @@ pub fn attach(ui: &MainWindow, rt: &tokio::runtime::Handle) -> Shutdown {
     ui.on_test_speakers({
         let slot = slot.clone();
         move || {
-            let guard = slot.lock().unwrap();
+            let mut guard = slot.lock().unwrap();
             if let Some(ear) = guard.ear.as_ref() {
                 ear.play_tone();
-            } else if let Some(preview) = guard.preview.as_ref() {
+                return;
+            }
+            if guard.preview.is_none() {
+                let input = guard.input.clone();
+                let output = guard.output.clone();
+                guard.preview = Some(crate::ear::Preview::start(&input, &output));
+            }
+            if let Some(preview) = guard.preview.as_ref() {
                 preview.play_tone();
             }
         }
@@ -918,12 +925,7 @@ fn cycle_device(ui: &MainWindow, slot: &Arc<Mutex<Slot>>, input: bool) {
 
 fn listen_local(slot: &Arc<Mutex<Slot>>) {
     let mut guard = slot.lock().unwrap();
-    if guard.ear.is_some() || guard.preview.is_some() {
-        return;
-    }
-    let input = guard.input.clone();
-    let output = guard.output.clone();
-    guard.preview = Some(crate::ear::Preview::start(&input, &output));
+    guard.preview = None;
 }
 
 fn begin(
@@ -1154,7 +1156,9 @@ fn begin(
                                     if guard.generation != gen {
                                         None
                                     } else {
-                                        guard.link = None;
+                                        if let Some(link) = guard.link.take() {
+                                            link.cancel();
+                                        }
                                         let ear = guard.ear.take();
                                         guard.generation += 1;
                                         guard.resume_channel = match &guard.aim {
